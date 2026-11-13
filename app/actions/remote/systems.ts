@@ -1,7 +1,9 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {reconcilePersistenceFlag} from '@actions/local/ephemeral_mode/wipe';
 import {storeConfigAndLicense, storeDataRetentionPolicies} from '@actions/local/systems';
+import {applyPersistenceModeChange} from '@actions/remote/refresh';
 import {forceLogoutIfNecessary} from '@actions/remote/session';
 import DatabaseManager from '@database/manager';
 import NetworkManager from '@managers/network_manager';
@@ -22,9 +24,9 @@ export type DataRetentionPoliciesRequest = {
     error?: unknown;
 }
 
-export const fetchDataRetentionPolicy = async (serverUrl: string, fetchOnly = false): Promise<DataRetentionPoliciesRequest> => {
-    const {data: globalPolicy, error: globalPolicyError} = await fetchGlobalDataRetentionPolicy(serverUrl);
-    const {data: teamPolicies, error: teamPoliciesError} = await fetchAllGranularDataRetentionPolicies(serverUrl);
+export const fetchDataRetentionPolicy = async (serverUrl: string, fetchOnly = false, groupLabel?: RequestGroupLabel): Promise<DataRetentionPoliciesRequest> => {
+    const {data: globalPolicy, error: globalPolicyError} = await fetchGlobalDataRetentionPolicy(serverUrl, groupLabel);
+    const {data: teamPolicies, error: teamPoliciesError} = await fetchAllGranularDataRetentionPolicies(serverUrl, undefined, undefined, undefined, groupLabel);
     const {data: channelPolicies, error: channelPoliciesError} = await fetchAllGranularDataRetentionPolicies(serverUrl, true);
 
     const error = globalPolicyError || teamPoliciesError || channelPoliciesError;
@@ -45,10 +47,10 @@ export const fetchDataRetentionPolicy = async (serverUrl: string, fetchOnly = fa
     return data;
 };
 
-export const fetchGlobalDataRetentionPolicy = async (serverUrl: string): Promise<{data?: GlobalDataRetentionPolicy; error?: unknown}> => {
+export const fetchGlobalDataRetentionPolicy = async (serverUrl: string, groupLabel?: RequestGroupLabel): Promise<{data?: GlobalDataRetentionPolicy; error?: unknown}> => {
     try {
         const client = NetworkManager.getClient(serverUrl);
-        const data = await client.getGlobalDataRetentionPolicy();
+        const data = await client.getGlobalDataRetentionPolicy(groupLabel);
         return {data};
     } catch (error) {
         logDebug('error on fetchGlobalDataRetentionPolicy', getFullErrorMessage(error));
@@ -62,6 +64,7 @@ export const fetchAllGranularDataRetentionPolicies = async (
     isChannel = false,
     page = 0,
     policies: Array<TeamDataRetentionPolicy | ChannelDataRetentionPolicy> = [],
+    groupLabel?: RequestGroupLabel,
 ): Promise<{data?: Array<TeamDataRetentionPolicy | ChannelDataRetentionPolicy>; error?: unknown}> => {
     try {
         const client = NetworkManager.getClient(serverUrl);
@@ -70,13 +73,13 @@ export const fetchAllGranularDataRetentionPolicies = async (
         const currentUserId = await getCurrentUserId(database);
         let data;
         if (isChannel) {
-            data = await client.getChannelDataRetentionPolicies(currentUserId, page);
+            data = await client.getChannelDataRetentionPolicies(currentUserId, page, undefined, groupLabel);
         } else {
-            data = await client.getTeamDataRetentionPolicies(currentUserId, page);
+            data = await client.getTeamDataRetentionPolicies(currentUserId, page, undefined, groupLabel);
         }
         policies.push(...data.policies);
         if (policies.length < data.total_count) {
-            await fetchAllGranularDataRetentionPolicies(serverUrl, isChannel, page + 1, policies);
+            await fetchAllGranularDataRetentionPolicies(serverUrl, isChannel, page + 1, policies, groupLabel);
         }
         return {data: policies};
     } catch (error) {
@@ -85,16 +88,23 @@ export const fetchAllGranularDataRetentionPolicies = async (
     }
 };
 
-export const fetchConfigAndLicense = async (serverUrl: string, fetchOnly = false): Promise<ConfigAndLicenseRequest> => {
+export const fetchConfigAndLicense = async (serverUrl: string, fetchOnly = false, groupLabel?: RequestGroupLabel): Promise<ConfigAndLicenseRequest> => {
     try {
         const client = NetworkManager.getClient(serverUrl);
         const [config, license]: [ClientConfig, ClientLicense] = await Promise.all([
-            client.getClientConfigOld(),
-            client.getClientLicenseOld(),
+            client.getClientConfigOld(groupLabel),
+            client.getClientLicenseOld(groupLabel),
         ]);
 
         if (!fetchOnly) {
             await storeConfigAndLicense(serverUrl, config, license);
+            const needsModeChange = await reconcilePersistenceFlag(serverUrl, config);
+            if (needsModeChange) {
+                const {error: modeChangeError} = await applyPersistenceModeChange(serverUrl);
+                if (modeChangeError) {
+                    throw modeChangeError;
+                }
+            }
         }
 
         return {config, license};

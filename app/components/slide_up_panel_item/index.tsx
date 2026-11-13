@@ -1,23 +1,25 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback} from 'react';
+import {type ImageSource, type ImageStyle} from 'expo-image';
+import React from 'react';
 import {type StyleProp, Text, type TextStyle, TouchableHighlight, View, type ViewStyle} from 'react-native';
-import FastImage, {type ImageStyle, type Source} from 'react-native-fast-image';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
+import ExpoImage from '@components/expo_image';
 import {useTheme} from '@context/theme';
-import {preventDoubleTap} from '@utils/tap';
+import {usePreventDoubleTap} from '@hooks/utils';
+import {urlSafeBase64Encode} from '@utils/security';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 import {isValidUrl} from '@utils/url';
 
 type SlideUpPanelProps = {
     destructive?: boolean;
-    leftIcon?: string | Source;
+    leftIcon?: CompassIconName | ImageSource;
     leftImageStyles?: StyleProp<ImageStyle>;
     leftIconStyles?: StyleProp<TextStyle>;
-    rightIcon?: string | Source;
+    rightIcon?: CompassIconName | ImageSource;
     rightImageStyles?: StyleProp<ImageStyle>;
     rightIconStyles?: StyleProp<TextStyle>;
     onPress: () => void;
@@ -86,8 +88,17 @@ const SlideUpPanelItem = ({
     const {image: leftImage, iconStyle: leftIconStyle} = useImageAndStyle(leftIcon, leftImageStyles, leftIconStyles, destructive);
     const {image: rightImage, iconStyle: rightIconStyle} = useImageAndStyle(rightIcon, rightImageStyles, rightIconStyles, destructive);
 
-    const handleOnPress = useCallback(preventDoubleTap(onPress, 500), []);
+    const handleOnPress = usePreventDoubleTap(onPress);
 
+    // The row View gets collapsable={false} so it stays a real native view. It only has
+    // layout props, so Fabric flattens it away until TouchableHighlight applies its
+    // pressed opacity, at which point Fabric materialises the row and moves the text into
+    // it, then flattens it again on release. On Android that reparenting of a
+    // ReactTextView mid-press races the sheet's own mounting and throws
+    // "addViewAt: cannot insert view: View already has a parent", which red-boxes the app
+    // (CI 34185558418: browse-channels dropdown, plus menu, failed-post retry, set-status;
+    // reproduced locally on the first tap). A view that is always a host view gets a plain
+    // opacity update instead of a reparent. No visual change.
     return (
         <TouchableHighlight
             onPress={handleOnPress}
@@ -95,7 +106,10 @@ const SlideUpPanelItem = ({
             testID={testID}
             underlayColor={changeOpacity(theme.buttonBg, 0.08)}
         >
-            <View style={style.row}>
+            <View
+                style={style.row}
+                collapsable={false}
+            >
                 {Boolean(leftImage) &&
                     <View style={leftIconStyle}>{leftImage}</View>
                 }
@@ -110,7 +124,7 @@ const SlideUpPanelItem = ({
     );
 };
 
-const useImageAndStyle = (icon: string | Source | undefined, imageStyles: StyleProp<ImageStyle>, iconStyles: StyleProp<TextStyle>, destructive: boolean) => {
+const useImageAndStyle = (icon: CompassIconName | ImageSource | undefined, imageStyles: StyleProp<ImageStyle>, iconStyles: StyleProp<TextStyle>, destructive: boolean) => {
     const theme = useTheme();
     const style = getStyleSheet(theme);
 
@@ -122,7 +136,8 @@ const useImageAndStyle = (icon: string | Source | undefined, imageStyles: StyleP
                 const imageStyle: StyleProp<ImageStyle> = [imageStyles];
                 imageStyle.push({width: 24, height: 24});
                 image = (
-                    <FastImage
+                    <ExpoImage
+                        id={`slide-up-panel-item-${urlSafeBase64Encode(icon.uri)}`}
                         source={icon}
                         style={imageStyle}
                     />

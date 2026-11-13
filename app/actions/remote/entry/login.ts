@@ -4,6 +4,10 @@
 import {fetchConfigAndLicense} from '@actions/remote/systems';
 import DatabaseManager from '@database/manager';
 import {getServerCredentials} from '@init/credentials';
+import EphemeralModeManager from '@managers/ephemeral_mode_manager';
+import IntuneManager from '@managers/intune_manager';
+import PerformanceMetricsManager from '@managers/performance_metrics_manager';
+import SecurityManager from '@managers/security_manager';
 import WebsocketManager from '@managers/websocket_manager';
 
 type AfterLoginArgs = {
@@ -16,6 +20,14 @@ export async function loginEntry({serverUrl}: AfterLoginArgs): Promise<{error?: 
         return {error: `${serverUrl} database not found`};
     }
 
+    // There are cases where the target may be reset and a performance metric
+    // be added after login. This would be done with a wrong value, so we make
+    // sure we don't do this by skipping the load metric here.
+    PerformanceMetricsManager.skipLoadMetric();
+
+    // But still we want to log the TTI
+    PerformanceMetricsManager.startTimeToInteraction();
+
     try {
         const clData = await fetchConfigAndLicense(serverUrl, false);
         if (clData.error) {
@@ -24,8 +36,11 @@ export async function loginEntry({serverUrl}: AfterLoginArgs): Promise<{error?: 
 
         const credentials = await getServerCredentials(serverUrl);
         if (credentials?.token) {
-            WebsocketManager.createClient(serverUrl, credentials.token);
-            await WebsocketManager.initializeClient(serverUrl);
+            const intunePolicy = await IntuneManager.getPolicy(serverUrl);
+            SecurityManager.addServer(serverUrl, clData.config, false, intunePolicy);
+            await EphemeralModeManager.addServer(serverUrl);
+            await WebsocketManager.createClient(serverUrl, credentials.token, credentials.preauthSecret);
+            await WebsocketManager.initializeClient(serverUrl, 'Login');
         }
 
         return {};

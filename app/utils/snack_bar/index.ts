@@ -1,8 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import {Screens} from '@constants';
-import {SNACK_BAR_TYPE} from '@constants/snack_bar';
-import {showOverlay} from '@screens/navigation';
+import {SNACK_BAR_TYPE, type SnackBarConfig} from '@constants/snack_bar';
+import SnackBarStore from '@store/snackbar_store';
 
 import type {AvailableScreens} from '@typings/screens/navigation';
 import type {PrimitiveType} from 'react-intl';
@@ -12,11 +12,16 @@ export type ShowSnackBarArgs = {
     onAction?: () => void;
     sourceScreen?: AvailableScreens;
     messageValues?: Record<string, PrimitiveType>;
+    descriptionValues?: Record<string, PrimitiveType>;
+    customMessage?: string;
+    customDescription?: string;
+    type?: SnackBarConfig['type'];
+    actionText?: string;
+    isPersistent?: SnackBarConfig['isPersistent'];
 };
 
 export const showSnackBar = (passProps: ShowSnackBarArgs) => {
-    const screen = Screens.SNACK_BAR;
-    showOverlay(screen, passProps);
+    SnackBarStore.show(passProps);
 };
 
 export const showMuteChannelSnackbar = (muted: boolean, onAction: () => void) => {
@@ -52,5 +57,35 @@ export const showThreadFollowingSnackbar = (following: boolean, onAction: () => 
     return showSnackBar({
         onAction,
         barType: following ? SNACK_BAR_TYPE.FOLLOW_THREAD : SNACK_BAR_TYPE.UNFOLLOW_THREAD,
+    });
+};
+
+export const showScheduledPostCreationErrorSnackbar = (errorMessage: string) => {
+    return showSnackBar({
+        barType: SNACK_BAR_TYPE.SCHEDULED_POST_CREATION_ERROR,
+        customMessage: errorMessage,
+        type: 'error',
+    });
+};
+
+export const showPlaybookErrorSnackbar = () => {
+    return showSnackBar({
+        barType: SNACK_BAR_TYPE.PLAYBOOK_ERROR,
+    });
+};
+
+export const showEnableTranslationSnackbar = (onAction: () => void, location: AvailableScreens) => {
+    return showSnackBar({
+        onAction,
+        barType: SNACK_BAR_TYPE.ENABLE_TRANSLATION,
+        sourceScreen: location,
+        actionText: 'Enable',
+    });
+};
+
+export const showBoRPostErrorSnackbar = (message?: string) => {
+    return showSnackBar({
+        barType: SNACK_BAR_TYPE.BOR_POST_EXPIRED,
+        customMessage: message,
     });
 };

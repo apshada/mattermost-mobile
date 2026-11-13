@@ -2,25 +2,17 @@
 // See LICENSE.txt for license information.
 
 import React, {useMemo} from 'react';
-import {Platform, Text, View} from 'react-native';
-import Animated, {useAnimatedStyle, withTiming} from 'react-native-reanimated';
+import {Platform, Pressable, Text, View} from 'react-native';
+import Animated, {useAnimatedStyle, withTiming, type SharedValue} from 'react-native-reanimated';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import CompassIcon from '@components/compass_icon';
+import NavigationButton, {type NavigationButtonProps} from '@components/navigation_button';
 import TouchableWithFeedback from '@components/touchable_with_feedback';
 import ViewConstants from '@constants/view';
+import {useIsTablet} from '@hooks/device';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
-
-export type HeaderRightButton = {
-    borderless?: boolean;
-    buttonType?: 'native' | 'opacity' | 'highlight';
-    color?: string;
-    iconName: string;
-    onPress: () => void;
-    rippleRadius?: number;
-    testID?: string;
-}
 
 type Props = {
     defaultHeight: number;
@@ -30,18 +22,22 @@ type Props = {
     leftComponent?: React.ReactElement;
     onBackPress?: () => void;
     onTitlePress?: () => void;
-    rightButtons?: HeaderRightButton[];
-    scrollValue?: Animated.SharedValue<number>;
-    lockValue?: Animated.SharedValue<number | null>;
+    rightButtons?: NavigationButtonProps[];
+    rightComponent?: React.ReactNode;
+    scrollValue?: SharedValue<number>;
     showBackButton?: boolean;
     subtitle?: string;
     subtitleCompanion?: React.ReactElement;
+
+    // Replaces the subtitle row when provided. See NavigationHeader's Props.
+    subtitleComponent?: React.ReactElement;
     theme: Theme;
     title?: string;
+    titleCompanion?: React.ReactElement;
+    titleTestID?: string;
 }
 
 const hitSlop = {top: 20, bottom: 20, left: 20, right: 20};
-const rightButtonHitSlop = {top: 20, bottom: 5, left: 5, right: 5};
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     centered: {
@@ -54,6 +50,9 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         justifyContent: 'flex-start',
         paddingHorizontal: 16,
         zIndex: 10,
+    },
+    pressed: {
+        opacity: 0.72,
     },
     subtitleContainer: {
         flexDirection: 'row',
@@ -73,10 +72,8 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         justifyContent: 'center',
         flex: 3,
         height: '100%',
-        paddingHorizontal: 8,
         ...Platform.select({
             ios: {
-                paddingHorizontal: 60,
                 flex: undefined,
                 width: '100%',
                 position: 'absolute',
@@ -95,7 +92,7 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         justifyContent: 'center',
         ...Platform.select({
             ios: {
-                paddingLeft: 16,
+                paddingLeft: 4,
                 zIndex: 5,
                 position: 'absolute',
                 bottom: 0,
@@ -109,19 +106,26 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         justifyContent: 'flex-end',
         ...Platform.select({
             ios: {
-                right: 16,
+                right: 4,
                 bottom: 0,
                 position: 'absolute',
                 zIndex: 2,
             },
         }),
     },
-    rightIcon: {
-        marginLeft: 10,
+    rightButtonContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 6,
     },
     title: {
         color: theme.sidebarHeaderTextColor,
         ...typography('Heading', 300),
+    },
+    titleRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 4,
     },
 }));
 
@@ -134,16 +138,20 @@ const Header = ({
     onBackPress,
     onTitlePress,
     rightButtons,
+    rightComponent,
     scrollValue,
-    lockValue,
     showBackButton = true,
     subtitle,
     subtitleCompanion,
+    subtitleComponent,
     theme,
     title,
+    titleCompanion,
+    titleTestID = 'navigation.header.title',
 }: Props) => {
     const styles = getStyleSheet(theme);
     const insets = useSafeAreaInsets();
+    const isTablet = useIsTablet();
 
     const opacity = useAnimatedStyle(() => {
         if (!isLargeTitle) {
@@ -155,7 +163,7 @@ const Header = ({
         }
 
         const barHeight = heightOffset - ViewConstants.LARGE_HEADER_TITLE_HEIGHT;
-        const val = (scrollValue?.value ?? 0);
+        const val = (scrollValue?.value || 0);
         const showDuration = 200;
         const hideDuration = 50;
         const duration = val >= barHeight ? showDuration : hideDuration;
@@ -167,15 +175,21 @@ const Header = ({
 
     const containerAnimatedStyle = useAnimatedStyle(() => ({
         height: defaultHeight,
-        paddingTop: insets.top,
-    }), [defaultHeight, lockValue]);
+        paddingTop: isTablet ? 0 : insets.top,
+    }), [defaultHeight, isTablet, insets.top]);
 
     const containerStyle = useMemo(() => (
         [styles.container, containerAnimatedStyle]), [styles, containerAnimatedStyle]);
 
-    const additionalTitleStyle = useMemo(() => ({
-        marginLeft: Platform.select({android: showBackButton && !leftComponent ? 20 : 0}),
-    }), [leftComponent, showBackButton, theme]);
+    const additionalTitleStyle = useMemo(() => {
+        return {
+            marginLeft: Platform.select({android: showBackButton && !leftComponent ? 20 : 0}),
+            paddingHorizontal: Platform.select({
+                ios: rightButtons?.length === 2 || rightComponent ? 90 : 60,
+                android: 8,
+            }),
+        };
+    }, [leftComponent, showBackButton, rightButtons, rightComponent]);
 
     return (
         <Animated.View style={containerStyle}>
@@ -208,16 +222,19 @@ const Header = ({
                 >
                     <View style={styles.centered}>
                         {!hasSearch &&
-                        <Animated.Text
-                            ellipsizeMode='tail'
-                            numberOfLines={1}
-                            style={[styles.title, opacity]}
-                            testID='navigation.header.title'
-                        >
-                            {title}
-                        </Animated.Text>
+                        <View style={styles.titleRow}>
+                            <Animated.Text
+                                ellipsizeMode='tail'
+                                numberOfLines={1}
+                                style={[styles.title, opacity]}
+                                testID={titleTestID}
+                            >
+                                {title}
+                            </Animated.Text>
+                            {titleCompanion}
+                        </View>
                         }
-                        {!isLargeTitle && Boolean(subtitle || subtitleCompanion) &&
+                        {!isLargeTitle && !subtitleComponent && Boolean(subtitle || subtitleCompanion) &&
                         <View style={styles.subtitleContainer}>
                             <Text
                                 ellipsizeMode='tail'
@@ -232,26 +249,36 @@ const Header = ({
                         }
                     </View>
                 </TouchableWithFeedback>
+                {/* Outside the title button so screen readers can reach the buttons inside it, but still opens the same screen when tapped. */}
+                {!isLargeTitle && Boolean(subtitleComponent) &&
+                <Pressable
+                    accessible={false}
+                    disabled={!onTitlePress}
+                    onPress={onTitlePress}
+                    style={({pressed}) => [styles.subtitleContainer, pressed && styles.pressed]}
+                    testID='navigation.header.subtitle_component'
+                >
+                    {subtitleComponent}
+                </Pressable>
+                }
             </Animated.View>
             <Animated.View style={styles.rightContainer}>
+                {rightComponent}
                 {Boolean(rightButtons?.length) &&
-                rightButtons?.map((r, i) => (
-                    <TouchableWithFeedback
-                        key={r.iconName}
-                        borderlessRipple={r.borderless === undefined ? true : r.borderless}
-                        hitSlop={rightButtonHitSlop}
+                rightButtons?.map((r) => (
+                    <NavigationButton
+                        id={r.id}
+                        key={r.id}
+                        accessibilityLabel={r.accessibilityLabel}
+                        borderless={r.borderless}
+                        disabled={r.disabled}
+                        iconName={r.iconName}
+                        isLoading={r.isLoading}
+                        count={r.count}
                         onPress={r.onPress}
-                        rippleRadius={r.rippleRadius || 20}
-                        type={r.buttonType || Platform.select({android: 'native', default: 'opacity'})}
-                        style={i > 0 && styles.rightIcon}
+                        rippleRadius={r.rippleRadius}
                         testID={r.testID}
-                    >
-                        <CompassIcon
-                            size={24}
-                            name={r.iconName}
-                            color={r.color || theme.sidebarHeaderTextColor}
-                        />
-                    </TouchableWithFeedback>
+                    />
                 ))
                 }
             </Animated.View>

@@ -2,23 +2,24 @@
 // See LICENSE.txt for license information.
 
 import Model from '@nozbe/watermelondb/Model';
+import {applicationName} from 'expo-application';
+import {Directory, File, Paths, type FileInfo as ExpoFileInfo} from 'expo-file-system';
 import mimeDB from 'mime-db';
 import {Alert, Linking, Platform} from 'react-native';
-import DeviceInfo from 'react-native-device-info';
-import FileSystem from 'react-native-fs';
 import Permissions, {PERMISSIONS} from 'react-native-permissions';
 
-import {Files} from '@constants';
+import {Files, ServerErrors} from '@constants';
+import {getFullErrorMessage} from '@utils/errors';
 import {generateId} from '@utils/general';
 import keyMirror from '@utils/key_mirror';
-import {logError} from '@utils/log';
-import {deleteEntititesFile, getIOSAppGroupDetails} from '@utils/mattermost_managed';
+import {logDebug, logError} from '@utils/log';
+import {getIOSAppGroupDetails} from '@utils/mattermost_managed';
 import {urlSafeBase64Encode} from '@utils/security';
 
 import type {PastedFile} from '@mattermost/react-native-paste-input';
+import type {DocumentPickerResponse} from '@react-native-documents/picker';
 import type FileModel from '@typings/database/models/servers/file';
 import type {IntlShape} from 'react-intl';
-import type {DocumentPickerResponse} from 'react-native-document-picker';
 import type {Asset} from 'react-native-image-picker';
 
 const EXTRACT_TYPE_REGEXP = /^\s*([^;\s]*)(?:;|\s|$)/;
@@ -63,9 +64,16 @@ const SUPPORTED_DOCS_FORMAT = Platform.select({
     ],
 });
 
+const SUPPORTED_IMAGE_FORMAT = ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'svg', 'xcf', 'gif', 'webp'];
+
 const SUPPORTED_VIDEO_FORMAT = Platform.select({
     ios: ['video/mp4', 'video/x-m4v', 'video/quicktime'],
     android: ['video/3gpp', 'video/x-matroska', 'video/mp4', 'video/webm', 'video/quicktime'],
+});
+
+const SUPPORTED_AUDIO_FORMAT = Platform.select({
+    ios: ['audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-aiff'],
+    android: ['audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm', 'audio/3gpp'],
 });
 
 const types: Record<string, string> = {};
@@ -140,59 +148,61 @@ function populateMaps() {
     });
 }
 
-export async function deleteV1Data() {
-    const dir = Platform.OS === 'ios' ? getIOSAppGroupDetails().appGroupSharedDirectory : FileSystem.DocumentDirectoryPath;
-
-    try {
-        const directory = `${dir}/mmkv`;
-        const mmkvDirInfo = await FileSystem.exists(directory);
-        if (mmkvDirInfo) {
-            await FileSystem.unlink(directory);
-        }
-    } catch {
-        // do nothing
-    }
-
-    try {
-        const entitiesInfo = await FileSystem.exists(`${dir}/entities`);
-        if (entitiesInfo) {
-            deleteEntititesFile();
-        }
-    } catch (e) {
-        // do nothing
-    }
-}
-
-export async function deleteFileCache(serverUrl: string) {
+export function deleteFileCache(serverUrl: string) {
     const serverDir = urlSafeBase64Encode(serverUrl);
     return deleteFileCacheByDir(serverDir);
 }
 
-export async function deleteFileCacheByDir(dir: string) {
+export function deleteFileCacheByDir(dir: string) {
     if (Platform.OS === 'ios') {
         const appGroupCacheDir = `${getIOSAppGroupDetails().appGroupSharedDirectory}/Library/Caches/${dir}`;
-        await deleteFilesInDir(appGroupCacheDir);
+        deleteFilesInDir(appGroupCacheDir);
     }
 
-    const cacheDir = `${FileSystem.CachesDirectoryPath}/${dir}`;
-    await deleteFilesInDir(cacheDir);
+    const cacheDir = `${Paths.cache.uri}/${dir}`;
+    deleteFilesInDir(cacheDir);
 
     return true;
 }
 
-async function deleteFilesInDir(directory: string) {
-    if (directory) {
-        const cacheDirInfo = await FileSystem.exists(directory);
-        if (cacheDirInfo) {
-            if (Platform.OS === 'ios') {
-                await FileSystem.unlink(directory);
-                await FileSystem.mkdir(directory);
-            } else {
-                const lstat = await FileSystem.readDir(directory);
-                lstat.forEach((stat: FileSystem.ReadDirItem) => {
-                    FileSystem.unlink(stat.path);
-                });
+/**
+ * Per-file eviction, for when the server confirms a denial: the FileModel rows are destroyed, but the
+ * downloaded bytes would stay readable on disk. Each file is looked for both where its row says it
+ * was saved and where downloads land by default, because opening a document never records its path.
+ * Failures are swallowed: a file that cannot be removed must not stop the denial being recorded.
+ */
+export function deleteDownloadedFiles(serverUrl: string | undefined, files: FileModel[]) {
+    for (const f of files) {
+        const paths = new Set<string>();
+        if (f.localPath) {
+            try {
+                paths.add(decodeURIComponent(f.localPath));
+            } catch {
+                paths.add(f.localPath);
             }
+        }
+        if (serverUrl) {
+            paths.add(getLocalFilePathFromFile(serverUrl, f));
+        }
+
+        for (const path of paths) {
+            try {
+                const file = new File(pathWithPrefix('file://', path));
+                if (file.exists) {
+                    file.delete();
+                }
+            } catch (error) {
+                logDebug('deleteDownloadedFiles: could not remove a cached file', getFullErrorMessage(error));
+            }
+        }
+    }
+}
+
+function deleteFilesInDir(directory: string) {
+    if (directory) {
+        const dir = new Directory(directory);
+        if (dir.exists) {
+            dir.delete();
         }
     }
 }
@@ -265,6 +275,11 @@ export const isGif = (file?: FileInfo | FileModel) => {
     return mime === 'image/gif';
 };
 
+export function extractExtension(filename: string) {
+    const ext = filename.split('.').pop() || '';
+    return ext.startsWith('.') ? ext.slice(1).toLowerCase() : ext.toLowerCase();
+}
+
 export const isImage = (file?: FileInfo | FileModel) => {
     if (!file) {
         return false;
@@ -274,9 +289,20 @@ export const isImage = (file?: FileInfo | FileModel) => {
         return true;
     }
 
+    // A draft persisted before its file metadata resolved has neither, despite the types.
+    if (!file.extension && !file.name) {
+        return false;
+    }
+
+    const fileExt = extractExtension(file.extension || file.name);
+
+    if (!SUPPORTED_IMAGE_FORMAT.includes(fileExt)) {
+        return false;
+    }
+
     let mimeType = 'mime_type' in file ? file.mime_type : file.mimeType;
     if (!mimeType) {
-        mimeType = lookupMimeType(file.extension) || lookupMimeType(file.name);
+        mimeType = lookupMimeType(fileExt);
     }
 
     return Boolean(mimeType?.startsWith('image/'));
@@ -297,6 +323,21 @@ export const isDocument = (file?: FileInfo | FileModel) => {
     return SUPPORTED_DOCS_FORMAT!.includes(mime);
 };
 
+export const isPdf = (file?: FileInfo | FileModel) => {
+    if (!file) {
+        return false;
+    }
+
+    let mime = 'mime_type' in file ? file.mime_type : file.mimeType;
+    if (mime && mime.includes(';')) {
+        mime = mime.split(';')[0];
+    } else if (!mime && file?.name) {
+        mime = lookupMimeType(file.name);
+    }
+
+    return mime === 'application/pdf';
+};
+
 export const isVideo = (file?: FileInfo | FileModel) => {
     if (!file) {
         return false;
@@ -310,6 +351,21 @@ export const isVideo = (file?: FileInfo | FileModel) => {
     }
 
     return SUPPORTED_VIDEO_FORMAT!.includes(mime);
+};
+
+export const isAudio = (file?: FileInfo | FileModel) => {
+    if (!file) {
+        return false;
+    }
+
+    let mime = 'mime_type' in file ? file.mime_type : file.mimeType;
+    if (mime && mime.includes(';')) {
+        mime = mime.split(';')[0];
+    } else if (!mime && file?.name) {
+        mime = lookupMimeType(file.name);
+    }
+
+    return SUPPORTED_AUDIO_FORMAT!.includes(mime);
 };
 
 export function getFormattedFileSize(bytes: number): string {
@@ -331,7 +387,7 @@ export function getFormattedFileSize(bytes: number): string {
     return `${bytes} B`;
 }
 
-export function getFileType(file: FileInfo): string {
+export function getFileType(file: FileInfo | ExtractedFileInfo): string {
     if (!file || !file.extension) {
         return 'other';
     }
@@ -384,11 +440,11 @@ export function getLocalFilePathFromFile(serverUrl: string, file: FileInfo | Fil
                 }
             }
 
-            return `${FileSystem.CachesDirectoryPath}/${server}/${filename}-${fileIdPath}.${extension}`;
+            return `${Paths.cache.uri}${server}/Files/${filename}-${fileIdPath}.${extension}`;
         } else if (file?.id && hasValidExtension) {
-            return `${FileSystem.CachesDirectoryPath}/${server}/${fileIdPath}.${file.extension}`;
+            return `${Paths.cache.uri}${server}/Files/${fileIdPath}.${file.extension}`;
         } else if (file?.id) {
-            return `${FileSystem.CachesDirectoryPath}/${server}/${fileIdPath}`;
+            return `${Paths.cache.uri}${server}/Files/${fileIdPath}`;
         }
     }
 
@@ -415,14 +471,13 @@ export async function extractFileInfo(files: Array<Asset | DocumentPickerRespons
             outFile.size = file.fileSize || 0;
             outFile.name = file.fileName || '';
         } else {
-            const localPath = Platform.select({
-                ios: (file.uri || '').replace('file://', ''),
-                default: file.uri || '',
-            });
+            const localPath = file.uri || '';
             try {
-                const fileInfo = await FileSystem.stat(decodeURIComponent(localPath));
-                outFile.size = fileInfo.size || 0;
-                outFile.name = localPath.substring(localPath.lastIndexOf('/') + 1);
+                const fileInfo = new File(localPath).info();
+                if (fileInfo.exists) {
+                    outFile.size = fileInfo.size || 0;
+                    outFile.name = localPath.substring(localPath.lastIndexOf('/') + 1);
+                }
             } catch (e) {
                 logError('extractFileInfo', e);
                 return;
@@ -466,10 +521,39 @@ export function uploadDisabledWarning(intl: IntlShape) {
     });
 }
 
-export const fileExists = async (path: string) => {
+export function uploadDisabledByPolicyWarning(intl: IntlShape) {
+    return intl.formatMessage({
+        id: 'mobile.file_upload.disabled_by_policy',
+        defaultMessage: 'File uploads are restricted in this channel',
+    });
+}
+
+export function getUploadErrorMessage(intl: IntlShape, errorMessage: string, errorName?: string) {
+    // The client may not know about a denial yet (the decision is still loading or went stale), so the
+    // server's own refusal is shown in the same words the disabled button would have used.
+    if (errorName === ServerErrors.UPLOAD_DENIED_BY_POLICY_ERROR) {
+        return uploadDisabledByPolicyWarning(intl);
+    }
+
+    // iOS: Alamofire wraps all network errors with this prefix
+    const isIosNetworkError = errorMessage.startsWith('URLSessionTask failed with error:');
+
+    // Android: Network exceptions from java.net package
+    const isAndroidNetworkError = errorName?.startsWith('java.net.') ?? false;
+
+    if (isIosNetworkError || isAndroidNetworkError) {
+        return intl.formatMessage({
+            id: 'mobile.file_upload.network_unavailable',
+            defaultMessage: "File couldn't be uploaded. Check your connection and try again.",
+        });
+    }
+
+    return errorMessage;
+}
+
+export const fileExists = (path: string) => {
     try {
-        const filePath = Platform.select({ios: path.replace('file://', ''), default: path});
-        return FileSystem.exists(filePath);
+        return new File(path).exists;
     } catch {
         return false;
     }
@@ -485,7 +569,6 @@ export const hasWriteStoragePermission = async (intl: IntlShape) => {
                 permissionRequest = await Permissions.request(storagePermission);
                 return permissionRequest === Permissions.RESULTS.GRANTED;
             case Permissions.RESULTS.BLOCKED: {
-                const applicationName = DeviceInfo.getApplicationName();
                 const title = intl.formatMessage(
                     {
                         id: 'mobile.storage_permission_denied_title',
@@ -527,30 +610,63 @@ export const hasWriteStoragePermission = async (intl: IntlShape) => {
     return true;
 };
 
-export const getAllFilesInCachesDirectory = async (serverUrl: string) => {
+export const getAllFilesInCachesDirectory = (serverUrl: string) => {
     try {
-        const files: FileSystem.ReadDirItem[][] = [];
+        const infos: ExpoFileInfo[] = [];
 
-        const promises = [FileSystem.readDir(`${FileSystem.CachesDirectoryPath}/${urlSafeBase64Encode(serverUrl)}`)];
+        const paths = [`${Paths.cache.uri}/${urlSafeBase64Encode(serverUrl)}`];
         if (Platform.OS === 'ios') {
-            const cacheDir = `${getIOSAppGroupDetails().appGroupSharedDirectory}/Library/Caches/${urlSafeBase64Encode(serverUrl)}`;
-            promises.push(FileSystem.readDir(cacheDir));
+            paths.push(`${getIOSAppGroupDetails().appGroupSharedDirectory}/Library/Caches/${urlSafeBase64Encode(serverUrl)}`);
         }
 
-        const dirs = await Promise.allSettled(promises);
-        dirs.forEach((p) => {
-            if (p.status === 'fulfilled') {
-                files.push(p.value);
+        for (const p of paths) {
+            const info = new Directory(p).info();
+            if (info.exists) {
+                infos.push(info);
             }
-        });
+        }
 
-        const flattenedFiles = files.flat();
-        const totalSize = flattenedFiles.reduce((acc, file) => acc + file.size, 0);
+        const totalSize = infos.reduce((acc, info) => acc + (info.size ?? 0), 0);
         return {
-            files: flattenedFiles,
+            files: infos,
             totalSize,
         };
     } catch (error) {
         return {error};
     }
 };
+
+export const pathWithPrefix = (prefix: string, path: string) => {
+    const p = path.startsWith(prefix) ? '' : prefix;
+    return `${p}${path}`;
+};
+
+export const deleteFile = (path: string) => {
+    try {
+        new File(pathWithPrefix('file://', path)).delete();
+    } catch { /* file may not exist */ }
+};
+
+export const filesLocalPathValidation = (files: FileModel[], authorId: string) => {
+    const filesInfo: FileInfo[] = [];
+    for (const f of files) {
+        const info = f.toFileInfo(authorId);
+        if (info.localPath) {
+            const exists = fileExists(info.localPath);
+            if (!exists) {
+                info.localPath = '';
+            }
+        }
+        filesInfo.push(info);
+    }
+
+    return filesInfo;
+};
+
+/**
+ * Convert FileModel array to FileInfo array
+ * Note: Does NOT validate local paths - validation is done by Files component
+ */
+export function fileModelsToFileInfo(files: FileModel[], userId: string): FileInfo[] {
+    return files.map((f) => f.toFileInfo(userId));
+}

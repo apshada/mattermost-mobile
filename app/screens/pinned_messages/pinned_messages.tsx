@@ -1,35 +1,39 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {DeviceEventEmitter, FlatList, type ListRenderItemInfo, StyleSheet, View} from 'react-native';
+import React, {useCallback, useMemo, useState} from 'react';
+import {FlatList, type ListRenderItemInfo, StyleSheet, View} from 'react-native';
 import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 
 import {fetchPinnedPosts} from '@actions/remote/post';
 import Loading from '@components/loading';
 import DateSeparator from '@components/post_list/date_separator';
 import Post from '@components/post_list/post';
-import {Events, Screens} from '@constants';
+import {Screens} from '@constants';
+import {PostConfigProvider} from '@context/post_config';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {popTopScreen} from '@screens/navigation';
+import useDidMount from '@hooks/did_mount';
+import {navigateBack} from '@screens/navigation';
 import {getDateForDateLine, selectOrderedPosts} from '@utils/post_list';
+import {emitPostsInViewport} from '@utils/post_list/viewport';
 
 import EmptyState from './empty';
 
 import type {PostListItem, PostListOtherItem, ViewableItemsChanged} from '@typings/components/post_list';
 import type PostModel from '@typings/database/models/servers/post';
-import type {AvailableScreens} from '@typings/screens/navigation';
+import type UserModel from '@typings/database/models/servers/user';
 
 type Props = {
     appsEnabled: boolean;
     channelId: string;
-    componentId: AvailableScreens;
+    currentUser: UserModel;
     currentTimezone: string | null;
     customEmojiNames: string[];
     isCRTEnabled: boolean;
     posts: PostModel[];
+    isChannelAutotranslated: boolean;
 }
 
 const edges: Edge[] = ['bottom', 'left', 'right'];
@@ -51,46 +55,34 @@ const styles = StyleSheet.create({
 function SavedMessages({
     appsEnabled,
     channelId,
-    componentId,
+    currentUser,
     currentTimezone,
     customEmojiNames,
     isCRTEnabled,
     posts,
+    isChannelAutotranslated,
 }: Props) {
     const [loading, setLoading] = useState(!posts.length);
     const [refreshing, setRefreshing] = useState(false);
     const theme = useTheme();
     const serverUrl = useServerUrl();
 
-    const data = useMemo(() => selectOrderedPosts(posts, 0, false, '', '', false, currentTimezone, false).reverse(), [posts]);
+    const data = useMemo(() => selectOrderedPosts(posts, 0, false, '', '', false, currentTimezone, false), [currentTimezone, posts]);
 
-    const close = useCallback(() => {
-        if (componentId) {
-            popTopScreen(componentId);
-        }
-    }, [componentId]);
-
-    useEffect(() => {
+    useDidMount(() => {
         fetchPinnedPosts(serverUrl, channelId).finally(() => {
             setLoading(false);
         });
-    }, []);
+    });
 
-    useAndroidHardwareBackHandler(componentId, close);
+    useAndroidHardwareBackHandler(Screens.PINNED_MESSAGES, navigateBack);
 
     const onViewableItemsChanged = useCallback(({viewableItems}: ViewableItemsChanged) => {
         if (!viewableItems.length) {
             return;
         }
 
-        const viewableItemsMap = viewableItems.reduce((acc: Record<string, boolean>, {item, isViewable}) => {
-            if (isViewable && item.type === 'post') {
-                acc[`${Screens.PINNED_MESSAGES}-${item.value.currentPost.id}`] = true;
-            }
-            return acc;
-        }, {});
-
-        DeviceEventEmitter.emit(Events.ITEM_IN_VIEWPORT, viewableItemsMap);
+        emitPostsInViewport(Screens.PINNED_MESSAGES, viewableItems);
     }, []);
 
     const handleRefresh = useCallback(async () => {
@@ -127,6 +119,7 @@ function SavedMessages({
                     <Post
                         appsEnabled={appsEnabled}
                         customEmojiNames={customEmojiNames}
+                        currentUser={currentUser}
                         highlightPinnedOrSaved={false}
                         isCRTEnabled={isCRTEnabled}
                         location={Screens.PINNED_MESSAGES}
@@ -139,12 +132,13 @@ function SavedMessages({
                         skipSavedHeader={true}
                         skipPinnedHeader={true}
                         testID='pinned_messages.post_list.post'
+                        isChannelAutotranslated={isChannelAutotranslated}
                     />
                 );
             default:
                 return null;
         }
-    }, [appsEnabled, currentTimezone, customEmojiNames, theme]);
+    }, [appsEnabled, currentTimezone, currentUser, customEmojiNames, isCRTEnabled, isChannelAutotranslated]);
 
     return (
         <SafeAreaView
@@ -152,17 +146,19 @@ function SavedMessages({
             style={styles.flex}
             testID='pinned_messages.screen'
         >
-            <FlatList
-                contentContainerStyle={data.length ? styles.list : [styles.empty]}
-                ListEmptyComponent={emptyList}
-                data={data}
-                onRefresh={handleRefresh}
-                refreshing={refreshing}
-                renderItem={renderItem}
-                scrollToOverflowEnabled={true}
-                onViewableItemsChanged={onViewableItemsChanged}
-                testID='pinned_messages.post_list.flat_list'
-            />
+            <PostConfigProvider>
+                <FlatList
+                    contentContainerStyle={data.length ? styles.list : [styles.empty]}
+                    ListEmptyComponent={emptyList}
+                    data={data}
+                    onRefresh={handleRefresh}
+                    refreshing={refreshing}
+                    renderItem={renderItem}
+                    scrollToOverflowEnabled={true}
+                    onViewableItemsChanged={onViewableItemsChanged}
+                    testID='pinned_messages.post_list.flat_list'
+                />
+            </PostConfigProvider>
         </SafeAreaView>
     );
 }

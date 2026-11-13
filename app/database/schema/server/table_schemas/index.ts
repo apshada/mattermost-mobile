@@ -3,10 +3,13 @@
 
 export {default as CategorySchema} from './category';
 export {default as CategoryChannelSchema} from './category_channel';
+export {default as ChannelSchema} from './channel';
+export {default as ChannelBookmarkSchema} from './channel_bookmark';
 export {default as ChannelInfoSchema} from './channel_info';
 export {default as ChannelMembershipSchema} from './channel_membership';
-export {default as ChannelSchema} from './channel';
 export {default as CustomEmojiSchema} from './custom_emoji';
+export {default as CustomProfileFieldSchema} from './custom_profile_field';
+export {default as CustomProfileAttributeSchema} from './custom_profile_attribute';
 export {default as DraftSchema} from './draft';
 export {default as FileSchema} from './file';
 export {default as GroupSchema} from './group';
@@ -20,8 +23,11 @@ export {default as PostInThreadSchema} from './posts_in_thread';
 export {default as PostSchema} from './post';
 export {default as PostsInChannelSchema} from './posts_in_channel';
 export {default as PreferenceSchema} from './preference';
+export {default as PropertyFieldSchema} from './property_field';
+export {default as PropertyValueSchema} from './property_value';
 export {default as ReactionSchema} from './reaction';
 export {default as RoleSchema} from './role';
+export {default as ScheduledPostSchema} from './scheduled_post';
 export {default as SystemSchema} from './system';
 export {default as TeamChannelHistorySchema} from './team_channel_history';
 export {default as TeamMembershipSchema} from './team_membership';

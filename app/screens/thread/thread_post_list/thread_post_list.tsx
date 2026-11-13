@@ -1,9 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useMemo, useRef} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {ActivityIndicator, StyleSheet, View} from 'react-native';
-import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 
 import {fetchPostThread} from '@actions/remote/post';
 import {markThreadAsRead} from '@actions/remote/thread';
@@ -12,9 +11,10 @@ import PostList from '@components/post_list';
 import {Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {debounce} from '@helpers/api/general';
-import {useAppState, useIsTablet} from '@hooks/device';
+import {useAppState} from '@hooks/device';
+import useDidMount from '@hooks/did_mount';
 import {useFetchingThreadState} from '@hooks/fetching_thread';
+import {useDebounce} from '@hooks/utils';
 import {isMinimumServerVersion} from '@utils/helpers';
 
 import type PostModel from '@typings/database/models/servers/post';
@@ -23,15 +23,12 @@ import type ThreadModel from '@typings/database/models/servers/thread';
 type Props = {
     channelLastViewedAt: number;
     isCRTEnabled: boolean;
-    nativeID: string;
     posts: PostModel[];
     rootPost: PostModel;
     teamId: string;
     thread?: ThreadModel;
     version?: string;
 }
-
-const edges: Edge[] = ['bottom'];
 
 const styles = StyleSheet.create({
     container: {marginTop: 10},
@@ -41,16 +38,16 @@ const styles = StyleSheet.create({
 
 const ThreadPostList = ({
     channelLastViewedAt, isCRTEnabled,
-    nativeID, posts, rootPost, teamId, thread, version,
+    posts, rootPost, teamId, thread, version,
 }: Props) => {
     const appState = useAppState();
-    const isTablet = useIsTablet();
     const serverUrl = useServerUrl();
     const theme = useTheme();
     const isFetchingThread = useFetchingThreadState(rootPost.id);
+    const [showHeader, setShowHeader] = useState(false);
 
     const canLoadMorePosts = useRef(true);
-    const onEndReached = useCallback(debounce(async () => {
+    const onEndReached = useDebounce(useCallback(async () => {
         if (isMinimumServerVersion(version || '', 6, 7) && !isFetchingThread && canLoadMorePosts.current && posts.length) {
             const options: FetchPaginatedThreadOptions = {
                 perPage: PER_PAGE_DEFAULT,
@@ -67,18 +64,18 @@ const ThreadPostList = ({
         } else {
             canLoadMorePosts.current = false;
         }
-    }, 500), [isFetchingThread, rootPost, posts, version]);
+    }, [version, isFetchingThread, posts, serverUrl, rootPost.id]), 500);
 
     const threadPosts = useMemo(() => {
         return [...posts, rootPost];
     }, [posts, rootPost]);
 
     // If CRT is enabled, mark the thread as read on mount.
-    useEffect(() => {
+    useDidMount(() => {
         if (isCRTEnabled && thread?.isFollowing) {
             markThreadAsRead(serverUrl, teamId, rootPost.id);
         }
-    }, []);
+    });
 
     // If CRT is enabled, When new post arrives and thread modal is open, mark thread as read.
     const oldPostsCount = useRef<number>(posts.length);
@@ -87,14 +84,23 @@ const ThreadPostList = ({
             oldPostsCount.current = posts.length;
             markThreadAsRead(serverUrl, teamId, rootPost.id, false);
         }
-    }, [isCRTEnabled, posts, rootPost, serverUrl, teamId, thread, appState === 'active']);
+    }, [isCRTEnabled, posts, rootPost, serverUrl, teamId, thread, appState]);
 
     const lastViewedAt = isCRTEnabled ? (thread?.viewedAt ?? 0) : channelLastViewedAt;
 
-    let header;
-    if (isFetchingThread && threadPosts.length === 1) {
-        header = <ActivityIndicator color={theme.centerChannelColor}/>;
-    }
+    useEffect(() => {
+        const raf = requestAnimationFrame(() => {
+            setShowHeader(isFetchingThread && threadPosts.length === 1);
+        });
+        return () => cancelAnimationFrame(raf);
+    }, [isFetchingThread, threadPosts.length, theme.centerChannelColor]);
+
+    const header = useMemo(() => {
+        if (showHeader) {
+            return <ActivityIndicator color={theme.centerChannelColor}/>;
+        }
+        return undefined;
+    }, [showHeader, theme.centerChannelColor]);
 
     const postList = (
         <PostList
@@ -104,7 +110,6 @@ const ThreadPostList = ({
             isCRTEnabled={isCRTEnabled}
             lastViewedAt={lastViewedAt}
             location={Screens.THREAD}
-            nativeID={nativeID}
             onEndReached={onEndReached}
             posts={threadPosts}
             rootId={rootPost.id}
@@ -116,18 +121,7 @@ const ThreadPostList = ({
         />
     );
 
-    if (isTablet) {
-        return postList;
-    }
-
-    return (
-        <SafeAreaView
-            edges={edges}
-            style={styles.flex}
-        >
-            {postList}
-        </SafeAreaView>
-    );
+    return postList;
 };
 
 export default ThreadPostList;

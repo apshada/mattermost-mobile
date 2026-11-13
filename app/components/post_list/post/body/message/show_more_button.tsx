@@ -1,11 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {LinearGradient, type LinearGradientProps} from 'expo-linear-gradient';
 import React from 'react';
 import {TouchableOpacity, View} from 'react-native';
-import LinearGradient from 'react-native-linear-gradient';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
 type ShowMoreButtonProps = {
@@ -69,12 +69,12 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
 const ShowMoreButton = ({highlight, onPress, showMore = true, theme}: ShowMoreButtonProps) => {
     const style = getStyleSheet(theme);
 
-    let iconName = 'chevron-down';
+    let iconName: CompassIconName = 'chevron-down';
     if (!showMore) {
         iconName = 'chevron-up';
     }
 
-    let gradientColors = [
+    let gradientColors: LinearGradientProps['colors'] = [
         changeOpacity(theme.centerChannelBg, 0),
         changeOpacity(theme.centerChannelBg, 0.75),
         theme.centerChannelBg,
@@ -102,11 +102,9 @@ const ShowMoreButton = ({highlight, onPress, showMore = true, theme}: ShowMoreBu
                 <TouchableOpacity
                     onPress={onPress}
                     style={style.buttonContainer}
+                    testID={`show_more.button.${iconName}`}
                 >
-                    <View
-                        style={style.button}
-                        testID={`show_more.button.${iconName}`}
-                    >
+                    <View style={style.button}>
                         <CompassIcon
                             name={iconName}
                             size={28}

@@ -7,7 +7,7 @@ import {StyleSheet, View} from 'react-native';
 import {searchCustomEmojis} from '@actions/remote/custom_emoji';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {debounce} from '@helpers/api/general';
+import {useDebounce} from '@hooks/utils';
 import {getKeyboardAppearanceFromTheme} from '@utils/theme';
 
 import EmojiFiltered from './filtered';
@@ -31,27 +31,29 @@ type Props = {
     customEmojis: CustomEmojiModel[];
     customEmojisEnabled: boolean;
     onEmojiPress: (emoji: string) => void;
+    imageUrl?: string;
+    file?: ExtractedFileInfo;
     recentEmojis: string[];
     testID?: string;
 }
 
-const Picker = ({customEmojis, customEmojisEnabled, onEmojiPress, recentEmojis, testID = ''}: Props) => {
+const Picker = ({customEmojis, customEmojisEnabled, file, imageUrl, onEmojiPress, recentEmojis, testID = ''}: Props) => {
     const theme = useTheme();
     const serverUrl = useServerUrl();
     const [searchTerm, setSearchTerm] = useState<string|undefined>();
 
     const onCancelSearch = useCallback(() => setSearchTerm(undefined), []);
 
-    const onChangeSearchTerm = useCallback((text: string) => {
-        setSearchTerm(text);
-        searchCustom(text.replace(/^:|:$/g, '').trim());
-    }, []);
-
-    const searchCustom = debounce((text: string) => {
+    const searchCustom = useDebounce(useCallback((text: string) => {
         if (text && text.length > 1) {
             searchCustomEmojis(serverUrl, text);
         }
-    }, 500);
+    }, [serverUrl]), 500);
+
+    const onChangeSearchTerm = useCallback((text: string) => {
+        setSearchTerm(text);
+        searchCustom(text.replace(/^:|:$/g, '').trim());
+    }, [searchCustom]);
 
     let EmojiList: React.ReactNode = null;
     const term = searchTerm?.replace(/^:|:$/g, '').trim();
@@ -68,6 +70,8 @@ const Picker = ({customEmojis, customEmojisEnabled, onEmojiPress, recentEmojis, 
             <EmojiSections
                 customEmojis={customEmojis}
                 customEmojisEnabled={customEmojisEnabled}
+                imageUrl={imageUrl}
+                file={file}
                 onEmojiPress={onEmojiPress}
                 recentEmojis={recentEmojis}
             />
@@ -75,10 +79,7 @@ const Picker = ({customEmojis, customEmojisEnabled, onEmojiPress, recentEmojis, 
     }
 
     return (
-        <View
-            style={styles.flex}
-            testID={`${testID}.screen`}
-        >
+        <>
             <View style={styles.searchBar}>
                 <PickerHeader
                     autoCapitalize='none'
@@ -90,7 +91,7 @@ const Picker = ({customEmojis, customEmojisEnabled, onEmojiPress, recentEmojis, 
                 />
             </View>
             {EmojiList}
-        </View>
+        </>
     );
 };
 

@@ -3,27 +3,75 @@
 
 import {Parser} from 'commonmark';
 import Renderer from 'commonmark-react-renderer';
-import React, {type ReactElement, useCallback, useMemo, useRef} from 'react';
-import {type StyleProp, Text, type TextStyle} from 'react-native';
+import React, {type ReactElement, type ReactNode, useCallback, useMemo, useRef, useState} from 'react';
+import {type NativeSyntheticEvent, type StyleProp, Text, type TextLayoutEventData, type TextStyle, View} from 'react-native';
 
 import Emoji from '@components/emoji';
-import {computeTextStyle} from '@utils/markdown';
+import {useTheme} from '@context/theme';
+import {computeTextStyle, getMarkdownTextStyles} from '@utils/markdown';
+
+import ChannelMention from '../markdown/channel_mention';
 
 import AtMention from './at_mention';
 
-import type {MarkdownBaseRenderer, MarkdownEmojiRenderer, MarkdownTextStyles} from '@typings/global/markdown';
+import type {MarkdownBaseRenderer, MarkdownChannelMentionRenderer, MarkdownEmojiRenderer} from '@typings/global/markdown';
 
 type Props = {
     enableEmoji?: boolean;
     enableCodeSpan?: boolean;
     enableHardBreak?: boolean;
     enableSoftBreak?: boolean;
+    enableChannelLink?: boolean;
     baseStyle?: StyleProp<TextStyle>;
-    textStyle?: MarkdownTextStyles;
+    numberOfLines?: number;
+    separateHeading?: boolean;
     value: string;
 };
 
-const RemoveMarkdown = ({enableEmoji, enableHardBreak, enableSoftBreak, enableCodeSpan, baseStyle, textStyle = {}, value}: Props) => {
+const filterHeadingContext = (context: string[]) => context.filter((c) => !c.startsWith('heading'));
+
+type HeadingBlockProps = {
+    children: ReactNode;
+    numberOfLines: number;
+    onLineCount: (count: number) => void;
+};
+
+const HeadingBlock = ({children, numberOfLines, onLineCount}: HeadingBlockProps) => {
+    const handleTextLayout = useCallback((e: NativeSyntheticEvent<TextLayoutEventData>) => {
+        if (numberOfLines > 0) {
+            onLineCount(Math.min(e.nativeEvent.lines.length, numberOfLines));
+        }
+    }, [numberOfLines, onLineCount]);
+
+    return (
+        <Text
+            numberOfLines={numberOfLines || undefined}
+            onTextLayout={numberOfLines > 0 ? handleTextLayout : undefined}
+        >
+            {children}
+        </Text>
+    );
+};
+
+const RemoveMarkdown = ({
+    enableEmoji,
+    enableChannelLink,
+    enableHardBreak,
+    enableSoftBreak,
+    enableCodeSpan,
+    baseStyle,
+    numberOfLines,
+    separateHeading,
+    value,
+}: Props) => {
+    const theme = useTheme();
+    const textStyle = getMarkdownTextStyles(theme);
+    const [headingLineCount, setHeadingLineCount] = useState(0);
+
+    const renderText = useCallback(({literal}: {literal: string}) => {
+        return <Text style={baseStyle}>{literal}</Text>;
+    }, [baseStyle]);
+
     const renderEmoji = useCallback(({emojiName, literal}: MarkdownEmojiRenderer) => {
         if (!enableEmoji) {
             return renderText({literal});
@@ -37,24 +85,34 @@ const RemoveMarkdown = ({enableEmoji, enableHardBreak, enableSoftBreak, enableCo
                 textStyle={baseStyle}
             />
         );
-    }, [baseStyle, enableEmoji]);
+    }, [baseStyle, enableEmoji, renderText]);
 
     const renderBreak = useCallback(() => {
         return '\n';
     }, []);
 
-    const renderText = useCallback(({literal}: {literal: string}) => {
-        return <Text style={baseStyle}>{literal}</Text>;
-    }, [baseStyle]);
-
-    const renderAtMention = ({context, mentionName}: {context: string[]; mentionName: string}) => {
+    const renderAtMention = useCallback(({context, mentionName}: {context: string[]; mentionName: string}) => {
         return (
             <AtMention
-                textStyle={computeTextStyle(textStyle, baseStyle, context)}
+                textStyle={computeTextStyle(textStyle, baseStyle, filterHeadingContext(context))}
                 mentionName={mentionName}
             />
         );
-    };
+    }, [baseStyle, textStyle]);
+
+    const renderChannelLink = useCallback(({context, channelName}: MarkdownChannelMentionRenderer) => {
+        if (enableChannelLink) {
+            return (
+                <ChannelMention
+                    linkStyle={textStyle.link}
+                    textStyle={computeTextStyle(textStyle, baseStyle, filterHeadingContext(context))}
+                    channelName={channelName}
+                />
+            );
+        }
+
+        return renderText({literal: `~${channelName}`});
+    }, [baseStyle, enableChannelLink, renderText, textStyle]);
 
     const renderCodeSpan = useCallback(({context, literal}: MarkdownBaseRenderer) => {
         if (!enableCodeSpan) {
@@ -70,7 +128,33 @@ const RemoveMarkdown = ({enableEmoji, enableHardBreak, enableSoftBreak, enableCo
                 {literal}
             </Text>
         );
-    }, [baseStyle, textStyle, enableCodeSpan]);
+    }, [enableCodeSpan, textStyle, baseStyle, renderText]);
+
+    const renderHeading = useCallback(({children}: {children: ReactNode}) => {
+        if (separateHeading) {
+            return (
+                <HeadingBlock
+                    numberOfLines={numberOfLines ?? 0}
+                    onLineCount={setHeadingLineCount}
+                >
+                    {children}
+                </HeadingBlock>
+            );
+        }
+        return <Text>{children}{'\n'}</Text>;
+    }, [numberOfLines, separateHeading]);
+
+    const paragraphLines = numberOfLines ? Math.max(0, numberOfLines - headingLineCount) : 0;
+
+    const renderParagraph = useCallback(({children, first}: {children: ReactNode; first: boolean}) => {
+        if (separateHeading) {
+            if (!first || (numberOfLines && paragraphLines === 0)) {
+                return null;
+            }
+            return <Text numberOfLines={paragraphLines || undefined}>{children}</Text>;
+        }
+        return <>{children}</>;
+    }, [numberOfLines, paragraphLines, separateHeading]);
 
     const renderNull = () => {
         return null;
@@ -88,13 +172,13 @@ const RemoveMarkdown = ({enableEmoji, enableHardBreak, enableSoftBreak, enableCo
                 link: Renderer.forwardChildren,
                 image: renderNull,
                 atMention: renderAtMention,
-                channelLink: Renderer.forwardChildren,
+                channelLink: renderChannelLink,
                 emoji: renderEmoji,
                 hashtag: Renderer.forwardChildren,
                 latexinline: Renderer.forwardChildren,
 
-                paragraph: Renderer.forwardChildren,
-                heading: Renderer.forwardChildren,
+                paragraph: renderParagraph,
+                heading: renderHeading,
                 codeBlock: renderNull,
                 blockQuote: renderNull,
 
@@ -118,11 +202,34 @@ const RemoveMarkdown = ({enableEmoji, enableHardBreak, enableSoftBreak, enableCo
         });
     };
 
-    const parser = useRef(new Parser()).current;
-    const renderer = useMemo(createRenderer, [renderText, renderEmoji]);
+    // Pattern suggested in https://react.dev/reference/react/useRef#avoiding-recreating-the-ref-contents
+    const parserRef = useRef<Parser | null>(null);
+    if (parserRef.current === null) {
+        parserRef.current = new Parser();
+    }
+    const parser = parserRef.current;
+
+    const renderer = useMemo(createRenderer, [
+        renderText,
+        renderCodeSpan,
+        renderAtMention,
+        renderChannelLink,
+        renderEmoji,
+        renderHeading,
+        renderParagraph,
+        enableHardBreak,
+        renderBreak,
+        enableSoftBreak,
+    ]);
     const ast = parser.parse(value);
 
-    return renderer.render(ast) as ReactElement;
+    const rendered = renderer.render(ast) as ReactElement;
+
+    if (separateHeading) {
+        return <View>{rendered}</View>;
+    }
+
+    return rendered;
 };
 
 export default RemoveMarkdown;

@@ -1,29 +1,50 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {useNavigation} from 'expo-router';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {useIntl} from 'react-intl';
-import {Alert, Keyboard, type LayoutChangeEvent, Platform, SafeAreaView, View, StyleSheet} from 'react-native';
+import {Alert, type LayoutChangeEvent, View, StyleSheet} from 'react-native';
+import {KeyboardAvoidingView} from 'react-native-keyboard-controller';
+import {SafeAreaView, type Edge} from 'react-native-safe-area-context';
 
 import {deletePost, editPost} from '@actions/remote/post';
 import Autocomplete from '@components/autocomplete';
 import Loading from '@components/loading';
+import NavigationButton from '@components/navigation_button';
+import {QUICK_ACTIONS_HEIGHT} from '@components/post_draft/quick_actions/quick_actions';
+import {Screens} from '@constants';
+import {EditPostProvider} from '@context/edit_post';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
 import {useAutocompleteDefaultAnimatedValues} from '@hooks/autocomplete';
 import {useKeyboardOverlap} from '@hooks/device';
-import useDidUpdate from '@hooks/did_update';
-import {useInputPropagation} from '@hooks/input';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
+import {useFetchRenderPermissions} from '@hooks/render_permissions';
+import DraftEditPostUploadManager from '@managers/draft_upload_manager';
 import PostError from '@screens/edit_post/post_error';
-import {buildNavigationButton, dismissModal, setButtons} from '@screens/navigation';
-import {changeOpacity} from '@utils/theme';
+import {navigateBack} from '@screens/navigation';
+import {expireChannelDecisionsOnDenial, writeDenialMessage} from '@utils/channel_policy';
+import {fileMaxWarning, fileSizeWarning, getUploadErrorMessage, uploadDisabledByPolicyWarning, uploadDisabledWarning} from '@utils/file';
+import {dismissKeyboard} from '@utils/keyboard';
 
-import EditPostInput, {type EditPostInputRef} from './edit_post_input';
+import EditPostInput from './edit_post_input';
 
+import type {PasteTextInputInstance} from '@mattermost/react-native-paste-input';
+import type {ErrorHandlers} from '@typings/components/upload_error_handlers';
 import type PostModel from '@typings/database/models/servers/post';
-import type {AvailableScreens} from '@typings/screens/navigation';
+
+type EditPostProps = {
+    post: PostModel;
+    maxPostSize: number;
+    canDelete: boolean;
+    files?: FileInfo[];
+    maxFileCount: number;
+    maxFileSize: number;
+    canUploadFiles: boolean;
+    canUploadFilesByPolicy: boolean;
+    writeDenied: boolean;
+}
 
 const AUTOCOMPLETE_SEPARATION = 8;
 
@@ -39,38 +60,65 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         justifyContent: 'center',
     },
+    inputContainer: {
+        flex: 1,
+    },
 });
 
-const RIGHT_BUTTON = buildNavigationButton('edit-post', 'edit_post.save.button');
+const safeAreaEdges: Edge[] = ['left', 'right', 'bottom'];
 
-type EditPostProps = {
-    componentId: AvailableScreens;
-    closeButtonId: string;
-    post: PostModel;
-    maxPostSize: number;
-    hasFilesAttached: boolean;
-    canDelete: boolean;
-}
-const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttached, canDelete}: EditPostProps) => {
+const EditPost = ({
+    maxPostSize,
+    post,
+    canDelete,
+    files,
+    maxFileCount,
+    maxFileSize,
+    canUploadFiles,
+    canUploadFilesByPolicy,
+    writeDenied,
+}: EditPostProps) => {
     const editingMessage = post.messageSource || post.message;
+    const navigation = useNavigation();
     const [postMessage, setPostMessage] = useState(editingMessage);
     const [cursorPosition, setCursorPosition] = useState(editingMessage.length);
     const [errorLine, setErrorLine] = useState<string | undefined>();
     const [errorExtra, setErrorExtra] = useState<string | undefined>();
     const [isUpdating, setIsUpdating] = useState(false);
     const [containerHeight, setContainerHeight] = useState(0);
-    const [propagateValue, shouldProcessEvent] = useInputPropagation();
+    const [postFiles, setPostFiles] = useState<FileInfo[]>(files || []);
+    const [canSave, setCanSave] = useState(false);
 
     const mainView = useRef<View>(null);
+    const uploadErrorHandlers = useRef<ErrorHandlers>({});
 
-    const postInputRef = useRef<EditPostInputRef>(null);
+    const postInputRef = useRef<PasteTextInputInstance | null>(null);
     const theme = useTheme();
     const intl = useIntl();
     const serverUrl = useServerUrl();
+    useFetchRenderPermissions(post.channelId);
 
-    useEffect(() => {
-        toggleSaveButton(false);
-    }, []);
+    const hasNoCurrentFiles = postFiles.length === 0;
+    const shouldDeleteOnSave = !postMessage && canDelete && hasNoCurrentFiles;
+
+    const shouldEnableSaveButton = useCallback(() => {
+        const loadingFiles = postFiles.filter((v) => v.clientId && DraftEditPostUploadManager.isUploading(v.clientId));
+        const hasUploadingFiles = loadingFiles.length > 0;
+        const tooLong = postMessage.length > maxPostSize;
+
+        const messageChanged = editingMessage !== postMessage;
+
+        const originalFiles = files || [];
+        const originalFileIds = originalFiles.map((f) => f.id).sort();
+        const currentFileIds = postFiles.map((f) => f.id).filter((id) => id).sort();
+        const filesChanged = JSON.stringify(originalFileIds) !== JSON.stringify(currentFileIds);
+
+        // Enable save button if:
+        // 1. No files are uploading AND
+        // 2. No message length error AND
+        // 3. (Message changed OR files changed)
+        return !hasUploadingFiles && !tooLong && (messageChanged || filesChanged);
+    }, [postMessage, postFiles, editingMessage, maxPostSize, files]);
 
     useEffect(() => {
         const t = setTimeout(() => {
@@ -82,57 +130,206 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
         };
     }, []);
 
-    useDidUpdate(() => {
-        // Workaround to avoid iOS emdash autocorrect in Code Blocks
-        if (Platform.OS === 'ios') {
-            onTextSelectionChange();
-        }
-    }, [postMessage]);
-
     const onClose = useCallback(() => {
-        Keyboard.dismiss();
-        dismissModal({componentId});
+        dismissKeyboard();
+        navigateBack();
     }, []);
 
     const onTextSelectionChange = useCallback((curPos: number = cursorPosition) => {
         setCursorPosition(curPos);
-    }, [cursorPosition, postMessage]);
+    }, [cursorPosition]);
 
-    const toggleSaveButton = useCallback((enabled = true) => {
-        setButtons(componentId, {
-            rightButtons: [{
-                ...RIGHT_BUTTON,
-                color: theme.sidebarHeaderTextColor,
-                disabledColor: changeOpacity(theme.sidebarHeaderTextColor, 0.32),
-                text: intl.formatMessage({id: 'edit_post.save', defaultMessage: 'Save'}),
-                enabled,
-            }],
+    const updateFileInPostFiles = useCallback((updatedFile: FileInfo) => {
+        const hasSameClientId = (file: FileInfo) => {
+            return file.clientId === updatedFile.clientId;
+        };
+
+        setPostFiles((prevFiles) => {
+            const fileIndex = prevFiles.findIndex(hasSameClientId);
+            if (fileIndex >= 0) {
+                const newFiles = [...prevFiles];
+                newFiles[fileIndex] = updatedFile;
+                return newFiles;
+            }
+            return prevFiles;
         });
-    }, [componentId, intl, theme]);
+    }, []);
+
+    const handleUploadError = useCallback((errorMessage: string, errorName?: string) => {
+        setErrorLine(getUploadErrorMessage(intl, errorMessage, errorName));
+    }, [intl]);
+
+    const addFiles = useCallback((newFiles: FileInfo[]) => {
+        if (!newFiles.length) {
+            return;
+        }
+
+        if (!canUploadFiles) {
+            setErrorLine(uploadDisabledWarning(intl));
+            return;
+        }
+
+        if (!canUploadFilesByPolicy) {
+            setErrorLine(uploadDisabledByPolicyWarning(intl));
+            return;
+        }
+
+        const currentFileCount = postFiles?.length || 0;
+        const availableCount = maxFileCount - currentFileCount;
+        if (newFiles.length > availableCount) {
+            setErrorLine(fileMaxWarning(intl, maxFileCount));
+            return;
+        }
+
+        const largeFile = newFiles.find((file) => file.size > maxFileSize);
+        if (largeFile) {
+            setErrorLine(fileSizeWarning(intl, maxFileSize));
+            return;
+        }
+
+        setPostFiles((prevFiles) => [...prevFiles, ...newFiles]);
+
+        // Start uploads for new files using the upload manager
+        for (const file of newFiles) {
+            DraftEditPostUploadManager.prepareUpload(
+                serverUrl,
+                file,
+                post.channelId,
+                post.rootId,
+                0,
+                true, // isEditPost = true
+                updateFileInPostFiles,
+            );
+            uploadErrorHandlers.current[file.clientId!] = DraftEditPostUploadManager.registerErrorHandler(file.clientId!, handleUploadError);
+        }
+
+        const currentMessageTooLong = postMessage.length > maxPostSize;
+        if (!currentMessageTooLong) {
+            setErrorLine(undefined);
+        }
+    }, [canUploadFiles, canUploadFilesByPolicy, postFiles?.length, maxFileCount, setErrorLine, intl, maxFileSize, serverUrl, post.channelId, post.rootId, updateFileInPostFiles, postMessage, maxPostSize, handleUploadError]);
+
+    const handleFileRemoval = useCallback((id: string) => {
+        const fileToRemove = postFiles?.find((file) => {
+            if (file.id && id) {
+                return file.id === id;
+            }
+            if (file.clientId && id) {
+                return file.clientId === id;
+            }
+            return false;
+        });
+
+        if (!fileToRemove) {
+            return;
+        }
+
+        const shouldKeepFile = (file: FileInfo) => {
+            if (fileToRemove.id && file.id) {
+                return file.id !== fileToRemove.id;
+            }
+            if (fileToRemove.clientId && file.clientId) {
+                return file.clientId !== fileToRemove.clientId;
+            }
+            return file !== fileToRemove;
+        };
+
+        const removeFileAction = () => {
+            if (fileToRemove.clientId && DraftEditPostUploadManager.isUploading(fileToRemove.clientId)) {
+                DraftEditPostUploadManager.cancel(fileToRemove.clientId);
+                if (uploadErrorHandlers.current[fileToRemove.clientId]) {
+                    uploadErrorHandlers.current[fileToRemove.clientId]?.();
+                    delete uploadErrorHandlers.current[fileToRemove.clientId];
+                }
+            }
+
+            // Remove the specific file by using a unique identifier combination
+            setPostFiles((prevFiles) => prevFiles?.filter(shouldKeepFile) || []);
+        };
+
+        const originalFiles = files || [];
+        const isNewlyUploadedFile = !originalFiles.some((originalFile) => {
+            return originalFile.id === fileToRemove.id;
+        });
+
+        if (isNewlyUploadedFile) {
+            removeFileAction();
+        } else {
+            Alert.alert(
+                intl.formatMessage({
+                    id: 'edit_post.delete_file.title',
+                    defaultMessage: 'Delete attachment',
+                }),
+                intl.formatMessage({
+                    id: 'edit_post.delete_file.confirmation',
+                    defaultMessage: 'Are you sure you want to remove {filename}?',
+                }, {
+                    filename: fileToRemove.name || '',
+                }),
+                [
+                    {
+                        text: intl.formatMessage({
+                            id: 'edit_post.delete_file.cancel',
+                            defaultMessage: 'Cancel',
+                        }),
+                        style: 'cancel',
+                    },
+                    {
+                        text: intl.formatMessage({
+                            id: 'edit_post.delete_file.confirm',
+                            defaultMessage: 'Delete',
+                        }),
+                        style: 'destructive',
+                        onPress: removeFileAction,
+                    },
+                ],
+            );
+        }
+    }, [intl, postFiles, files]);
+
+    useEffect(() => {
+        let loadingFiles: FileInfo[] = [];
+        if (postFiles) {
+            loadingFiles = postFiles.filter((v) => v.clientId && DraftEditPostUploadManager.isUploading(v.clientId));
+        }
+
+        setCanSave(shouldEnableSaveButton());
+
+        for (const key of Object.keys(uploadErrorHandlers.current)) {
+            if (!loadingFiles.find((v) => v.clientId === key)) {
+                uploadErrorHandlers.current[key]?.();
+                delete uploadErrorHandlers.current[key];
+            }
+        }
+
+        for (const file of loadingFiles) {
+            if (file.clientId && !uploadErrorHandlers.current[file.clientId]) {
+                uploadErrorHandlers.current[file.clientId] = DraftEditPostUploadManager.registerErrorHandler(file.clientId, handleUploadError);
+            }
+        }
+    }, [handleUploadError, postFiles, postMessage, setErrorLine, shouldEnableSaveButton]);
 
     const onChangeTextCommon = useCallback((message: string) => {
-        const tooLong = message.trim().length > maxPostSize;
-        setErrorLine(undefined);
+        const tooLong = message.length > maxPostSize;
         setErrorExtra(undefined);
+
         if (tooLong) {
             const line = intl.formatMessage({id: 'mobile.message_length.message_split_left', defaultMessage: 'Message exceeds the character limit'});
-            const extra = `${message.trim().length} / ${maxPostSize}`;
+            const extra = `${message.length} / ${maxPostSize}`;
             setErrorLine(line);
             setErrorExtra(extra);
+        } else {
+            // Clear any error when message is valid
+            setErrorLine(undefined);
         }
-        toggleSaveButton(editingMessage !== message && !tooLong);
-    }, [intl, maxPostSize, editingMessage, toggleSaveButton]);
+    }, [intl, maxPostSize]);
 
     const onAutocompleteChangeText = useCallback((message: string) => {
         setPostMessage(message);
-        propagateValue(message);
         onChangeTextCommon(message);
     }, [onChangeTextCommon]);
 
     const onInputChangeText = useCallback((message: string) => {
-        if (!shouldProcessEvent(message)) {
-            return;
-        }
         setPostMessage(message);
         onChangeTextCommon(message);
     }, [onChangeTextCommon]);
@@ -140,14 +337,15 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
     const handleUIUpdates = useCallback((res: {error?: unknown}) => {
         if (res.error) {
             setIsUpdating(false);
-            const errorMessage = intl.formatMessage({id: 'mobile.edit_post.error', defaultMessage: 'There was a problem editing this message. Please try again.'});
+            expireChannelDecisionsOnDenial(serverUrl, post.channelId, res.error);
+            const errorMessage = writeDenialMessage(intl, res.error) ?? intl.formatMessage({id: 'mobile.edit_post.error', defaultMessage: 'There was a problem editing this message. Please try again.'});
             setErrorLine(errorMessage);
             postInputRef?.current?.focus();
         } else {
             setIsUpdating(false);
             onClose();
         }
-    }, []);
+    }, [intl, onClose, serverUrl, post.channelId]);
 
     const handleDeletePost = useCallback(async () => {
         Alert.alert(
@@ -161,7 +359,7 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
                 style: 'cancel',
                 onPress: () => {
                     setIsUpdating(false);
-                    toggleSaveButton();
+                    setCanSave(false);
                     setPostMessage(editingMessage);
                 },
             }, {
@@ -173,35 +371,50 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
                 },
             }],
         );
-    }, [serverUrl, editingMessage]);
+    }, [intl, editingMessage, serverUrl, post, handleUIUpdates]);
 
     const onSavePostMessage = useCallback(async () => {
         setIsUpdating(true);
         setErrorLine(undefined);
         setErrorExtra(undefined);
-        toggleSaveButton(false);
-        if (!postMessage && canDelete && !hasFilesAttached) {
+        setCanSave(false);
+        if (shouldDeleteOnSave) {
             handleDeletePost();
             return;
         }
 
-        const res = await editPost(serverUrl, post.id, postMessage);
+        const currentFileIds = postFiles.map((file) => file.id).filter((id): id is string => Boolean(id));
+        const originalFiles = post.metadata?.files || [];
+        const originalFileIds = originalFiles.map((file) => file.id).filter((id): id is string => Boolean(id));
+        const currentFileIdSet = new Set(currentFileIds);
+        const removedFileIds = originalFileIds.filter((id) => !currentFileIdSet.has(id));
+
+        const res = await editPost(serverUrl, post.id, postMessage, currentFileIds, removedFileIds);
         handleUIUpdates(res);
-    }, [toggleSaveButton, serverUrl, post.id, postMessage, onClose]);
+    }, [shouldDeleteOnSave, post.metadata?.files, post.id, serverUrl, postMessage, handleUIUpdates, handleDeletePost, postFiles]);
+
+    useEffect(() => {
+        navigation.setOptions({
+            headerRight: () => (
+                <NavigationButton
+                    onPress={onSavePostMessage}
+                    disabled={!canSave || writeDenied}
+                    testID={'edit_post.save.button'}
+                    text={intl.formatMessage({id: 'mobile.edit_post.save', defaultMessage: 'Save'})}
+                />
+            ),
+        });
+    }, [navigation, onSavePostMessage, theme.sidebarHeaderTextColor, canSave, writeDenied, intl]);
 
     const onLayout = useCallback((e: LayoutChangeEvent) => {
         setContainerHeight(e.nativeEvent.layout.height);
     }, []);
 
-    useNavButtonPressed(RIGHT_BUTTON.id, componentId, onSavePostMessage, [postMessage]);
-    useNavButtonPressed(closeButtonId, componentId, onClose, []);
-    useAndroidHardwareBackHandler(componentId, onClose);
+    useAndroidHardwareBackHandler(Screens.EDIT_POST, onClose);
 
-    const overlap = useKeyboardOverlap(mainView, containerHeight);
-    const autocompletePosition = overlap + AUTOCOMPLETE_SEPARATION;
+    const overlap = useKeyboardOverlap();
+    const autocompletePosition = overlap + AUTOCOMPLETE_SEPARATION + QUICK_ACTIONS_HEIGHT;
     const autocompleteAvailableSpace = containerHeight - autocompletePosition;
-
-    const inputHeight = containerHeight - overlap;
 
     const [animatedAutocompletePosition, animatedAutocompleteAvailableSpace] = useAutocompleteDefaultAnimatedValues(autocompletePosition, autocompleteAvailableSpace);
 
@@ -214,35 +427,52 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
     }
 
     return (
-        <>
+        <EditPostProvider
+            onFileRemove={handleFileRemoval}
+            updateFileCallback={updateFileInPostFiles}
+            isEditMode={true}
+        >
             <SafeAreaView
                 testID='edit_post.screen'
                 style={styles.container}
+                edges={safeAreaEdges}
                 onLayout={onLayout}
             >
-                <View
-                    style={styles.body}
-                    ref={mainView}
+                <KeyboardAvoidingView
+                    behavior={'padding'}
+                    automaticOffset={true}
+                    style={styles.inputContainer}
                 >
-                    {Boolean((errorLine || errorExtra)) &&
-                        <PostError
-                            errorExtra={errorExtra}
-                            errorLine={errorLine}
-                        />
-                    }
-                    <EditPostInput
-                        inputHeight={inputHeight}
-                        hasError={Boolean(errorLine)}
-                        message={postMessage}
-                        onChangeText={onInputChangeText}
-                        onTextSelectionChange={onTextSelectionChange}
-                        ref={postInputRef}
-                    />
-                </View>
+                    <View
+                        style={styles.body}
+                        ref={mainView}
+                    >
+                        {Boolean((errorLine || errorExtra)) &&
+                            <PostError
+                                errorExtra={errorExtra}
+                                errorLine={errorLine}
+                            />
+                        }
+                        <View style={styles.inputContainer}>
+                            <EditPostInput
+                                hasError={Boolean(errorLine || errorExtra)}
+                                message={postMessage}
+                                onChangeText={onInputChangeText}
+                                onTextSelectionChange={onTextSelectionChange}
+                                updateCursorPosition={setCursorPosition}
+                                updateValue={setPostMessage}
+                                inputRef={postInputRef}
+                                post={post}
+                                postFiles={postFiles}
+                                addFiles={addFiles}
+                            />
+                        </View>
+                    </View>
+                </KeyboardAvoidingView>
             </SafeAreaView>
             <Autocomplete
                 channelId={post.channelId}
-                hasFilesAttached={hasFilesAttached}
+                shouldDirectlyReact={false}
                 nestedScrollEnabled={true}
                 rootId={post.rootId}
                 updateValue={onAutocompleteChangeText}
@@ -250,10 +480,9 @@ const EditPost = ({componentId, maxPostSize, post, closeButtonId, hasFilesAttach
                 cursorPosition={cursorPosition}
                 position={animatedAutocompletePosition}
                 availableSpace={animatedAutocompleteAvailableSpace}
-                inPost={false}
                 serverUrl={serverUrl}
             />
-        </>
+        </EditPostProvider>
     );
 };
 

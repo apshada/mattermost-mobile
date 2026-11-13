@@ -11,13 +11,23 @@ import DatabaseManager from '@database/manager';
 import {DEFAULT_LOCALE} from '@i18n';
 import {getUserById} from '@queries/servers/user';
 import {toMilliseconds} from '@utils/datetime';
+import {ensureString, includes} from '@utils/types';
 import {displayUsername, getUserIdFromChannelName} from '@utils/user';
 
 import type PostModel from '@typings/database/models/servers/post';
 import type UserModel from '@typings/database/models/servers/user';
 import type {IntlShape} from 'react-intl';
 
-export function areConsecutivePosts(post: PostModel, previousPost: PostModel) {
+export function hasAiGeneratedMetadata(post: PostModel | Post): boolean {
+    return Boolean(ensureString(post.props?.ai_generated_by) && ensureString(post.props?.ai_generated_by_username));
+}
+
+export function areConsecutivePosts(post: PostModel, previousPost: PostModel, userLocale: string) {
+    // Caller already excludes AI current posts; break after an AI previous post so the next header shows.
+    if (hasAiGeneratedMetadata(previousPost)) {
+        return false;
+    }
+
     let consecutive = false;
 
     if (post && previousPost) {
@@ -32,11 +42,27 @@ export function areConsecutivePosts(post: PostModel, previousPost: PostModel) {
         !prevPostFromWebhook && isNotSystemMessage;
     }
 
+    if (consecutive) {
+        const postTranslation = getPostTranslation(post, userLocale);
+        const previousPostTranslation = getPostTranslation(previousPost, userLocale);
+        if (postTranslation?.state !== previousPostTranslation?.state) {
+            consecutive = false;
+        }
+    }
+
     return consecutive;
 }
 
 export function isFromWebhook(post: PostModel | Post): boolean {
-    return post.props && post.props.from_webhook === 'true';
+    return post.props?.from_webhook === 'true';
+}
+
+export function isFromBot(post: PostModel | Post): boolean {
+    return post.props?.from_bot === 'true';
+}
+
+export function isFromPlugin(post: PostModel | Post): boolean {
+    return post.props?.from_plugin === 'true';
 }
 
 export function isEdited(post: PostModel): boolean {
@@ -47,8 +73,29 @@ export function isPostEphemeral(post: PostModel): boolean {
     return post.type === Post.POST_TYPES.EPHEMERAL || post.type === Post.POST_TYPES.EPHEMERAL_ADD_TO_CHANNEL || post.deleteAt > 0;
 }
 
+type EphemeralIdentityFields = {
+    create_at?: number;
+    root_id?: string;
+    user_id?: string;
+};
+
+// Integration update payloads are partial posts (often create_at=0). Preserve identity from the stored post.
+export function restoreEphemeralIdentityFieldsForEdit(incoming: Post, stored: EphemeralIdentityFields): Post {
+    const out: Post = {...incoming};
+    if (!out.create_at && stored.create_at) {
+        out.create_at = stored.create_at;
+    }
+    if (!out.root_id && stored.root_id) {
+        out.root_id = stored.root_id;
+    }
+    if (!out.user_id && stored.user_id) {
+        out.user_id = stored.user_id;
+    }
+    return out;
+}
+
 export function isPostFailed(post: PostModel): boolean {
-    return post.props?.failed || ((post.pendingPostId === post.id) && (Date.now() > post.updateAt + POST_TIME_TO_FAIL));
+    return Boolean(post.props?.failed) || ((post.pendingPostId === post.id) && (Date.now() > post.updateAt + POST_TIME_TO_FAIL));
 }
 
 export function isPostPendingOrFailed(post: PostModel): boolean {
@@ -64,15 +111,20 @@ export function fromAutoResponder(post: PostModel): boolean {
 }
 
 export function postUserDisplayName(post: PostModel, author?: UserModel, teammateNameDisplay?: string, enablePostUsernameOverride = false) {
-    if (isFromWebhook(post) && post.props?.override_username && enablePostUsernameOverride) {
-        return post.props.override_username;
+    const overrideUsername = ensureString(post.props?.override_username);
+    if (
+        isFromWebhook(post) &&
+        enablePostUsernameOverride &&
+        overrideUsername
+    ) {
+        return overrideUsername;
     }
 
     return displayUsername(author, author?.locale || DEFAULT_LOCALE, teammateNameDisplay, true);
 }
 
 export function shouldIgnorePost(post: Post): boolean {
-    return Post.IGNORE_POST_TYPES.includes(post.type);
+    return includes(Post.IGNORE_POST_TYPES, post.type);
 }
 
 export const processPostsFetched = (data: PostResponse) => {
@@ -128,7 +180,7 @@ export async function persistentNotificationsConfirmation(serverUrl: string, val
         });
         description = intl.formatMessage({
             id: 'persistent_notifications.dm_channel.description',
-            defaultMessage: '@{username} will be notified every {interval, plural, one {minute} other {{interval} minutes}} until they’ve acknowledged or replied to the message.',
+            defaultMessage: '{username} will be notified every {interval, plural, one {minute} other {{interval} minutes}} until they’ve acknowledged or replied to the message.',
         }, {
             interval: persistentNotificationInterval,
             username: user?.username,
@@ -211,4 +263,137 @@ export async function persistentNotificationsConfirmation(serverUrl: string, val
         description,
         buttons,
     );
+}
+
+export async function sendMessageWithAlert({title, channelName, intl, sendMessageHandler}: {
+    title: string;
+    channelName: string;
+    intl: IntlShape;
+    sendMessageHandler: () => void;
+}) {
+    const buttons: AlertButton[] = [{
+        text: intl.formatMessage({
+            id: 'send_message.confirm.cancel',
+            defaultMessage: 'Cancel',
+        }),
+        style: 'cancel',
+    }, {
+        text: intl.formatMessage({
+            id: 'send_message.confirm.send',
+            defaultMessage: 'Send',
+        }),
+        onPress: sendMessageHandler,
+    }];
+
+    const description = intl.formatMessage({
+        id: 'send_message.confirm.description',
+        defaultMessage: 'Are you sure you want to send this message to {channelName} now?',
+    }, {
+        channelName,
+    });
+
+    Alert.alert(
+        title,
+        description,
+        buttons,
+    );
+}
+
+export function scheduledPostFromPost(post: Post, schedulingInfo: SchedulingInfo, postPriority?: PostPriority, postFiles?: FileInfo[]): ScheduledPost {
+    const fileIDs: string[] = [];
+    if (postFiles) {
+        postFiles.forEach((file) => {
+            if (file.id) {
+                fileIDs.push(file.id);
+            }
+        });
+    }
+
+    return {
+        ...post,
+        scheduled_at: schedulingInfo.scheduled_at,
+        repeat_type: schedulingInfo.repeat_type,
+        repeat_timezone: schedulingInfo.repeat_timezone,
+        priority: post.root_id ? undefined : postPriority,
+        metadata: {
+            files: postFiles,
+        },
+        file_ids: fileIDs,
+    };
+}
+
+export function getPostTranslation(post: Post | PostModel, locale: string): PostTranslation | undefined {
+    const normalizedLocale = locale.split('-')[0];
+    return post.metadata?.translations?.[normalizedLocale];
+}
+
+export function getPostTranslatedMessage(originalMessage: string, translation: PostTranslation): string {
+    return translation.object?.message ?? originalMessage;
+}
+
+export function hasInteractivePostContent(post: Post | PostModel, mmBlocksEnabled: boolean): boolean {
+    if (!mmBlocksEnabled) {
+        return false;
+    }
+    const nAttachments = Array.isArray(post.props?.attachments) ? post.props?.attachments.length : 0;
+    const hasMmBlocksContent = Boolean(
+        (Array.isArray(post.props?.mm_blocks) && post.props.mm_blocks.length) ||
+        (Array.isArray(post.props?.blocks) && post.props.blocks.length) ||
+        (Array.isArray(post.props?.cards) && post.props.cards.length) ||
+        nAttachments,
+    );
+    return hasMmBlocksContent;
+}
+
+/**
+ * Whether the server denied this user access to the files of the post behind a permalink embed.
+ *
+ * ABAC decisions are made at render time, so the embed the server just sent is authoritative:
+ * it is recalculated per user on every fetch, while the stored linked post may predate the
+ * policy change. A non-zero count means "denied", and the server redacts all of a post's
+ * files or none of them.
+ */
+export function isPermalinkEmbedRedacted(embedData?: PermalinkEmbedData): boolean {
+    return getPermalinkEmbedRedactedCount(embedData) > 0;
+}
+
+function getPermalinkEmbedRedactedCount(embedData?: PermalinkEmbedData): number {
+    return embedData?.post?.metadata?.redacted_file_count ?? 0;
+}
+
+/**
+ * How many files to report as redacted for a permalink preview.
+ *
+ * The embed wins whenever it is conclusive — explicitly denied, or explicitly granted by
+ * listing files. Only when it says neither (no files, no redacted count, e.g. a host post
+ * stored before the policy was applied) do we fall back to what the linked post holds.
+ */
+export function getPermalinkRedactedFileCount(embedData?: PermalinkEmbedData, linkedPostRedactedCount = 0): number {
+    const embedRedactedCount = getPermalinkEmbedRedactedCount(embedData);
+    if (embedRedactedCount > 0) {
+        return embedRedactedCount;
+    }
+
+    if ((embedData?.post?.metadata?.files?.length ?? 0) > 0) {
+        return 0;
+    }
+
+    return linkedPostRedactedCount;
+}
+
+export function isPostRedactionVerified(verifiedEpoch: number | undefined, requiredEpoch: number): boolean {
+    return (verifiedEpoch ?? 0) >= requiredEpoch;
+}
+
+/**
+ * Whether a stored attachment decision may be rendered. While ABAC is enforced it must have been
+ * confirmed under the current required epoch. While it is not, the server redacts nothing new, but a
+ * denial cached while it was enforced is stale until the post is fetched again: its file rows were
+ * destroyed, and no since-fetch re-delivers a post whose only change is its redaction.
+ */
+export function isAttachmentDecisionCurrent(enforced: boolean, verifiedEpoch: number | undefined, requiredEpoch: number, redactedFileCount: number): boolean {
+    if (isPostRedactionVerified(verifiedEpoch, requiredEpoch)) {
+        return true;
+    }
+    return !enforced && redactedFileCount === 0;
 }

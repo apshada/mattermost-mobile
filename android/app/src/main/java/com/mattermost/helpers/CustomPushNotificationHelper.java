@@ -20,7 +20,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.Base64;
-import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
@@ -30,7 +29,9 @@ import androidx.core.app.RemoteInput;
 import androidx.core.graphics.drawable.IconCompat;
 
 import com.mattermost.rnbeta.*;
+import com.mattermost.rnutils.helpers.NotificationHelper;
 import com.nozbe.watermelondb.WMDatabase;
+import com.mattermost.turbolog.TurboLog;
 
 import java.io.IOException;
 import java.security.KeyFactory;
@@ -49,6 +50,8 @@ import okhttp3.Response;
 
 import static com.mattermost.helpers.database_extension.GeneralKt.getDatabaseForServer;
 import static com.mattermost.helpers.database_extension.GeneralKt.getDeviceToken;
+import static com.mattermost.helpers.database_extension.GeneralKt.getZeroPersistenceSigningKey;
+import static com.mattermost.helpers.database_extension.GeneralKt.isZeroPersistenceServer;
 import static com.mattermost.helpers.database_extension.SystemKt.queryConfigServerVersion;
 import static com.mattermost.helpers.database_extension.SystemKt.queryConfigSigningKey;
 import static com.mattermost.helpers.database_extension.UserKt.getLastPictureUpdate;
@@ -57,7 +60,6 @@ public class CustomPushNotificationHelper {
     public static final String CHANNEL_HIGH_IMPORTANCE_ID = "channel_01";
     public static final String CHANNEL_MIN_IMPORTANCE_ID = "channel_02";
     public static final String KEY_TEXT_REPLY = "CAN_REPLY";
-    public static final int MESSAGE_NOTIFICATION_ID = 435345;
     public static final String NOTIFICATION_ID = "notificationId";
     public static final String NOTIFICATION = "notification";
     public static final String PUSH_TYPE_MESSAGE = "message";
@@ -192,7 +194,7 @@ public class CustomPushNotificationHelper {
         String channelId = bundle.getString("channel_id");
         String postId = bundle.getString("post_id");
         String rootId = bundle.getString("root_id");
-        int notificationId = postId != null ? postId.hashCode() : MESSAGE_NOTIFICATION_ID;
+        int notificationId = postId != null ? postId.hashCode() : NotificationHelper.INSTANCE.MESSAGE_NOTIFICATION_ID;
 
         boolean is_crt_enabled = bundle.containsKey("is_crt_enabled") && Objects.equals(bundle.getString("is_crt_enabled"), "true");
         String groupId = is_crt_enabled && !android.text.TextUtils.isEmpty(rootId) ? rootId : channelId;
@@ -218,11 +220,6 @@ public class CustomPushNotificationHelper {
     }
 
     public static void createNotificationChannels(Context context) {
-        // Notification channels are not supported in Android Nougat and below
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return;
-        }
-
         final NotificationManagerCompat notificationManager = NotificationManagerCompat.from(context);
 
         if (mHighImportanceChannel == null) {
@@ -241,36 +238,52 @@ public class CustomPushNotificationHelper {
     public static boolean verifySignature(final Context context, String signature, String serverUrl, String ackId) {
         if (signature == null) {
             // Backward compatibility with old push proxies
-            Log.i("Mattermost Notifications Signature verification", "No signature in the notification");
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", "No signature in the notification");
             return true;
         }
 
         if (serverUrl == null) {
-            Log.i("Mattermost Notifications Signature verification", "No server_url for server_id");
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", "No server_url for server_id");
             return false;
         }
 
         DatabaseHelper dbHelper = DatabaseHelper.Companion.getInstance();
         if (dbHelper == null) {
-            Log.i("Mattermost Notifications Signature verification", "Cannot access the database");
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", "Cannot access the database");
             return false;
         }
 
         WMDatabase db = getDatabaseForServer(dbHelper, context, serverUrl);
         if (db == null) {
-            Log.i("Mattermost Notifications Signature verification", "Cannot access the server database");
-            return false;
+            boolean isZeroPersistence = isZeroPersistenceServer(dbHelper, serverUrl);
+            if (!isZeroPersistence) {
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Cannot access the server database");
+                return false;
+            }
+
+            if (signature.equals("NO_SIGNATURE")) {
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Cannot verify unsigned notification for zero-persistence server");
+                return false;
+            }
+
+            String zeroPersistenceSigningKey = getZeroPersistenceSigningKey(dbHelper, serverUrl);
+            if (zeroPersistenceSigningKey == null) {
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "No signing key stored for zero-persistence server");
+                return false;
+            }
+            
+            return verifyJwt(dbHelper, signature, ackId, zeroPersistenceSigningKey);
         }
 
         if (signature.equals("NO_SIGNATURE")) {
             String version = queryConfigServerVersion(db);
             if (version == null) {
-                Log.i("Mattermost Notifications Signature verification", "No server version");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "No server version");
                 return false;
             }
 
             if (!version.matches("[0-9]+(\\.[0-9]+)*")) {
-                Log.i("Mattermost Notifications Signature verification", "Invalid server version");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Invalid server version");
                 return false;
             }
 
@@ -324,7 +337,7 @@ public class CustomPushNotificationHelper {
             }
 
             if (rejected) {
-                Log.i("Mattermost Notifications Signature verification", "Server version should send signature");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Server version should send signature");
                 return false;
             }
 
@@ -334,10 +347,14 @@ public class CustomPushNotificationHelper {
 
         String signingKey = queryConfigSigningKey(db);
         if (signingKey == null) {
-            Log.i("Mattermost Notifications Signature verification", "No signing key");
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", "No signing key");
             return false;
         }
 
+        return verifyJwt(dbHelper, signature, ackId, signingKey);
+    }
+
+    private static boolean verifyJwt(DatabaseHelper dbHelper, String signature, String ackId, String signingKey) {
         try {
             byte[] encoded = Base64.decode(signingKey, 0);
             KeyFactory kf = KeyFactory.getInstance("EC");
@@ -345,17 +362,17 @@ public class CustomPushNotificationHelper {
 
             String storedDeviceToken = getDeviceToken(dbHelper);
             if (storedDeviceToken == null) {
-                Log.i("Mattermost Notifications Signature verification", "No device token stored");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "No device token stored");
                 return false;
             }
             String[] tokenParts = storedDeviceToken.split(":", 2);
             if (tokenParts.length != 2) {
-                Log.i("Mattermost Notifications Signature verification", "Wrong stored device token format");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Wrong stored device token format");
                 return false;
             }
             String deviceToken = tokenParts[1].substring(0, tokenParts[1].length() -1 );
             if (deviceToken.isEmpty()) {
-                Log.i("Mattermost Notifications Signature verification", "Empty stored device token");
+                TurboLog.Companion.i("Mattermost Notifications Signature verification", "Empty stored device token");
                 return false;
             }
 
@@ -366,19 +383,19 @@ public class CustomPushNotificationHelper {
                     .build()
                     .parseSignedClaims(signature);
         } catch (MissingClaimException e) {
-            Log.i("Mattermost Notifications Signature verification", String.format("Missing claim: %s", e.getMessage()));
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", String.format("Missing claim: %s", e.getMessage()));
             e.printStackTrace();
             return false;
         } catch (IncorrectClaimException e) {
-            Log.i("Mattermost Notifications Signature verification", String.format("Incorrect claim: %s", e.getMessage()));
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", String.format("Incorrect claim: %s", e.getMessage()));
             e.printStackTrace();
             return false;
         } catch (JwtException e) {
-            Log.i("Mattermost Notifications Signature verification", String.format("Cannot verify JWT: %s", e.getMessage()));
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", String.format("Cannot verify JWT: %s", e.getMessage()));
             e.printStackTrace();
             return false;
         } catch (Exception e) {
-            Log.i("Mattermost Notifications Signature verification", String.format("Exception while parsing JWT: %s", e.getMessage()));
+            TurboLog.Companion.i("Mattermost Notifications Signature verification", String.format("Exception while parsing JWT: %s", e.getMessage()));
             e.printStackTrace();
             return false;
         }
@@ -495,24 +512,15 @@ public class CustomPushNotificationHelper {
         if (conversationTitle != null && !channelName.equals(senderName)) {
             messagingStyle.setConversationTitle(conversationTitle);
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                messagingStyle.setGroupConversation(true);
-            }
+            messagingStyle.setGroupConversation(true);
         }
     }
 
     private static void setNotificationBadgeType(NotificationCompat.Builder notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            notification.setBadgeIconType(NotificationCompat.BADGE_ICON_LARGE);
-        }
+        notification.setBadgeIconType(NotificationCompat.BADGE_ICON_LARGE);
     }
 
     private static void setNotificationChannel(Context context, NotificationCompat.Builder notification) {
-        // If Android Oreo or above we need to register a channel
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return;
-        }
-
         if (mHighImportanceChannel == null) {
             createNotificationChannels(context);
         }
@@ -572,7 +580,7 @@ public class CustomPushNotificationHelper {
             Double lastUpdateAt = 0.0;
             if (!TextUtils.isEmpty(urlOverride)) {
                 Request request = new Request.Builder().url(urlOverride).build();
-                Log.i("ReactNative", String.format("Fetch override profile image %s", urlOverride));
+                TurboLog.Companion.i("ReactNative", String.format("Fetch override profile image %s", urlOverride));
                 response = client.newCall(request).execute();
             } else {
                 DatabaseHelper dbHelper = DatabaseHelper.Companion.getInstance();
@@ -594,7 +602,7 @@ public class CustomPushNotificationHelper {
 
                 bitmapCache.removeBitmap(userId, serverUrl);
                 String url = String.format("api/v4/users/%s/image", userId);
-                Log.i("ReactNative", String.format("Fetch profile image %s", url));
+                TurboLog.Companion.i("ReactNative", String.format("Fetch profile image %s", url));
                 response = Network.getSync(serverUrl, url, null);
             }
 

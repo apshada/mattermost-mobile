@@ -20,7 +20,7 @@ struct ContentView: View {
   }
   
   var body: some View {
-    VStack {
+    VStack(spacing: 12) {
       if (!linkPreviewUrl.isEmpty) {
         LinkPreview(
           link: $linkPreviewUrl,
@@ -30,12 +30,11 @@ struct ContentView: View {
       
       if (!attachments.isEmpty) {
         AttachmentsView(attachments: $attachments)
-          .padding(.horizontal, -20)
+          .padding(.horizontal, -16)
       }
       
       if (!linkPreviewUrl.isEmpty || !attachments.isEmpty) {
         Divider()
-          .padding(.top, 10)
       }
       
       VStack (spacing: 0) {
@@ -57,13 +56,13 @@ struct ContentView: View {
           ) {
             ChannelListView()
           }
+          .accessibilityIdentifier("share_extension.channel.option")
           .frame(height: 48)
         }
       }
       .padding(.all, 0)
       
       Divider()
-        .padding(.bottom, 10)
       
       if hasChannels {
         FloatingTextField(

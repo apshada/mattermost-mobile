@@ -1,17 +1,19 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {Database, Q} from '@nozbe/watermelondb';
+import {Database, Model, Q} from '@nozbe/watermelondb';
+import {DeviceEventEmitter} from 'react-native';
 
+import {Events} from '@constants';
 import {OperationType} from '@constants/database';
 import {
     getRangeOfValues,
     getValidRecordsForUpdate,
     retrieveRecords,
 } from '@database/operator/utils/general';
+import {isDatabaseCorruptionError} from '@utils/database_errors';
 import {logWarning} from '@utils/log';
 
-import type Model from '@nozbe/watermelondb/Model';
 import type {
     HandleRecordsArgs,
     OperationArgs,
@@ -22,10 +24,10 @@ import type {
 
 export interface BaseDataOperatorType {
     database: Database;
-    handleRecords: <T extends Model>({buildKeyRecordBy, fieldName, transformer, createOrUpdateRawValues, deleteRawValues, tableName, prepareRecordsOnly}: HandleRecordsArgs<T>, description: string) => Promise<Model[]>;
-    processRecords: <T extends Model>({createOrUpdateRawValues, deleteRawValues, tableName, buildKeyRecordBy, fieldName}: ProcessRecordsArgs) => Promise<ProcessRecordResults<T>>;
-    batchRecords: (models: Model[], description: string) => Promise<void>;
-    prepareRecords: <T extends Model>({tableName, createRaws, deleteRaws, updateRaws, transformer}: OperationArgs<T>) => Promise<Model[]>;
+    handleRecords: <T extends Model, R extends RawValue>({buildKeyRecordBy, fieldName, transformer, createOrUpdateRawValues, deleteRawValues, tableName, prepareRecordsOnly}: HandleRecordsArgs<T, R>, description: string) => Promise<Model[]>;
+    processRecords: <T extends Model, R extends RawValue>({createOrUpdateRawValues, deleteRawValues, tableName, buildKeyRecordBy, fieldName}: ProcessRecordsArgs<R>) => Promise<ProcessRecordResults<T, R>>;
+    batchRecords: (models: Model[], description: string, propagateError?: boolean) => Promise<void>;
+    prepareRecords: <T extends Model, R extends RawValue>({tableName, createRaws, deleteRaws, updateRaws, transformer}: OperationArgs<T, R>) => Promise<Model[]>;
 }
 
 export default class BaseDataOperator {
@@ -40,13 +42,14 @@ export default class BaseDataOperator {
      * the same value.  Hence, prior to that we query the database and pick only those values that are  'new' from the 'Raw' array.
      * @param {ProcessRecordsArgs} inputsArg
      * @param {RawValue[]} inputsArg.createOrUpdateRawValues
+     * @param {RawValue[]} inputsArg.deleteRawValues
      * @param {string} inputsArg.tableName
      * @param {string} inputsArg.fieldName
      * @param {(existing: Model, newElement: RawValue) => boolean} inputsArg.buildKeyRecordBy
-     * @returns {Promise<{ProcessRecordResults}>}
+     * @returns {Promise<{ProcessRecordResults<T>}>}
      */
-    processRecords = async <T extends Model>({createOrUpdateRawValues = [], deleteRawValues = [], tableName, buildKeyRecordBy, fieldName, shouldUpdate}: ProcessRecordsArgs): Promise<ProcessRecordResults<T>> => {
-        const getRecords = async (rawValues: RawValue[]) => {
+    processRecords = async <T extends Model, R extends RawValue>({createOrUpdateRawValues = [], deleteRawValues = [], tableName, buildKeyRecordBy, fieldName, shouldUpdate}: ProcessRecordsArgs<R>): Promise<ProcessRecordResults<T, R>> => {
+        const getRecords = async (rawValues: R[]) => {
             // We will query a table where one of its fields can match a range of values.  Hence, here we are extracting all those potential values.
             const columnValues: string[] = getRangeOfValues({fieldName, raws: rawValues});
 
@@ -69,15 +72,15 @@ export default class BaseDataOperator {
             return existingRecords;
         };
 
-        const createRaws: RecordPair[] = [];
-        const updateRaws: RecordPair[] = [];
+        const createRaws: Array<RecordPair<T, R>> = [];
+        const updateRaws: Array<RecordPair<T, R>> = [];
 
         // for delete flow
         const deleteRaws = await getRecords(deleteRawValues);
 
         // for create or update flow
         const createOrUpdateRaws = await getRecords(createOrUpdateRawValues);
-        const recordsByKeys = createOrUpdateRaws.reduce((result: Record<string, Model>, record) => {
+        const recordsByKeys = createOrUpdateRaws.reduce((result: Record<string, T>, record) => {
             // @ts-expect-error object with string key
             const key = buildKeyRecordBy?.(record) || record[fieldName];
             result[key] = record;
@@ -86,7 +89,6 @@ export default class BaseDataOperator {
 
         if (createOrUpdateRawValues.length > 0) {
             for (const newElement of createOrUpdateRawValues) {
-                // @ts-expect-error object with string key
                 const key = buildKeyRecordBy?.(newElement) || newElement[fieldName];
                 const existingRecord = recordsByKeys[key];
 
@@ -97,7 +99,7 @@ export default class BaseDataOperator {
                     }
 
                     // Some raw value has an update_at field.  We'll proceed to update only if the update_at value is different from the record's value in database
-                    const updateRecords = getValidRecordsForUpdate({
+                    const updateRecords = getValidRecordsForUpdate<T, R>({
                         tableName,
                         existingRecord,
                         newValue: newElement,
@@ -125,11 +127,11 @@ export default class BaseDataOperator {
      * @param {string} prepareRecord.tableName
      * @param {RawValue[]} prepareRecord.createRaws
      * @param {RawValue[]} prepareRecord.updateRaws
-     * @param {Model[]} prepareRecord.deleteRaws
-     * @param {(TransformerArgs) => Promise<Model>;} transformer
-     * @returns {Promise<Model[]>}
+     * @param {T extends Model[]} prepareRecord.deleteRaws
+     * @param {(TransformerArgs) => Promise<T extends Model>;} transformer
+     * @returns {Promise<T extends Model[]>}
      */
-    prepareRecords = async <T extends Model>({tableName, createRaws, deleteRaws, updateRaws, transformer}: OperationArgs<T>): Promise<T[]> => {
+    prepareRecords = async <T extends Model, R extends RawValue>({tableName, createRaws, deleteRaws, updateRaws, transformer}: OperationArgs<T, R>): Promise<T[]> => {
         if (!this.database) {
             logWarning('Database not defined in prepareRecords');
             return [];
@@ -140,7 +142,7 @@ export default class BaseDataOperator {
         // create operation
         if (createRaws?.length) {
             const recordPromises = createRaws.map(
-                (createRecord: RecordPair) => {
+                (createRecord: RecordPair<T, R>) => {
                     return transformer({
                         database: this.database,
                         tableName,
@@ -156,7 +158,7 @@ export default class BaseDataOperator {
         // update operation
         if (updateRaws?.length) {
             const recordPromises = updateRaws.map(
-                (updateRecord: RecordPair) => {
+                (updateRecord: RecordPair<T, R>) => {
                     return transformer({
                         database: this.database,
                         tableName,
@@ -186,7 +188,7 @@ export default class BaseDataOperator {
      * @param {Array} models
      * @returns {Promise<void>}
      */
-    async batchRecords(models: Model[], description: string): Promise<void> {
+    async batchRecords(models: Model[], description: string, propagateError = false): Promise<void> {
         try {
             if (models.length > 0) {
                 await this.database.write(async (writer) => {
@@ -195,6 +197,16 @@ export default class BaseDataOperator {
             }
         } catch (e) {
             logWarning('batchRecords error ', description, e as Error);
+            if (isDatabaseCorruptionError(e)) {
+                DeviceEventEmitter.emit(Events.DATABASE_CORRUPTION_DETECTED, {
+                    database: this.database,
+                    error: e,
+                    source: description,
+                });
+            }
+            if (propagateError) {
+                throw e;
+            }
         }
     }
 
@@ -209,15 +221,15 @@ export default class BaseDataOperator {
      * @param {string} handleRecordsArgs.tableName
      * @returns {Promise<Model[]>}
      */
-    async handleRecords<T extends Model>({buildKeyRecordBy, fieldName, transformer, createOrUpdateRawValues, deleteRawValues = [], tableName, prepareRecordsOnly = true, shouldUpdate}: HandleRecordsArgs<T>, description: string): Promise<T[]> {
-        if (!createOrUpdateRawValues.length) {
+    async handleRecords<T extends Model, R extends RawValue>({buildKeyRecordBy, fieldName, transformer, createOrUpdateRawValues, deleteRawValues = [], tableName, prepareRecordsOnly = true, shouldUpdate}: HandleRecordsArgs<T, R>, description: string): Promise<T[]> {
+        if (!createOrUpdateRawValues.length && !deleteRawValues.length) {
             logWarning(
                 `An empty "rawValues" array has been passed to the handleRecords method for tableName ${tableName}`,
             );
             return [];
         }
 
-        const {createRaws, deleteRaws, updateRaws} = await this.processRecords<T>({
+        const {createRaws, deleteRaws, updateRaws} = await this.processRecords<T, R>({
             createOrUpdateRawValues,
             deleteRawValues,
             tableName,
@@ -227,7 +239,7 @@ export default class BaseDataOperator {
         });
 
         let models: T[] = [];
-        models = await this.prepareRecords<T>({
+        models = await this.prepareRecords<T, R>({
             tableName,
             createRaws,
             updateRaws,

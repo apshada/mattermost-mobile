@@ -3,26 +3,57 @@
 
 import {withDatabase, withObservables} from '@nozbe/watermelondb/react';
 import {of as of$} from 'rxjs';
-import {switchMap} from 'rxjs/operators';
+import {distinctUntilChanged, map, switchMap} from 'rxjs/operators';
 
-import {MAX_MESSAGE_LENGTH_FALLBACK} from '@constants/post_draft';
-import {observeFilesForPost} from '@queries/servers/file';
-import {observeConfigIntValue} from '@queries/servers/system';
+import {RenderPermissionAction} from '@constants/access_control';
+import {DEFAULT_SERVER_MAX_FILE_SIZE, MAX_MESSAGE_LENGTH_FALLBACK} from '@constants/post_draft';
+import {withServerUrl} from '@context/server';
+import {observePost} from '@queries/servers/post';
+import {observeChannelActionDenied, observeRenderPermission} from '@queries/servers/render_permissions';
+import {observeCanUploadFiles} from '@queries/servers/security';
+import {observeConfigIntValue, observeMaxFileCount} from '@queries/servers/system';
 
 import EditPost from './edit_post';
 
 import type {WithDatabaseArgs} from '@typings/database/database';
-import type PostModel from '@typings/database/models/servers/post';
 
-const enhance = withObservables([], ({database, post}: WithDatabaseArgs & { post: PostModel}) => {
+export type EditPostProps = {
+    postId: string;
+    files?: FileInfo[];
+    canDelete: boolean;
+};
+
+type EnhancedProps = EditPostProps & WithDatabaseArgs & {
+    serverUrl: string;
+};
+
+const enhance = withObservables([], ({database, postId, serverUrl}: EnhancedProps) => {
     const maxPostSize = observeConfigIntValue(database, 'MaxPostSize', MAX_MESSAGE_LENGTH_FALLBACK);
+    const canUploadFiles = observeCanUploadFiles(database);
+    const maxFileSize = observeConfigIntValue(database, 'MaxFileSize', DEFAULT_SERVER_MAX_FILE_SIZE);
+    const maxFileCount = observeMaxFileCount(database);
 
-    const hasFilesAttached = observeFilesForPost(database, post.id).pipe(switchMap((files) => of$(files?.length > 0)));
+    const post = observePost(database, postId);
+    const channelId = post.pipe(
+        map((p) => p?.channelId),
+        distinctUntilChanged(),
+    );
+    const canUploadFilesByPolicy = channelId.pipe(
+        switchMap((id) => observeRenderPermission(database, serverUrl, id, RenderPermissionAction.UploadFileAttachment, true)),
+    );
+    const writeDenied = channelId.pipe(
+        switchMap((id) => (id ? observeChannelActionDenied(database, serverUrl, id, RenderPermissionAction.ChannelWriteAccess) : of$(false))),
+    );
 
     return {
+        post,
         maxPostSize,
-        hasFilesAttached,
+        canUploadFiles,
+        canUploadFilesByPolicy,
+        maxFileSize,
+        maxFileCount,
+        writeDenied,
     };
 });
 
-export default withDatabase(enhance(EditPost));
+export default withDatabase(withServerUrl(enhance(EditPost)));

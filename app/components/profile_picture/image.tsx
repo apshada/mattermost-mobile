@@ -1,14 +1,14 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {type ImageSource} from 'expo-image';
 import React, {useMemo} from 'react';
-import {Image as RNImage} from 'react-native';
-import FastImage, {type Source} from 'react-native-fast-image';
-import Animated from 'react-native-reanimated';
+import {Platform} from 'react-native';
 
 import {buildAbsoluteUrl} from '@actions/remote/file';
 import {buildProfileImageUrlFromUser} from '@actions/remote/user';
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
+import {ExpoImageAnimated} from '@components/expo_image';
 import {ACCOUNT_OUTLINE_IMAGE} from '@constants/profile';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
@@ -22,12 +22,9 @@ type Props = {
     forwardRef?: React.RefObject<any>;
     iconSize?: number;
     size: number;
-    source?: Source | string;
+    source?: ImageSource | CompassIconName;
     url?: string;
 };
-
-const AnimatedFastImage = Animated.createAnimatedComponent(FastImage);
-const AnimatedImage = Animated.createAnimatedComponent(RNImage);
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     return {
@@ -49,16 +46,32 @@ const Image = ({author, forwardRef, iconSize, size, source, url}: Props) => {
         backgroundColor: theme.centerChannelBg,
         height: size,
         width: size,
-    }), [size]);
+    }), [size, theme.centerChannelBg]);
 
     const imgSource = useMemo(() => {
         if (!author || typeof source === 'string') {
             return undefined;
         }
 
+        if (source) {
+            return source;
+        }
+
         const pictureUrl = buildProfileImageUrlFromUser(serverUrl, author);
-        return source ?? {uri: buildAbsoluteUrl(serverUrl, pictureUrl)};
+        return {uri: buildAbsoluteUrl(serverUrl, pictureUrl)};
+
+    // We need to pass the lastPictureUpdateAt, because changes in this
+    // value are used internally, and may not be followed by a change
+    // in the containing object (author).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [author, serverUrl, source, lastPictureUpdateAt]);
+    const id = useMemo(() => {
+        if (author) {
+            return `user-${author.id}-${lastPictureUpdateAt}`;
+        }
+
+        return undefined;
+    }, [author, lastPictureUpdateAt]);
 
     if (typeof source === 'string') {
         return (
@@ -71,22 +84,27 @@ const Image = ({author, forwardRef, iconSize, size, source, url}: Props) => {
     }
 
     if (imgSource?.uri?.startsWith('file://')) {
+        const uri = Platform.select({
+            ios: imgSource.uri.replace(/^file:\/+/, '/'),
+            default: imgSource.uri,
+        });
+
         return (
-            <AnimatedImage
-                key={imgSource.uri}
+            <ExpoImageAnimated
+                id={id}
+                key={id}
                 ref={forwardRef}
                 style={fIStyle}
-                source={{uri: imgSource.uri}}
+                source={{uri}}
             />
         );
     }
 
     if (imgSource) {
         return (
-            <AnimatedFastImage
-                key={imgSource.uri}
-
-                // @ts-expect-error TS expects old type ref
+            <ExpoImageAnimated
+                id={id}
+                key={id}
                 ref={forwardRef}
                 style={fIStyle}
                 source={imgSource}

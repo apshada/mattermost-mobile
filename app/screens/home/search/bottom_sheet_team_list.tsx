@@ -2,9 +2,9 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
+import {StyleSheet, View} from 'react-native';
 
 import TeamList from '@components/team_list';
-import {useIsTablet} from '@hooks/device';
 import BottomSheetContent from '@screens/bottom_sheet/content';
 import {dismissBottomSheet} from '@screens/navigation';
 
@@ -15,11 +15,17 @@ type Props = {
     teamId: string;
     setTeamId: (teamId: string) => void;
     title: string;
+    crossTeamSearchEnabled: boolean;
 }
 
-export default function BottomSheetTeamList({teams, title, setTeamId, teamId}: Props) {
-    const isTablet = useIsTablet();
-    const showTitle = !isTablet && Boolean(teams.length);
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+    },
+});
+
+export default function BottomSheetTeamList({teams, title, setTeamId, teamId, crossTeamSearchEnabled}: Props) {
+    const showTitle = Boolean(teams.length);
 
     const onPress = useCallback((newTeamId: string) => {
         setTeamId(newTeamId);
@@ -33,13 +39,17 @@ export default function BottomSheetTeamList({teams, title, setTeamId, teamId}: P
             testID='search.select_team_slide_up'
             title={title}
         >
-            <TeamList
-                selectedTeamId={teamId}
-                teams={teams}
-                onPress={onPress}
-                testID='search.select_team_slide_up.team_list'
-                type={isTablet ? 'FlatList' : 'BottomSheetFlatList'}
-            />
+            <View style={styles.container} >
+                <TeamList
+                    selectedTeamId={teamId}
+                    teams={teams}
+                    onPress={onPress}
+                    testID='search.select_team_slide_up.team_list'
+                    type={'BottomSheetFlatList'}
+                    hideIcon={true}
+                    separatorAfterFirstItem={crossTeamSearchEnabled}
+                />
+            </View>
         </BottomSheetContent>
     );
 }

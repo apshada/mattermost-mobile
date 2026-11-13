@@ -1,6 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {Post} from '@support/server_api';
 import {
     Alert,
     CameraQuickAction,
@@ -12,19 +13,41 @@ import {
     PostList,
     SendButton,
 } from '@support/ui/component';
+import {dismissKnownModals} from '@support/ui/modal_dismiss';
 import {
     ChannelListScreen,
+    FindChannelsScreen,
+    HomeScreen,
     PostOptionsScreen,
     ThreadScreen,
 } from '@support/ui/screen';
-import {timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {disableSynchronization, enableSynchronization, isAndroid, isIos, isIpad, longPressWithScrollRetry, timeouts, wait, waitForElementToBeVisible, waitForElementToExist, waitForElementToNotExist, withSynchronizationDisabled} from '@support/utils';
+import {by, element, expect, waitFor} from 'detox';
+
+import {logDebug} from '../../../../provision/log';
+
+import InteractiveDialogScreen from './interactive_dialog';
+
+async function dismissErrorAlertIfPresent(): Promise<boolean> {
+    try {
+        const ok = isAndroid() ? element(by.text('OK')) : element(by.label('OK')).atIndex(0);
+        await waitFor(ok).toBeVisible().withTimeout(timeouts.ONE_SEC);
+        await ok.tap();
+        await wait(timeouts.HALF_SEC);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 class ChannelScreen {
     testID = {
         channelScreenPrefix: 'channel.',
         channelScreen: 'channel.screen',
         channelQuickActionsButton: 'channel_header.channel_quick_actions.button',
+        quickActions: 'channel.quick_actions',
+        askAgentsQuickAction: 'channel.quick_actions.ask_agents',
+        quickCallButton: 'channel_header.quick_call.button',
         favoriteQuickAction: 'channel.quick_actions.favorite.action',
         unfavoriteQuickAction: 'channel.quick_actions.unfavorite.action',
         muteQuickAction: 'channel.quick_actions.mute.action',
@@ -41,10 +64,48 @@ class ChannelScreen {
         introUnfavoriteAction: 'channel_post_list.intro_options.unfavorite.action',
         introChannelInfoAction: 'channel_post_list.intro_options.channel_info.action',
         toastMessage: 'toast.message',
+        banner: 'channel.banner',
+        postPriorityPicker: 'channel.post_draft.quick_actions.post_priority_action',
+        postPriorityImportantMessage: 'post_priority_picker_item.important',
+        postPriorityUrgentMessage: 'post_priority_picker_item.urgent',
+        postPriorityRequestAck: 'post_priority_picker_item.requested_ack.toggled.false.button',
+        postPriorityPersistentNotification: 'post_priority_picker_item.persistent_notifications.toggled.undefined.button',
+        scheduledPostTooltipCloseButton: 'scheduled_post.tooltip.close.button',
+        scheduledPostTooltipCloseButtonAdminAccount: 'scheduled_post_tutorial_tooltip.close',
+        scheduleMessageTomorrowOption: 'post_priority_picker_item.scheduledPostOptionTomorrow',
+        scheduleMessageOnMondayOption: 'post_priority_picker_item.scheduledPostOptionMonday',
+        scheduledPostOptionNextMonday: 'post_priority_picker_item.scheduledPostOptionNextMonday',
+        scheduledPostOptionTomorrowSelected: 'post_priority_picker_item.scheduledPostOptionTomorrow.selected',
+        scheduledPostOptionMondaySelected: 'post_priority_picker_item.scheduledPostOptionMonday.selected',
+        scheduledPostOptionNextMondaySelected: 'post_priority_picker_item.scheduledPostOptionNextMonday.selected',
+        clickOnScheduledMessageButton: 'scheduled_post_create_button',
+        scheduledDraftInfoInChannel: 'scheduled_post_header.scheduled_post_indicator',
+        scheduledDraftTooltipText: 'scheduled_post.tooltip.description',
+        scheduledPostOptionsBottomSheet: 'scheduled_post_options_bottom_sheet.screen',
     };
 
+    scheduleDraftInforMessage = element(by.text('Type a message and long press the send button to schedule it for a later time.'));
+    scheduledDraftTooltipText = element(by.id(this.testID.scheduledDraftTooltipText));
+    scheduledDraftInfoInChannel = element(by.id(this.testID.scheduledDraftInfoInChannel));
+    clickOnScheduledMessageButton = element(by.id(this.testID.clickOnScheduledMessageButton));
+    scheduledPostOptionTomorrowSelected = element(by.id(this.testID.scheduledPostOptionTomorrowSelected));
+    scheduledPostOptionMondaySelected = element(by.id(this.testID.scheduledPostOptionMondaySelected));
+    scheduledPostOptionNextMonday = element(by.id(this.testID.scheduledPostOptionNextMonday));
+    scheduledPostOptionNextMondaySelected = element(by.id(this.testID.scheduledPostOptionNextMondaySelected));
+    scheduleMessageTomorrowOption = element(by.id(this.testID.scheduleMessageTomorrowOption));
+    scheduleMessageOnMondayOption = element(by.id(this.testID.scheduleMessageOnMondayOption));
+    scheduledPostTooltipCloseButton = element(by.id(this.testID.scheduledPostTooltipCloseButton));
+    scheduledPostTooltipCloseButtonAdminAccount = element(by.id(this.testID.scheduledPostTooltipCloseButtonAdminAccount));
+    postPriorityPersistentNotification = element(by.id(this.testID.postPriorityPersistentNotification));
+    postPriorityUrgentMessage = element(by.id(this.testID.postPriorityUrgentMessage));
+    postPriorityRequestAck = element(by.id(this.testID.postPriorityRequestAck));
+    postPriorityImportantMessage = element(by.id(this.testID.postPriorityImportantMessage));
+    postPriorityPicker = element(by.id(this.testID.postPriorityPicker));
     channelScreen = element(by.id(this.testID.channelScreen));
     channelQuickActionsButton = element(by.id(this.testID.channelQuickActionsButton));
+    quickActions = element(by.id(this.testID.quickActions));
+    askAgentsQuickAction = element(by.id(this.testID.askAgentsQuickAction));
+    quickCallButton = element(by.id(this.testID.quickCallButton));
     favoriteQuickAction = element(by.id(this.testID.favoriteQuickAction));
     unfavoriteQuickAction = element(by.id(this.testID.unfavoriteQuickAction));
     muteQuickAction = element(by.id(this.testID.muteQuickAction));
@@ -61,6 +122,8 @@ class ChannelScreen {
     introUnfavoriteAction = element(by.id(this.testID.introUnfavoriteAction));
     introChannelInfoAction = element(by.id(this.testID.introChannelInfoAction));
     toastMessage = element(by.id(this.testID.toastMessage));
+    banner = element(by.id(this.testID.banner));
+    applyPostPriority = element(by.text('Apply'));
 
     // convenience props
     backButton = NavigationHeader.backButton;
@@ -80,6 +143,9 @@ class ChannelScreen {
     postDraftArchivedCloseChannelButton = PostDraft.getPostDraftArchivedCloseChannelButton(this.testID.channelScreenPrefix);
     postDraftReadOnly = PostDraft.getPostDraftReadOnly(this.testID.channelScreenPrefix);
     postInput = PostDraft.getPostInput(this.testID.channelScreenPrefix);
+    attachmentAction = PostDraft.getAttachmentAction(this.testID.channelScreenPrefix);
+    attachmentActionDisabled = PostDraft.getAttachmentActionDisabled(this.testID.channelScreenPrefix);
+    borAction = PostDraft.getBoRAction(this.testID.channelScreenPrefix);
     sendButton = SendButton.getSendButton(this.testID.channelScreenPrefix);
     sendButtonDisabled = SendButton.getSendButtonDisabled(this.testID.channelScreenPrefix);
 
@@ -109,24 +175,176 @@ class ChannelScreen {
         return this.postList.getPostMessageAtIndex(index);
     };
 
-    toBeVisible = async () => {
+    toBeVisible = async (timeout = isAndroid() ? timeouts.HALF_MIN : timeouts.TEN_SEC) => {
         await wait(timeouts.ONE_SEC);
-        await waitFor(this.channelScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        await waitForElementToExist(this.channelScreen, timeout);
 
         return this.channelScreen;
     };
 
-    open = async (categoryKey: string, channelName: string) => {
-        // # Open channel screen
-        await ChannelListScreen.getChannelItemDisplayName(categoryKey, channelName).tap();
+    openQuickActions = async () => {
+        await this.channelQuickActionsButton.tap();
+        await waitForElementToExist(this.channelInfoQuickAction, timeouts.TEN_SEC);
+    };
 
+    closeQuickActions = async () => {
+        try {
+            await waitForElementToExist(this.channelInfoQuickAction, timeouts.TWO_SEC);
+        } catch {
+            return;
+        }
+
+        if (isAndroid()) {
+            await device.pressBack();
+            try {
+                await waitFor(this.channelInfoQuickAction).not.toExist().withTimeout(timeouts.TWO_SEC);
+            } catch {
+                await device.pressBack();
+            }
+        } else {
+            try {
+                await this.quickActions.swipe('down', 'fast');
+            } catch {
+                await this.channelInfoQuickAction.swipe('down', 'fast');
+            }
+        }
+
+        await waitForElementToNotExist(this.channelInfoQuickAction, timeouts.TEN_SEC);
+    };
+
+    dismissScheduledPostTooltip = async () => {
+        try {
+            await waitFor(this.scheduledPostTooltipCloseButton).toBeVisible().withTimeout(timeouts.FOUR_SEC);
+            await this.scheduledPostTooltipCloseButton.tap();
+            await wait(timeouts.HALF_SEC);
+        } catch {
+            try {
+                await waitFor(this.scheduledPostTooltipCloseButtonAdminAccount).toBeVisible().withTimeout(timeouts.FOUR_SEC);
+                await this.scheduledPostTooltipCloseButtonAdminAccount.tap();
+                await wait(timeouts.HALF_SEC);
+            } catch {
+                // Tooltip not visible.
+            }
+        }
+    };
+
+    waitForIntro = async (waitFn: () => Promise<void>, reopen?: {category: string; channelName: string}) => {
+        try {
+            await waitFn();
+        } catch (error) {
+            if (!reopen) {
+                throw error;
+            }
+            await this.back();
+            await this.open(reopen.category, reopen.channelName);
+            await waitFn();
+        }
+    };
+
+    tapIntroChannelInfoAction = async (reopen?: {category: string; channelName: string}) => {
+        await this.waitForIntro(
+            () => waitForElementToExist(this.introChannelInfoAction, timeouts.HALF_MIN),
+            reopen,
+        );
+        await this.introChannelInfoAction.tap();
+    };
+
+    // Same intro-footer race as tapIntroChannelInfoAction: the post list can keep its
+    // spinner up and never render the intro options, so reopening the channel is the
+    // recovery. Callers that can afford to leave and re-enter pass reopen.
+    tapIntroSetHeaderAction = async (reopen?: {category: string; channelName: string}) => {
+        await this.waitForIntro(
+            () => waitForElementToExist(this.introSetHeaderAction, timeouts.HALF_MIN),
+            reopen,
+        );
+        await this.introSetHeaderAction.tap();
+    };
+
+    open = async (category: string, channelName: any) => {
+        // # Open channel screen
+        await wait(timeouts.FOUR_SEC);
+        const name = typeof channelName === 'string' ? channelName : String(channelName);
+        if (category === 'channels') {
+            try {
+                await ChannelListScreen.tapSidebarPublicChannelDisplayName(name);
+            } catch (notInSidebar) {
+                // The channel exists on the server but has not landed in a sidebar category.
+                // Search reaches it regardless, so specs that are not about the sidebar can
+                // carry on; the log keeps a real sidebar regression visible.
+                logDebug(`[ChannelScreen.open] ${name} absent from the sidebar, opening via Find Channels: ${String(notInSidebar)}`);
+                return this.openViaFindChannels(name);
+            }
+        } else {
+            await ChannelListScreen.getChannelItemDisplayName(category, name).tap();
+        }
+        await this.dismissScheduledPostTooltip();
+        return this.toBeVisible();
+    };
+
+    // For API-created private channels not yet in the sidebar.
+    openViaFindChannels = async (channelName: string) => {
+        await ChannelListScreen.toBeVisible();
+        await FindChannelsScreen.open();
+        await FindChannelsScreen.searchInput.replaceText(channelName);
+        await FindChannelsScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+        await waitForElementToBeVisible(
+            FindChannelsScreen.getFilteredChannelItem(channelName),
+            timeouts.HALF_MIN,
+        );
+        await FindChannelsScreen.getFilteredChannelItem(channelName).tap();
+        await this.dismissScheduledPostTooltip();
         return this.toBeVisible();
     };
 
     back = async () => {
-        await wait(timeouts.ONE_SEC);
-        await this.backButton.tap();
-        await expect(this.channelScreen).not.toBeVisible();
+        await wait(isIos() ? timeouts.TWO_SEC : timeouts.ONE_SEC);
+        let navigated = false;
+        let backButtonShown = false;
+        try {
+            await waitForElementToExist(this.backButton, timeouts.THREE_SEC);
+            backButtonShown = true;
+        } catch {
+            // Back button not in hierarchy — fall through to tab/native back.
+        }
+        if (backButtonShown) {
+            /** Taps the header back button; only the tap may fail over to the fallbacks below, an error turning sync off or on surfaces. */
+            const tapBack = async () => {
+                try {
+                    await NavigationHeader.tapBackButton(0);
+                    navigated = true;
+                } catch {
+                    // Not tappable — fall through to tab/native back.
+                }
+            };
+
+            // iOS: tap with synchronization disabled, the same way ChannelInfoScreen.close()
+            // and PinnedMessagesScreen.back() already do.
+            if (isIos()) {
+                await withSynchronizationDisabled(tapBack);
+            } else {
+                await tapBack();
+            }
+        }
+        if (!navigated) {
+            if (isAndroid()) {
+                await device.pressBack();
+            } else {
+                // Wait for the tab before tapping it: when a sheet is still covering the
+                // header the tab bar is not in the hierarchy yet, and a bare tap fails with
+                // "tab_bar.home.tab not found" instead of waiting the sheet out.
+                await waitForElementToExist(HomeScreen.channelListTab, timeouts.TEN_SEC);
+                await HomeScreen.channelListTab.tap();
+
+                // A tablet shows sidebar and channel together, so the home tab already *is* the
+                // channels view and never dismisses the channel. Assert we reached the list.
+                if (isIpad()) {
+                    await waitForElementToExist(ChannelListScreen.channelListScreen, timeouts.TEN_SEC);
+                    return;
+                }
+            }
+        }
+        await waitFor(this.channelScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
     leaveChannel = async ({confirm = true} = {}) => {
@@ -153,12 +371,66 @@ class ChannelScreen {
 
     openPostOptionsFor = async (postId: string, text: string) => {
         const {postListPostItem} = this.getPostListPostItem(postId, text);
-        await expect(postListPostItem).toBeVisible();
 
-        // # Open post options
-        await postListPostItem.longPress();
-        await PostOptionsScreen.toBeVisible();
-        await wait(timeouts.TWO_SEC);
+        await waitForElementToExist(postListPostItem, timeouts.HALF_MIN);
+
+        if (isAndroid()) {
+            try {
+                await this.postList.getFlatList().swipe('up', 'fast', 0.3);
+            } catch { /* ignore */ }
+            await wait(timeouts.TWO_SEC);
+        }
+
+        if (isIos()) {
+            // Dismiss the keyboard so the row can pass visibility; do not swipe the
+            // inverted list first — that can move an older post off-screen.
+            await this.dismissKeyboard();
+        }
+
+        const postTestID = `${this.testID.channelScreenPrefix}post_list.post.${postId}`;
+        const longPressTarget = element(by.id(postTestID));
+
+        // Each attempt gets its own iOS budget; a shared one left the single recovery none.
+        const attemptOpenPostOptions = async (attempt: number): Promise<void> => {
+            try {
+                await longPressWithScrollRetry(
+                    longPressTarget,
+                    by.id(this.postList.testID.flatList),
+                    PostOptionsScreen.postOptionsScreen,
+                    8,
+                    isIos() ? Date.now() + timeouts.ONE_MIN : undefined,
+                );
+                await wait(timeouts.TWO_SEC);
+            } catch (error) {
+                if (attempt > 1) {
+                    throw error;
+                }
+
+                // A long press that degrades into a tap opens the post's thread. The
+                // channel post list item cannot exist there, so every remaining attempt
+                // is doomed and the helper burns its whole budget on a lost cause.
+                let navigatedToThread = false;
+                try {
+                    await ThreadScreen.toBeVisible();
+                    navigatedToThread = true;
+                } catch {
+                    // Still on the channel — the original failure is the real one.
+                }
+
+                if (!navigatedToThread) {
+                    throw error;
+                }
+
+                // Recover to the channel and retry once. Failures from here on are
+                // reported as themselves, not masked by the original error.
+                await ThreadScreen.back();
+                await this.toBeVisible();
+                await wait(timeouts.ONE_SEC);
+                await attemptOpenPostOptions(attempt + 1);
+            }
+        };
+
+        await attemptOpenPostOptions(1);
     };
 
     openReplyThreadFor = async (postId: string, text: string) => {
@@ -169,29 +441,356 @@ class ChannelScreen {
         await ThreadScreen.toBeVisible();
     };
 
+    composePostDraft = async (message: string) => {
+        await dismissKnownModals();
+
+        await this.dismissScheduledPostTooltip();
+
+        if (isIos()) {
+            try {
+                await waitFor(this.postList.getFlatList()).toExist().withTimeout(timeouts.ONE_SEC);
+                await this.postList.getFlatList().tap({x: 5, y: 5});
+                await wait(timeouts.HALF_SEC);
+            } catch {
+                // Channel intro has no post list yet.
+            }
+        }
+
+        try {
+            await this.postInput.tap();
+        } catch {
+            // replaceText below still focuses the field.
+        }
+
+        const replaceDeadline = Date.now() + timeouts.TEN_SEC;
+        let lastError: unknown;
+        /* eslint-disable no-await-in-loop -- retry on transient iOS occlusion */
+        while (Date.now() < replaceDeadline) {
+            try {
+                await this.postInput.replaceText(message);
+                lastError = undefined;
+                break;
+            } catch (e) {
+                const msg = String(e);
+                if (!msg.includes('hittable') && !msg.includes('not visible')) {
+                    throw e;
+                }
+                lastError = e;
+                await wait(timeouts.HALF_SEC);
+            }
+        }
+        /* eslint-enable no-await-in-loop */
+        if (lastError) {
+            throw lastError;
+        }
+    };
+
     postMessage = async (message: string) => {
-        // # Post message
-        await this.postInput.tap();
-        await this.postInput.replaceText(message);
+        await this.composePostDraft(message);
         await this.tapSendButton();
+        await wait(timeouts.TWO_SEC);
+    };
+
+    // Post a message through the UI and hand back the post the server actually stored.
+    postMessageAndVerify = async (message: string, channelId: string, siteUrl: string): Promise<{post?: any; error?: any}> => {
+        await this.postMessage(message);
+
+        // Look the post up BY MESSAGE, exactly, and let that call poll (~12s).
+        let result = await Post.apiFindPostInChannelByMessage(siteUrl, channelId, message, {exact: true});
+        if (result.post?.id) {
+            return result;
+        }
+
+        // The poll found nothing, so the send really was dropped rather than slow. Resend once.
+        await this.postMessage(message);
+        result = await Post.apiFindPostInChannelByMessage(siteUrl, channelId, message, {exact: true});
+        if (result.post?.id) {
+            return result;
+        }
+
+        // Only what is established: not in THIS channel. A mistargeted sidebar tap can post it
+        // to a different channel, so do not blame the network.
+        throw new Error(
+            `message "${message}" not found in channel ${channelId} after two sends — the send ` +
+            'may have failed, or the app may not have been in that channel ' +
+            `(${JSON.stringify(result.error ?? 'no post and no error')})`,
+        );
+    };
+
+    postSlashCommand = async (command: string) => {
+        await dismissErrorAlertIfPresent();
+
+        await this.composePostDraft(command);
+        await waitForElementToBeVisible(this.sendButton, timeouts.FOUR_SEC);
+
+        // On Android the autocomplete suggestion row can still be intercepting input when send
+        // fires, causing the text to post as plain text rather than execute as a slash command.
+        if (isAndroid()) {
+            await wait(timeouts.ONE_SEC);
+        }
+        await this.sendButton.tap();
+
+        // The first slash command after plugin install can race command registration. Retry only
+        // when the command clearly did not execute, so a slow first tap is not duplicated.
+        try {
+            await waitForElementToBeVisible(InteractiveDialogScreen.interactiveDialogScreen, timeouts.HALF_MIN);
+        } catch (primaryError) {
+            try {
+                await waitForElementToBeVisible(InteractiveDialogScreen.interactiveDialogScreen, timeouts.TEN_SEC);
+                return;
+            } catch {
+                // Still no dialog — check for a rejection signal before resending.
+            }
+
+            const errorWasShown = await dismissErrorAlertIfPresent();
+            let postedAsPlainText = false;
+            try {
+                await waitFor(element(by.text(command))).toExist().withTimeout(timeouts.TWO_SEC);
+                postedAsPlainText = true;
+            } catch {
+                // Command text not visible as a post.
+            }
+
+            if (!errorWasShown && !postedAsPlainText) {
+                throw primaryError;
+            }
+
+            await this.composePostDraft(command);
+            await waitForElementToBeVisible(this.sendButton, timeouts.FOUR_SEC);
+            if (isAndroid()) {
+                await wait(timeouts.ONE_SEC);
+            }
+            await this.sendButton.tap();
+            await waitForElementToBeVisible(InteractiveDialogScreen.interactiveDialogScreen, timeouts.HALF_MIN);
+        }
     };
 
     tapSendButton = async () => {
-        // # Tap send button
+        await waitForElementToBeVisible(this.sendButton, timeouts.FOUR_SEC);
         await this.sendButton.tap();
-        await expect(this.sendButton).not.toExist();
-        await expect(this.sendButtonDisabled).toBeVisible();
+        await waitFor(this.sendButton).not.toExist().withTimeout(timeouts.FIVE_SEC);
+    };
+
+    enterMessageToSchedule = async (message: string) => {
+        await this.postInput.tap();
+        await this.postInput.clearText();
+        await this.postInput.replaceText(message);
+    };
+
+    longPressSendButton = async () => {
+        await this.dismissScheduledPostTooltip();
+        await waitForElementToBeVisible(this.sendButton, timeouts.FOUR_SEC);
+
+        if (isAndroid()) {
+            try {
+                await this.postList.getFlatList().swipe('up', 'fast', 0.3);
+            } catch { /* ignore */ }
+            await wait(timeouts.ONE_SEC);
+        } else {
+            await this.dismissKeyboardForSchedulePicker();
+        }
+
+        await disableSynchronization();
+        try {
+            await this.sendButton.longPress(timeouts.TWO_SEC);
+
+            await waitForElementToExist(
+                element(by.id(this.testID.scheduledPostOptionsBottomSheet)),
+                timeouts.HALF_MIN,
+            );
+        } finally {
+            await enableSynchronization();
+        }
+    };
+
+    dismissKeyboard = async () => {
+        if (isAndroid()) {
+            // Android (adjustResize + threshold 25%) already tapped fine before this fix;
+            // keep the original no-op-safe scroll so the passing Android path is unchanged.
+            try {
+                await this.postList.getFlatList().scroll(100, 'up', 0.5, 0.5);
+            } catch { /* list at boundary — nothing to scroll */ }
+            return;
+        }
+        try {
+            await this.introDisplayName.tap();
+        } catch {
+            try {
+                await this.postList.getFlatList().tap({x: 5, y: 5});
+            } catch { /* nothing to dismiss */ }
+        }
+        await wait(timeouts.ONE_SEC);
+    };
+
+    dismissKeyboardForSchedulePicker = async () => {
+        if (!isIos()) {
+            return;
+        }
+        try {
+            await this.postList.getFlatList().swipe('down', 'slow', 0.1);
+        } catch {
+            try {
+                await this.headerTitle.tap({x: 1, y: 1});
+            } catch { /* ignore */ }
+        }
+        await wait(timeouts.ONE_SEC);
+    };
+
+    tapScheduleOption = async (option: Detox.NativeElement) => {
+        await this.dismissKeyboardForSchedulePicker();
+
+        const bottomSheetMatcher = by.id(this.testID.scheduledPostOptionsBottomSheet);
+        await waitForElementToExist(option, timeouts.HALF_MIN);
+
+        if (isIos()) {
+            try {
+                await waitFor(option).toBeVisible(50).whileElement(bottomSheetMatcher).scroll(100, 'down');
+            } catch {
+                try {
+                    await waitFor(option).toBeVisible(50).whileElement(bottomSheetMatcher).scroll(100, 'up');
+                } catch { /* option may already be in view */ }
+            }
+            await waitForElementToExist(option, timeouts.TEN_SEC);
+            await option.tap({x: 1, y: 1});
+        } else {
+            await option.tap();
+        }
     };
 
     hasPostMessage = async (postId: string, postMessage: string) => {
         const {postListPostItem} = this.getPostListPostItem(postId, postMessage);
-        await expect(postListPostItem).toBeVisible();
+
+        await waitFor(postListPostItem).toExist().withTimeout(timeouts.TEN_SEC);
+        await waitFor(postListPostItem).toBeVisible(50).withTimeout(timeouts.TEN_SEC);
     };
 
     hasPostMessageAtIndex = async (index: number, postMessage: string) => {
         await expect(
             this.getPostMessageAtIndex(index),
         ).toHaveText(postMessage);
+    };
+
+    openPostPriorityPicker = async () => {
+        await this.postPriorityPicker.tap();
+    };
+
+    clickPostPriorityImportantMessage = async () => {
+        await this.postPriorityImportantMessage.tap();
+    };
+
+    clickPostPriorityUrgentMessage = async () => {
+        await this.postPriorityUrgentMessage.tap();
+    };
+
+    toggleRequestAckPostpriority = async () => {
+        await this.postPriorityRequestAck.tap();
+    };
+
+    togglePersistentNotificationPostpriority = async () => {
+        await this.postPriorityPersistentNotification.tap();
+    };
+
+    applyPostPrioritySettings = async () => {
+        await this.applyPostPriority.tap();
+    };
+
+    scheduleMessageForTomorrow = async () => {
+        await this.tapScheduleOption(this.scheduleMessageTomorrowOption);
+        await waitForElementToExist(this.scheduledPostOptionTomorrowSelected, timeouts.TEN_SEC);
+    };
+
+    scheduleMessageForMonday = async () => {
+        await this.tapScheduleOption(this.scheduleMessageOnMondayOption);
+        await waitForElementToExist(this.scheduledPostOptionMondaySelected, timeouts.TEN_SEC);
+    };
+
+    scheduleMessageForNextMonday = async () => {
+        await this.tapScheduleOption(this.scheduledPostOptionNextMonday);
+        await waitForElementToExist(this.scheduledPostOptionNextMondaySelected, timeouts.TEN_SEC);
+    };
+
+    // Probe whichever schedule option the picker shows (UTC vs America/New_York weekday mismatch on CI).
+    scheduleMessageForAvailableOption = async (): Promise<'tomorrow' | 'next_monday' | 'monday'> => {
+        const tryOption = async (
+            select: () => Promise<void>,
+            option: Detox.NativeElement,
+        ): Promise<boolean> => {
+            try {
+                await waitFor(option).toExist().withTimeout(timeouts.TWO_SEC);
+            } catch {
+                return false;
+            }
+
+            // Selection failures must fail the test — falling through would pick another
+            // option and return a key that does not match what the picker applied.
+            await select();
+            return true;
+        };
+
+        if (await tryOption(() => this.scheduleMessageForTomorrow(), this.scheduleMessageTomorrowOption)) {
+            return 'tomorrow';
+        }
+        if (await tryOption(() => this.scheduleMessageForNextMonday(), this.scheduledPostOptionNextMonday)) {
+            return 'next_monday';
+        }
+        if (await tryOption(() => this.scheduleMessageForMonday(), this.scheduleMessageOnMondayOption)) {
+            return 'monday';
+        }
+
+        throw new Error('scheduleMessageForAvailableOption: no schedule option visible in picker');
+    };
+
+    clickOnScheduledMessage = async () => {
+        await waitForElementToBeVisible(this.clickOnScheduledMessageButton, timeouts.TEN_SEC);
+        await this.clickOnScheduledMessageButton.tap();
+        await wait(timeouts.TWO_SEC);
+    };
+
+    /*
+    * Verify the message is scheduled and user can see Info in channel or thread
+    * @param {boolean} thread - true if the message is scheduled in thread
+    * @returns {Promise<void>}
+    */
+    verifyScheduledDraftInfoInChannel = async (thread = false) => {
+        await expect(this.scheduledDraftInfoInChannel).toBeVisible();
+        await expect(this.scheduledDraftInfoInChannel).toHaveText(`1 scheduled message in ${thread ? 'thread' : 'channel'}. See all.`);
+    };
+
+    closeScheduledMessageTooltip = async () => {
+        if (isIos()) {
+            await waitFor(this.scheduledDraftTooltipText).toBeVisible().withTimeout(timeouts.TEN_SEC);
+            await this.scheduledDraftTooltipText.tap();
+        } else {
+            await wait(timeouts.TEN_SEC);
+            await this.scheduleDraftInforMessage.tap();
+        }
+    };
+
+    assertPostMessageEdited = async (
+        postId: string,
+        updatedMessage: string,
+        locator: 'channel_page' | 'pinned_page' | 'thread_page' | 'search_page' | 'saved_messages_page' | 'recent_mentions_page' = 'channel_page',
+    ) => {
+        const locatorTestIDs = {
+            channel_page: 'channel.post_list.post',
+            pinned_page: 'pinned_messages.post_list.post',
+            search_page: 'search_results.post_list.post',
+            thread_page: 'thread.post_list.post',
+            saved_messages_page: 'saved_messages.post_list.post',
+            recent_mentions_page: 'recent_mentions.post_list.post',
+        };
+
+        await waitFor(element(by.id('edit_post.screen'))).
+            not.toExist().
+            withTimeout(timeouts.TEN_SEC);
+
+        const postItemTestID = locatorTestIDs[locator];
+        const postItemElement = `${postItemTestID}.${postId}`;
+        const postItemMatcher = by.id(postItemElement);
+        const escapedMessage = updatedMessage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const combinedPattern = new RegExp(`${escapedMessage}.*Edited`, isAndroid() ? 'is' : 'i');
+        const combinedMatcher = by.text(combinedPattern).withAncestor(postItemMatcher);
+        await waitFor(element(combinedMatcher)).toExist().withTimeout(timeouts.HALF_MIN);
     };
 }
 

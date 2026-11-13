@@ -1,47 +1,61 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React from 'react';
+import React, {useCallback, useMemo} from 'react';
+import {useIntl} from 'react-intl';
 import {View} from 'react-native';
 
+import {removePost} from '@actions/local/post';
+import CompassIcon from '@components/compass_icon';
+import FormattedText from '@components/formatted_text';
 import FormattedTime from '@components/formatted_time';
+import ExpiryTimer from '@components/post_list/post/header/expiry_timer';
 import PostPriorityLabel from '@components/post_priority/post_priority_label';
-import {CHANNEL, THREAD} from '@constants/screens';
+import {Screens} from '@constants';
+import {usePostConfig} from '@context/post_config';
+import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import {DEFAULT_LOCALE} from '@i18n';
-import {postUserDisplayName} from '@utils/post';
+import {isUnrevealedBoRPost} from '@utils/bor';
+import {getPostTranslation, postUserDisplayName} from '@utils/post';
 import {makeStyleSheetFromTheme} from '@utils/theme';
+import {ensureString} from '@utils/types';
 import {typography} from '@utils/typography';
-import {displayUsername, getUserCustomStatus, getUserTimezone, isCustomStatusExpired} from '@utils/user';
+import {
+    displayUsername,
+    getUserCustomStatus,
+    getUserTimezone,
+    isCustomStatusExpired,
+} from '@utils/user';
 
+import AiGeneratedIndicator from './ai_generated_indicator';
 import HeaderCommentedOn from './commented_on';
 import HeaderDisplayName from './display_name';
 import HeaderReply from './reply';
 import HeaderTag from './tag';
+import TranslateIcon from './translate_icon';
 
 import type PostModel from '@typings/database/models/servers/post';
 import type UserModel from '@typings/database/models/servers/user';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type HeaderProps = {
     author?: UserModel;
     commentCount: number;
     currentUser?: UserModel;
-    enablePostUsernameOverride: boolean;
+    isAiGenerated: boolean;
     isAutoResponse: boolean;
+    isChannelAutotranslated: boolean;
     isCRTEnabled?: boolean;
-    isCustomStatusEnabled: boolean;
     isEphemeral: boolean;
-    isMilitaryTime: boolean;
     isPendingOrFailed: boolean;
     isSystemPost: boolean;
     isWebHook: boolean;
-    location: string;
+    location: AvailableScreens;
     post: PostModel;
-    rootPostAuthor?: UserModel;
+    rootPostAuthor?: UserModel | null;
     showPostPriority: boolean;
     shouldRenderReplyButton?: boolean;
-    teammateNameDisplay: string;
-    hideGuestTags: boolean;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -56,38 +70,60 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         wrapper: {
             flex: 1,
             flexDirection: 'row',
+            alignItems: 'center',
+            gap: 5,
         },
         time: {
             color: theme.centerChannelColor,
-            marginTop: 5,
             opacity: 0.5,
             ...typography('Body', 75, 'Regular'),
         },
-        postPriority: {
-            alignSelf: 'center',
-            marginLeft: 6,
+        visibleToYou: {
+            color: theme.centerChannelColor,
+            opacity: 0.5,
+            ...typography('Body', 75, 'Regular'),
         },
     };
 });
 
 const Header = (props: HeaderProps) => {
     const {
-        author, commentCount = 0, currentUser, enablePostUsernameOverride, isAutoResponse, isCRTEnabled, isCustomStatusEnabled,
-        isEphemeral, isMilitaryTime, isPendingOrFailed, isSystemPost, isWebHook,
-        location, post, rootPostAuthor, showPostPriority, shouldRenderReplyButton, teammateNameDisplay, hideGuestTags,
+        author, commentCount = 0, currentUser, isAiGenerated, isAutoResponse, isChannelAutotranslated, isCRTEnabled,
+        isEphemeral, isPendingOrFailed, isSystemPost, isWebHook,
+        location, post, rootPostAuthor, showPostPriority, shouldRenderReplyButton,
     } = props;
+    const postConfig = usePostConfig();
     const theme = useTheme();
     const style = getStyleSheet(theme);
     const pendingPostStyle = isPendingOrFailed ? style.pendingPost : undefined;
     const isReplyPost = Boolean(post.rootId && !isEphemeral);
-    const showReply = !isReplyPost && (location !== THREAD) && (shouldRenderReplyButton && (!rootPostAuthor && commentCount > 0));
-    const displayName = postUserDisplayName(post, author, teammateNameDisplay, enablePostUsernameOverride);
-    const rootAuthorDisplayName = rootPostAuthor ? displayUsername(rootPostAuthor, currentUser?.locale, teammateNameDisplay, true) : undefined;
+    const showReply = !isReplyPost && (location !== Screens.THREAD) && (shouldRenderReplyButton && (!rootPostAuthor && commentCount > 0));
+    const displayName = postUserDisplayName(post, author, postConfig.teammateNameDisplay, postConfig.enablePostUsernameOverride);
+    const rootAuthorDisplayName = rootPostAuthor ? displayUsername(rootPostAuthor, currentUser?.locale, postConfig.teammateNameDisplay, true) : undefined;
     const customStatus = getUserCustomStatus(author);
     const showCustomStatusEmoji = Boolean(
-        isCustomStatusEnabled && displayName && customStatus &&
+        postConfig.isCustomStatusEnabled && displayName && customStatus &&
         !(isSystemPost || author?.isBot || isAutoResponse || isWebHook),
-    ) && !isCustomStatusExpired(author) && Boolean(customStatus?.emoji);
+    ) &&
+    !isCustomStatusExpired(author) &&
+    Boolean(customStatus?.emoji);
+    const userIconOverride = ensureString(post.props?.override_icon_url);
+    const usernameOverride = ensureString(post.props?.override_username);
+    const intl = useIntl();
+
+    // We need to depend on the expire_at directly,
+    // since changes in it may not be reflected in the post object
+    // (it is still the same object reference).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const showBoRIcon = useMemo(() => isUnrevealedBoRPost(post), [post, post.metadata?.expire_at]);
+    const borExpireAt = post.metadata?.expire_at;
+    const serverUrl = useServerUrl();
+
+    const onBoRPostExpiry = useCallback(async () => {
+        await removePost(serverUrl, post);
+    }, [post, serverUrl]);
+
+    const translation = getPostTranslation(post, intl.locale);
 
     return (
         <>
@@ -101,9 +137,9 @@ const Header = (props: HeaderProps) => {
                         rootPostAuthor={rootAuthorDisplayName}
                         shouldRenderReplyButton={shouldRenderReplyButton}
                         theme={theme}
-                        userIconOverride={post.props?.override_icon_url}
+                        userIconOverride={userIconOverride}
                         userId={post.userId}
-                        usernameOverride={post.props?.override_username}
+                        usernameOverride={usernameOverride}
                         showCustomStatusEmoji={showCustomStatusEmoji}
                         customStatus={customStatus!}
                     />
@@ -111,40 +147,63 @@ const Header = (props: HeaderProps) => {
                     <HeaderTag
                         isAutoResponder={isAutoResponse}
                         isAutomation={isWebHook || author?.isBot}
-                        showGuestTag={author?.isGuest && !hideGuestTags}
+                        showGuestTag={author?.isGuest && !postConfig.hideGuestTags}
                     />
                     }
                     <FormattedTime
                         timezone={getUserTimezone(currentUser)}
-                        isMilitaryTime={isMilitaryTime}
+                        isMilitaryTime={postConfig.isMilitaryTime}
                         value={post.createAt}
                         style={style.time}
                         testID='post_header.date_time'
                     />
-                    {showPostPriority && post.metadata?.priority?.priority && (
-                        <View style={style.postPriority}>
-                            <PostPriorityLabel
-                                label={post.metadata.priority.priority}
-                            />
-                        </View>
+                    {isChannelAutotranslated && post.type === '' && (
+                        <TranslateIcon translationState={translation?.state}/>
                     )}
-                    {!isCRTEnabled && showReply && commentCount > 0 &&
+                    {isEphemeral && (
+                        <FormattedText
+                            id='post_header.visible_message'
+                            defaultMessage='(Only visible to you)'
+                            style={style.visibleToYou}
+                            testID='post_header.visible_message'
+                        />
+                    )}
+                    {showPostPriority && post.metadata?.priority?.priority && (
+                        <PostPriorityLabel label={post.metadata.priority.priority}/>
+                    )}
+                    {showBoRIcon && (
+                        <CompassIcon
+                            name='fire'
+                            size={16}
+                            color={theme.dndIndicator}
+                        />
+                    )}
+                    {Boolean(borExpireAt) && (
+                        <ExpiryTimer
+                            expiryTime={borExpireAt as number}
+                            onExpiry={onBoRPostExpiry}
+                        />
+                    )}
+                    {isAiGenerated && (
+                        <AiGeneratedIndicator post={post}/>
+                    )}
+                    {!isCRTEnabled && showReply && commentCount > 0 && (
                         <HeaderReply
                             commentCount={commentCount}
                             location={location}
                             post={post}
                             theme={theme}
                         />
-                    }
+                    )}
                 </View>
             </View>
-            {Boolean(rootAuthorDisplayName) && location === CHANNEL &&
-            <HeaderCommentedOn
-                locale={currentUser?.locale || DEFAULT_LOCALE}
-                name={rootAuthorDisplayName!}
-                theme={theme}
-            />
-            }
+            {Boolean(rootAuthorDisplayName) && location === Screens.CHANNEL && (
+                <HeaderCommentedOn
+                    locale={currentUser?.locale || DEFAULT_LOCALE}
+                    name={rootAuthorDisplayName!}
+                    theme={theme}
+                />
+            )}
         </>
     );
 };

@@ -1,12 +1,13 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React from 'react';
-import {useIntl} from 'react-intl';
+import React, {useCallback} from 'react';
+import {defineMessage, useIntl} from 'react-intl';
 import {View, Pressable} from 'react-native';
 
 import {dismissIncomingCall} from '@calls/actions';
-import {leaveAndJoinWithAlert, showLimitRestrictedAlert} from '@calls/alerts';
+import {joinCallAndOpenCallScreen} from '@calls/actions/calls';
+import {showLimitRestrictedAlert} from '@calls/alerts';
 import {removeIncomingCall} from '@calls/state';
 import CompassIcon from '@components/compass_icon';
 import FormattedRelativeTime from '@components/formatted_relative_time';
@@ -15,6 +16,7 @@ import UserAvatarsStack from '@components/user_avatars_stack';
 import Screens from '@constants/screens';
 import {JOIN_CALL_BAR_HEIGHT} from '@constants/view';
 import {useTheme} from '@context/theme';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
@@ -59,6 +61,9 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     },
     innerContainerRestricted: {
         backgroundColor: changeOpacity(theme.centerChannelColor, 0.48),
+    },
+    pressed: {
+        opacity: 0.72,
     },
     iconContainer: {
         top: 1,
@@ -130,6 +135,11 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     },
 }));
 
+const callParticipantsMessage = defineMessage({
+    id: 'calls.join_call_avatars.bottom_sheet_title',
+    defaultMessage: 'Call participants',
+});
+
 const JoinCallBanner = ({
     channelId,
     callId,
@@ -143,13 +153,15 @@ const JoinCallBanner = ({
     const style = getStyleSheet(theme);
     const isLimitRestricted = limitRestrictedInfo.limitRestricted;
 
-    const joinHandler = async () => {
+    const handleJoinPress = useCallback(async () => {
         if (isLimitRestricted) {
             showLimitRestrictedAlert(limitRestrictedInfo, intl);
             return;
         }
-        leaveAndJoinWithAlert(intl, serverUrl, channelId);
-    };
+
+        await joinCallAndOpenCallScreen(intl, serverUrl, channelId);
+    }, [isLimitRestricted, limitRestrictedInfo, intl, serverUrl, channelId]);
+    const joinHandler = usePreventDoubleTap(handleJoinPress);
 
     const onDismissPress = () => {
         removeIncomingCall(serverUrl, callId, channelId);
@@ -159,7 +171,8 @@ const JoinCallBanner = ({
     return (
         <View style={style.outerContainer}>
             <Pressable
-                style={[style.innerContainer, isLimitRestricted && style.innerContainerRestricted]}
+                testID='calls.join_call_banner.join'
+                style={({pressed}) => [style.innerContainer, isLimitRestricted && style.innerContainerRestricted, pressed && style.pressed]}
                 onPress={joinHandler}
             >
                 <View style={style.iconContainer}>
@@ -197,8 +210,12 @@ const JoinCallBanner = ({
                     overflowContainerStyle={style.overflowContainer}
                     overflowItemStyle={style.overflowItem}
                     overflowTextStyle={style.overflowText}
+                    bottomSheetTitle={callParticipantsMessage}
                 />
-                <Pressable onPress={onDismissPress}>
+                <Pressable
+                    testID='calls.join_call_banner.dismiss'
+                    onPress={onDismissPress}
+                >
                     <View style={style.dismissContainer}>
                         <CompassIcon
                             name='close'

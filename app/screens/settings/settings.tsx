@@ -1,118 +1,60 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useMemo} from 'react';
+import React, {useCallback} from 'react';
 import {useIntl} from 'react-intl';
-import {Platform, View} from 'react-native';
+import {Platform} from 'react-native';
 
 import {handleGotoLocation} from '@actions/remote/command';
-import CompassIcon from '@components/compass_icon';
+import MenuDivider from '@components/menu_divider';
 import SettingContainer from '@components/settings/container';
 import SettingItem from '@components/settings/item';
 import {Screens} from '@constants';
 import {useServerDisplayName, useServerUrl} from '@context/server';
-import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {dismissModal, goToScreen, setButtons} from '@screens/navigation';
-import {preventDoubleTap} from '@utils/tap';
-import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
+import {usePreventDoubleTap} from '@hooks/utils';
+import {navigateBack, navigateToSettingsScreen} from '@screens/navigation';
 
 import ReportProblem from './report_problem';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
-const CLOSE_BUTTON_ID = 'close-settings';
-
-const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
-    return {
-        containerStyle: {
-            paddingLeft: 8,
-            marginTop: 12,
-        },
-        helpGroup: {
-            width: '91%',
-            backgroundColor: changeOpacity(theme.centerChannelColor, 0.08),
-            height: 1,
-            alignSelf: 'center',
-
-            // marginTop: 20,
-        },
-    };
-});
-
 type SettingsProps = {
-    componentId: AvailableScreens;
     helpLink: string;
     showHelp: boolean;
     siteName: string;
 }
 
-//todo: Profile the whole feature - https://mattermost.atlassian.net/browse/MM-39711
-
-const Settings = ({componentId, helpLink, showHelp, siteName}: SettingsProps) => {
-    const theme = useTheme();
+const Settings = ({helpLink, showHelp, siteName}: SettingsProps) => {
     const intl = useIntl();
     const serverUrl = useServerUrl();
     const serverDisplayName = useServerDisplayName();
 
     const serverName = siteName || serverDisplayName;
-    const styles = getStyleSheet(theme);
 
-    const closeButton = useMemo(() => {
-        return {
-            id: CLOSE_BUTTON_ID,
-            icon: CompassIcon.getImageSourceSync('close', 24, theme.centerChannelColor),
-            testID: 'close.settings.button',
-        };
-    }, [theme.centerChannelColor]);
+    useAndroidHardwareBackHandler(Screens.SETTINGS, navigateBack);
 
-    const close = useCallback(() => {
-        dismissModal({componentId});
-    }, [componentId]);
+    const goToNotifications = usePreventDoubleTap(useCallback(() => {
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION);
+    }, []));
 
-    useEffect(() => {
-        setButtons(componentId, {
-            leftButtons: [closeButton],
-        });
-    }, []);
+    const goToDisplaySettings = usePreventDoubleTap(useCallback(() => {
+        navigateToSettingsScreen(Screens.SETTINGS_DISPLAY);
+    }, []));
 
-    useAndroidHardwareBackHandler(componentId, close);
-    useNavButtonPressed(CLOSE_BUTTON_ID, componentId, close, []);
-
-    const goToNotifications = preventDoubleTap(() => {
-        const screen = Screens.SETTINGS_NOTIFICATION;
-        const title = intl.formatMessage({id: 'settings.notifications', defaultMessage: 'Notifications'});
-
-        goToScreen(screen, title);
-    });
-
-    const goToDisplaySettings = preventDoubleTap(() => {
-        const screen = Screens.SETTINGS_DISPLAY;
-        const title = intl.formatMessage({id: 'settings.display', defaultMessage: 'Display'});
-
-        goToScreen(screen, title);
-    });
-
-    const goToAbout = preventDoubleTap(() => {
-        const screen = Screens.ABOUT;
+    const goToAbout = usePreventDoubleTap(useCallback(() => {
         const title = intl.formatMessage({id: 'settings.about', defaultMessage: 'About {appTitle}'}, {appTitle: serverName});
 
-        goToScreen(screen, title);
-    });
+        navigateToSettingsScreen(Screens.ABOUT, {headerTitle: title});
+    }, [intl, serverName]));
 
-    const goToAdvancedSettings = preventDoubleTap(() => {
-        const screen = Screens.SETTINGS_ADVANCED;
-        const title = intl.formatMessage({id: 'settings.advanced_settings', defaultMessage: 'Advanced Settings'});
+    const goToAdvancedSettings = usePreventDoubleTap(useCallback(() => {
+        navigateToSettingsScreen(Screens.SETTINGS_ADVANCED);
+    }, []));
 
-        goToScreen(screen, title);
-    });
-
-    const openHelp = preventDoubleTap(() => {
+    const openHelp = usePreventDoubleTap(useCallback(() => {
         if (helpLink) {
             handleGotoLocation(serverUrl, intl, helpLink);
         }
-    });
+    }, [helpLink, intl, serverUrl]));
 
     return (
         <SettingContainer testID='settings'>
@@ -138,18 +80,17 @@ const Settings = ({componentId, helpLink, showHelp, siteName}: SettingsProps) =>
                 optionName='about'
                 testID='settings.about.option'
             />
-            {Platform.OS === 'android' && <View style={styles.helpGroup}/>}
+            {Platform.OS === 'android' && <MenuDivider/>}
             {showHelp &&
                 <SettingItem
-                    optionLabelTextStyle={{color: theme.linkColor}}
                     onPress={openHelp}
                     optionName='help'
                     separator={false}
                     testID='settings.help.option'
-                    type='default'
+                    type='link'
                 />
             }
-            <ReportProblem siteName={siteName}/>
+            <ReportProblem/>
         </SettingContainer>
     );
 };

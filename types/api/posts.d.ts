@@ -1,8 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-type PostType =
+type PostTypesUserCreatable =
     | ''
+    | 'burn_on_read';
+
+type PostType = PostTypesUserCreatable
     | 'system_add_remove'
     | 'system_add_to_channel'
     | 'system_add_to_team'
@@ -16,9 +19,25 @@ type PostType =
     | 'system_join_leave'
     | 'system_leave_channel'
     | 'system_purpose_change'
-    | 'system_remove_from_channel';
+    | 'system_remove_from_channel'
+    | 'system_ephemeral_add_to_channel'
+    | 'system_guest_join_channel'
+    | 'system_add_guest_to_chan'
+    | 'system_join_team'
+    | 'system_leave_team'
+    | 'system_remove_from_team'
+    | 'system_combined_user_activity'
+    | 'system_shared_chan_state'
+    | 'add_bot_teams_channels'
+    | 'system_auto_responder'
+    | 'custom_calls'
+    | 'custom_calls_recording'
+    | 'custom_run_update'
+    | 'custom_llmbot'
+    | 'custom_llm_postback'
+    | 'custom_agent_mention_reminder';
 
-type PostEmbedType = 'image' | 'message_attachment' | 'opengraph';
+type PostEmbedType = 'image' | 'message_attachment' | 'opengraph' | 'permalink';
 
 type PostAcknowledgement = {
     post_id: string;
@@ -30,6 +49,29 @@ type PostPriority = {
     priority: '' | 'urgent' | 'important';
     requested_ack?: boolean;
     persistent_notifications?: boolean;
+};
+
+// Matches the web client's PostInfo type (GET /api/v4/posts/{post_id}/info).
+// Returns channel/team metadata for a post without requiring channel membership,
+// unlike GET /api/v4/posts/{post_id} which requires ReadChannelContent permission.
+type PostInfo = {
+    channel_id: string;
+    channel_type: ChannelType;
+    channel_display_name: string;
+    has_joined_channel: boolean;
+    team_id: string;
+    team_type: string;
+    team_display_name: string;
+    has_joined_team: boolean;
+}
+
+type PermalinkEmbedData = {
+    post_id: string;
+    post?: Post;
+    team_name: string;
+    channel_display_name: string;
+    channel_type: string;
+    channel_id: string;
 };
 
 type PostEmbed = {
@@ -45,6 +87,15 @@ type PostImage = {
     frame_count?: number;
 };
 
+type PostTranslationState = 'ready' | 'skipped' | 'unavailable' | 'processing';
+type PostTranslation = {
+    object: {
+        message: string;
+    };
+    state: PostTranslationState;
+    source_lang?: string;
+};
+
 type PostMetadata = {
     acknowledgements?: PostAcknowledgement[];
     embeds?: PostEmbed[];
@@ -53,6 +104,11 @@ type PostMetadata = {
     images?: Dictionary<PostImage | undefined>;
     reactions?: Reaction[];
     priority?: PostPriority;
+    expire_at?: number;
+    borConfig?: PostBoRConfig;
+    recipients?: string[];
+    translations?: Record<string, PostTranslation>;
+    redacted_file_count?: number;
 };
 
 type Post = {
@@ -71,7 +127,7 @@ type Post = {
     message_source?: string;
     type: PostType;
     participants?: null | UserProfile[]|string[];
-    props: Record<string, any>;
+    props: Record<string, unknown> | undefined;
     hashtags: string;
     pending_post_id: string;
     reply_count: number;
@@ -86,6 +142,8 @@ type Post = {
 type PostProps = {
     disable_group_highlight?: boolean;
     mentionHighlightDisabled: boolean;
+    ai_generated_by?: string;
+    ai_generated_by_username?: string;
 };
 
 type PostResponse = {
@@ -107,29 +165,29 @@ type ProcessedPosts = {
 }
 
 type MessageAttachment = {
-    id: number;
-    fallback: string;
-    color: string;
-    pretext: string;
-    author_name: string;
-    author_link: string;
-    author_icon: string;
-    title: string;
-    title_link: string;
-    text: string;
-    fields: MessageAttachmentField[];
-    image_url: string;
-    thumb_url: string;
-    footer: string;
-    footer_icon: string;
-    timestamp: number | string;
+    id?: number;
+    fallback?: string;
+    color?: string;
+    pretext?: string;
+    author_name?: string;
+    author_link?: string;
+    author_icon?: string;
+    title?: string;
+    title_link?: string;
+    text?: string;
+    fields?: MessageAttachmentField[];
+    image_url?: string;
+    thumb_url?: string;
+    footer?: string;
+    footer_icon?: string;
+    timestamp?: number | string;
     actions?: PostAction[];
 };
 
 type MessageAttachmentField = {
-    title: string;
-    value: any;
-    short: boolean;
+    title?: string;
+    value?: any;
+    short?: boolean;
 }
 
 type PostSearchParams = {
@@ -150,4 +208,10 @@ type FetchPaginatedThreadOptions = {
     perPage?: number;
     fromCreateAt?: number;
     fromPost?: string;
+}
+
+type PostBoRConfig = {
+    enabled: boolean;
+    borDurationSeconds: number;
+    borMaximumTimeToLiveSeconds: number;
 }

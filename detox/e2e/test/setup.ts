@@ -1,23 +1,428 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
+/* eslint-disable no-await-in-loop, no-console */
 
-import {Plugin, System, User} from '@support/server_api';
+import {execSync} from 'child_process';
+import {existsSync, readFileSync, writeFileSync} from 'fs';
+import {tmpdir} from 'os';
+import path from 'path';
+
+import {System, User} from '@support/server_api';
+import {drainPoolGuardViolations} from '@support/server_api/pool_guard';
+import {applyServerBaseline} from '@support/server_baseline';
+import {serverRole} from '@support/server_role';
 import {siteOneUrl} from '@support/test_config';
+import {disableSynchronization, enableSynchronization} from '@support/utils';
+
+import {logError, logWarn} from '../../provision/log';
+
+const BUNDLE_ID = 'com.mattermost.rnbeta';
+
+function getSimulatorId(): string {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const udid = (device as any)._deviceId || (device as any).id || process.env.SIMULATOR_ID || '';
+        return typeof udid === 'string' ? udid : '';
+    } catch {
+        return process.env.SIMULATOR_ID || '';
+    }
+}
+
+function resolveContainerPath(simId: string, kind: string): string | undefined {
+    try {
+        const containerPath = execSync(
+            `xcrun simctl get_app_container "${simId}" ${BUNDLE_ID} ${kind} 2>/dev/null`,
+            {encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']},
+        ).trim();
+        return containerPath || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+// Jest resets module state per test file, so cache paths on disk per simulator instead of in a variable or process.env.
+function containerCacheFile(simId: string): string {
+    return path.join(tmpdir(), `mattermost-detox-ios-containers-${simId}.json`);
+}
+
+function readCachedContainerPath(simId: string, kind: string): string | undefined {
+    try {
+        const cached = JSON.parse(readFileSync(containerCacheFile(simId), 'utf8')) as Record<string, string>;
+        const cachedPath = cached[kind];
+        return cachedPath && existsSync(cachedPath) ? cachedPath : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function getContainerPath(simId: string, kind: string): string | undefined {
+    const cachedPath = readCachedContainerPath(simId, kind);
+    if (cachedPath) {
+        return cachedPath;
+    }
+    const containerPath = resolveContainerPath(simId, kind);
+    if (containerPath) {
+        try {
+            let cached: Record<string, string> = {};
+            try {
+                cached = JSON.parse(readFileSync(containerCacheFile(simId), 'utf8')) as Record<string, string>;
+            } catch {
+                // No cache yet for this simulator.
+            }
+            cached[kind] = containerPath;
+            writeFileSync(containerCacheFile(simId), JSON.stringify(cached));
+        } catch {
+            // Caching is best effort; the resolved path is still usable.
+        }
+    }
+    return containerPath;
+}
+
+function wipeContainerContents(containerPath: string): void {
+    // Preserve containermanagerd's metadata plist; deleting it breaks future
+    // `simctl get_app_container ... group.com.mattermost.rnbeta` lookups in the shard.
+    execSync(
+        `find "${containerPath}" -mindepth 1 -maxdepth 1 ! -name '.com.apple.mobile_container_manager.metadata.plist' -exec rm -rf {} +`,
+        {stdio: 'pipe'},
+    );
+}
+
+function clearIOSAppData(): void {
+    const simId = getSimulatorId();
+    if (!simId) {
+        console.warn('[clearIOSAppData] No simulator ID — skipping data wipe');
+        return;
+    }
+
+    try {
+        execSync(`xcrun simctl terminate "${simId}" ${BUNDLE_ID} 2>/dev/null || true`, {stdio: 'pipe', timeout: 10_000});
+    } catch {
+        // App might not be running or terminate timed out — fallback below
+    }
+
+    try {
+        const appPid = execSync(
+            `xcrun simctl spawn "${simId}" launchctl list 2>/dev/null | grep "${BUNDLE_ID}" | awk '{print $1}' | grep -E '^[0-9]+$' | head -n 1 || true`,
+            {encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']},
+        ).trim();
+
+        if (appPid) {
+            execSync(`xcrun simctl spawn "${simId}" kill -9 "${appPid}"`, {stdio: 'pipe'});
+
+            execSync('sleep 1', {stdio: 'pipe'});
+        }
+    } catch {
+        // App might not be running — that's fine
+    }
+
+    // 2. Find the app's data and App Group containers and delete their contents.
+    const dataContainer = getContainerPath(simId, 'data');
+    if (dataContainer) {
+        try {
+            wipeContainerContents(dataContainer);
+            console.info(`[clearIOSAppData] Cleared data container: ${dataContainer}`);
+        } catch {
+            console.warn('[clearIOSAppData] data-container wipe failed');
+        }
+    } else {
+        console.warn('[clearIOSAppData] Could not resolve data container (app may not be installed yet)');
+    }
+
+    const appGroupContainer = getContainerPath(simId, 'group.com.mattermost.rnbeta');
+    if (appGroupContainer) {
+        if (existsSync(appGroupContainer)) {
+            try {
+                wipeContainerContents(appGroupContainer);
+                console.info(`[clearIOSAppData] Cleared App Group container: ${appGroupContainer}`);
+            } catch {
+                console.warn('[clearIOSAppData] App-Group-container wipe failed');
+            }
+        }
+    } else {
+        console.warn('[clearIOSAppData] Could not resolve App Group container');
+    }
+
+    // 3. Clear the keychain (removes stored auth tokens, certificates)
+    try {
+        execSync(`xcrun simctl keychain "${simId}" reset`, {stdio: 'pipe'});
+    } catch {
+        // Older simctl versions may not support keychain reset — non-fatal
+    }
+}
+
+// ─── Admin API login ─────────────────────────────────────────────────────────
+
+async function loginAdmin(): Promise<void> {
+    // 8 attempts with 3s*n backoff is 84s of sleeping on its own, and each attempt can
+    // additionally spend the API client's whole retry budget. That overruns the 360s
+    // beforeAll before the attempts are even used up, which reports as a bare Jest hook
+    // timeout instead of "the server is not healthy". Bound the total instead.
+    const HEALTH_MAX_ATTEMPTS = 8;
+    const HEALTH_DEADLINE_MS = 150_000;
+    const healthDeadlineAt = Date.now() + HEALTH_DEADLINE_MS;
+    for (let healthAttempt = 1; healthAttempt <= HEALTH_MAX_ATTEMPTS; healthAttempt++) {
+        try {
+            await System.apiCheckSystemHealth(siteOneUrl);
+            break;
+        } catch (error) {
+            const backoffMs = 3000 * healthAttempt;
+            if (healthAttempt === HEALTH_MAX_ATTEMPTS || Date.now() + backoffMs >= healthDeadlineAt) {
+                throw error;
+            }
+            console.warn(`⚠️ System health check attempt ${healthAttempt} failed, retrying...`);
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+    }
+
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const {error: loginError} = await User.apiAdminLogin(siteOneUrl);
+        if (loginError) {
+            if (attempt === MAX_ATTEMPTS) {
+                throw new Error(`Admin login failed after ${MAX_ATTEMPTS} attempts: ${JSON.stringify(loginError)}`);
+            }
+            console.warn(`⚠️ Admin login attempt ${attempt} failed, retrying...`);
+            await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+            continue;
+        }
+
+        const {error: meError} = await User.apiGetMe(siteOneUrl);
+        if (!meError) {
+            console.info(`✅ Admin session verified on attempt ${attempt}`);
+            return;
+        }
+        if (attempt === MAX_ATTEMPTS) {
+            throw new Error(`Admin session not usable after ${MAX_ATTEMPTS} login attempts`);
+        }
+        console.warn(`⚠️ Session check failed on attempt ${attempt}, retrying...`);
+        await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+    }
+}
+
+function recoverAndroidDevice(): void {
+    if (device.getPlatform() !== 'android') {
+        return;
+    }
+
+    const commands = [
+        'adb shell input keyevent KEYCODE_WAKEUP',
+        'adb shell wm dismiss-keyguard',
+        'adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS',
+        'adb shell svc power stayon true',
+    ];
+    for (const command of commands) {
+        try {
+            execSync(command, {stdio: 'pipe', timeout: 5_000});
+        } catch {
+            // Best effort — an unavailable command must not mask the launch error.
+        }
+    }
+
+    // Record what actually holds focus, so a repeat failure is diagnosable from the
+    // job log instead of only from the Espresso view dump.
+    try {
+        const focus = execSync(
+            "adb shell dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'",
+            {encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5_000},
+        );
+        logWarn(`[recoverAndroidDevice] window focus: ${focus.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
+    } catch {
+        logError('[recoverAndroidDevice] could not read window focus from dumpsys');
+    }
+}
+
+// Android 13+ (API 33+): the `permissions` key in device.launchApp() only works
+// on iOS simulators. On Android, notification permission must be granted via adb.
+async function grantAndroidNotificationPermission(): Promise<void> {
+    if (device.getPlatform() !== 'android') {
+        return;
+    }
+    try {
+        execSync(`adb shell pm grant ${BUNDLE_ID} android.permission.POST_NOTIFICATIONS`, {stdio: 'pipe'});
+    } catch {
+        // API < 33 or already granted
+    }
+}
+
+// iOS has no shard-level retry (Android re-runs failed spec files in a second
+// attempt), so on CI a failing iOS test is retried once in place. Jest keeps the
+// first attempt's error in the report's retryReasons, and Test System IO stores it
+// as a failed attempt: a test that passes on retry is reported flaky, not clean.
+if (process.env.CI && process.env.IOS === 'true') {
+    jest.retryTimes(Number(process.env.DETOX_TEST_RETRIES ?? 1), {logErrorsBeforeRetry: true});
+}
+
+// ─── Global beforeAll ────────────────────────────────────────────────────────
+// Runs before each test file.
+// Responsibilities: launch app with clean state, admin login, plugin cleanup.
 
 beforeAll(async () => {
-    // Login as sysadmin and reset server configuration
-    await System.apiCheckSystemHealth(siteOneUrl);
-    await User.apiAdminLogin(siteOneUrl);
-    await Plugin.apiDisableNonPrepackagedPlugins(siteOneUrl);
+    if (device.getPlatform() === 'android') {
+        try {
+            execSync(`adb shell am force-stop ${BUNDLE_ID}`, {stdio: 'pipe'});
+        } catch { /* app may not be running */ }
+        try {
+            execSync(`adb shell pm clear ${BUNDLE_ID}`, {stdio: 'pipe'});
+        } catch {
+            // Package might not be installed yet on first run
+        }
 
-    await device.launchApp({
-        newInstance: true,
-        launchArgs: {detoxPrintBusyIdleResources: 'YES'},
-        permissions: {
-            notifications: 'YES',
-            camera: 'YES',
-            medialibrary: 'YES',
-            photos: 'YES',
-        },
-    });
+        try {
+            execSync('adb shell settings put secure show_ime_with_hard_keyboard 0', {stdio: 'pipe'});
+            execSync('adb shell settings put secure spell_checker_enabled 0', {stdio: 'pipe'});
+            execSync('adb shell settings put secure auto_text_enabled 0', {stdio: 'pipe'});
+        } catch {
+            // Older AVDs may not support these — non-fatal.
+        }
+    }
+
+    const isFirstFile = !process.env.DETOX_SETUP_DONE;
+    const launchArgs = {detoxDisableSynchronization: 'YES'};
+
+    const APP_READY_TIMEOUT = device.getPlatform() === 'android' ? 90_000 : 30_000;
+
+    async function forceAndroidDataClear(): Promise<void> {
+        if (device.getPlatform() !== 'android') {
+            return;
+        }
+        try {
+            // Stop the app process first so pm clear can safely wipe its data dir.
+            execSync(`adb shell am force-stop ${BUNDLE_ID}`, {stdio: 'pipe'});
+        } catch { /* app may not be running */ }
+        try {
+            execSync(`adb shell pm clear ${BUNDLE_ID}`, {stdio: 'pipe'});
+            console.info('[forceAndroidDataClear] pm clear succeeded');
+        } catch (e) {
+            console.warn('[forceAndroidDataClear] pm clear failed:', String(e).slice(0, 200));
+        }
+    }
+
+    async function ensureAndroidMetroReverse(): Promise<void> {
+        if (device.getPlatform() !== 'android') {
+            return;
+        }
+        try {
+            execSync('adb reverse tcp:8081 tcp:8081', {stdio: 'pipe'});
+            const reverseList = execSync('adb reverse --list', {encoding: 'utf8'});
+            if (!reverseList.includes('tcp:8081')) {
+                console.warn('[ensureAndroidMetroReverse] tcp:8081 reverse missing after setup');
+            }
+        } catch (e) {
+            console.warn('[ensureAndroidMetroReverse] failed:', String(e).slice(0, 200));
+        }
+    }
+
+    async function launchAndVerify(): Promise<void> {
+        await grantAndroidNotificationPermission();
+        await ensureAndroidMetroReverse();
+
+        await device.launchApp({
+            newInstance: true,
+            ...(device.getPlatform() === 'ios' ? {permissions: {notifications: 'YES'}} : {}),
+            launchArgs,
+        });
+
+        await disableSynchronization();
+
+        const serverScreenEl = element(by.id('server.screen'));
+
+        try {
+            await waitFor(serverScreenEl).toExist().withTimeout(APP_READY_TIMEOUT);
+        } catch {
+            if (device.getPlatform() === 'android') {
+                const channelListEl = element(by.id('channel_list.screen'));
+                try {
+                    await waitFor(channelListEl).toExist().withTimeout(5_000);
+                    console.warn(
+                        '[launchAndVerify] App launched in logged-in state (channel_list visible). ' +
+                        'pm clear did not take effect. Retrying with force-stop + pm clear.',
+                    );
+                    await forceAndroidDataClear();
+
+                    await grantAndroidNotificationPermission();
+                    await ensureAndroidMetroReverse();
+                    await device.launchApp({newInstance: true, launchArgs});
+                    await waitFor(serverScreenEl).toExist().withTimeout(APP_READY_TIMEOUT);
+                } catch {
+                    throw new Error(
+                        `[launchAndVerify] Neither server.screen nor channel_list.screen appeared within ${APP_READY_TIMEOUT / 1000}s`,
+                    );
+                }
+            } else {
+                const channelListEl = element(by.id('channel_list.screen'));
+                try {
+                    await waitFor(channelListEl).toExist().withTimeout(5_000);
+                    console.warn(
+                        '[launchAndVerify] iOS app launched with stale state (channel_list visible). ' +
+                        'clearIOSAppData wipe incomplete. Re-clearing and relaunching.',
+                    );
+                    clearIOSAppData();
+                    await device.launchApp({
+                        newInstance: true,
+                        ...(device.getPlatform() === 'ios' ? {permissions: {notifications: 'YES'}} : {}),
+                        launchArgs,
+                    });
+                    await waitFor(serverScreenEl).toExist().withTimeout(APP_READY_TIMEOUT);
+                } catch {
+                    throw new Error(
+                        `[launchAndVerify] server.screen did not appear within ${APP_READY_TIMEOUT / 1000}s`,
+                    );
+                }
+            }
+        } finally {
+            // Always re-enable synchronization so subsequent test operations
+            // (tap, typeText, expect) re-enter the normal synchronized path.
+            await enableSynchronization();
+        }
+    }
+
+    if (isFirstFile) {
+        process.env.DETOX_SETUP_DONE = 'true';
+    }
+
+    if (device.getPlatform() === 'ios') {
+        clearIOSAppData();
+    }
+
+    const MAX_LAUNCH_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_LAUNCH_ATTEMPTS; attempt++) {
+        try {
+            await launchAndVerify();
+            break;
+        } catch (launchError) {
+            console.warn(
+                `⚠️ Launch attempt ${attempt}/${MAX_LAUNCH_ATTEMPTS} failed:`,
+                String(launchError).slice(0, 300),
+            );
+            if (attempt === MAX_LAUNCH_ATTEMPTS) {
+                throw launchError;
+            }
+
+            if (device.getPlatform() === 'ios') {
+                clearIOSAppData();
+            } else if (device.getPlatform() === 'android') {
+                recoverAndroidDevice();
+                await forceAndroidDataClear();
+                await ensureAndroidMetroReverse();
+            }
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+    }
+
+    console.info('✅ App launched');
+
+    await loginAdmin();
+
+    // The mutation shard runs specs that change server-wide state; start each one from the baseline.
+    if (serverRole === 'mutation') {
+        await applyServerBaseline(siteOneUrl);
+    }
+}, 360_000);
+
+// API helpers return errors instead of throwing, so a blocked write would otherwise pass unnoticed.
+afterAll(() => {
+    const violations = drainPoolGuardViolations();
+    if (violations.length) {
+        throw new Error(`Server-wide writes from a pool shard (move the spec to detox/e2e/server_mutation_specs.json):\n${violations.join('\n')}`);
+    }
 });

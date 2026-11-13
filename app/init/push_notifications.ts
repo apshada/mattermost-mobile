@@ -1,6 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import RNUtils from '@mattermost/rnutils/src';
+import {defineMessages} from 'react-intl';
 import {AppState, DeviceEventEmitter, Platform, type EmitterSubscription} from 'react-native';
 import {
     Notification,
@@ -11,45 +13,72 @@ import {
     Notifications,
     type NotificationTextInput,
     type Registered,
+    type RegistrationError,
 } from 'react-native-notifications';
 import {requestNotifications} from 'react-native-permissions';
 
 import {storeDeviceToken} from '@actions/app/global';
 import {markChannelAsViewed} from '@actions/local/channel';
+import {enqueueAuditEvent} from '@actions/local/ephemeral_mode/audit_queue';
 import {updateThread} from '@actions/local/thread';
 import {backgroundNotification, openNotification} from '@actions/remote/notifications';
 import {isCallsStartedMessage} from '@calls/utils';
-import {Device, Events, Navigation, PushNotification, Screens} from '@constants';
+import {Device, Events, PushNotification, Screens} from '@constants';
+import {EphemeralModeAuditEventKind} from '@constants/ephemeral_mode';
 import DatabaseManager from '@database/manager';
-import {DEFAULT_LOCALE, getLocalizedMessage, t} from '@i18n';
-import NativeNotifications from '@notifications';
+import {DEFAULT_LOCALE, getLocalizedMessage} from '@i18n';
+import EphemeralModeManager from '@managers/ephemeral_mode_manager';
 import {getServerDisplayName} from '@queries/app/servers';
 import {getCurrentChannelId} from '@queries/servers/system';
 import {getIsCRTEnabled, getThreadById} from '@queries/servers/thread';
-import {showOverlay} from '@screens/navigation';
 import EphemeralStore from '@store/ephemeral_store';
-import NavigationStore from '@store/navigation_store';
+import InAppNotificationStore from '@store/in_app_notification_store';
+import {NavigationStore} from '@store/navigation_store';
+import {getFullErrorMessage} from '@utils/errors';
 import {isBetaApp} from '@utils/general';
 import {isMainActivity, isTablet} from '@utils/helpers';
-import {logDebug, logInfo} from '@utils/log';
+import {logDebug, logError, logInfo, logWarning} from '@utils/log';
 import {convertToNotificationData} from '@utils/notification';
 
-class PushNotifications {
+const messages = defineMessages({
+    replyTitle: {
+        id: 'mobile.push_notification_reply.title',
+        defaultMessage: 'Reply',
+    },
+    replyButton: {
+        id: 'mobile.push_notification_reply.button',
+        defaultMessage: 'Send',
+    },
+    replyPlaceholder: {
+        id: 'mobile.push_notification_reply.placeholder',
+        defaultMessage: 'Write a reply...',
+    },
+});
+
+class PushNotificationsSingleton {
     configured = false;
     subscriptions?: EmitterSubscription[];
 
     init(register: boolean) {
+        logDebug('PushNotifications: Initializing');
         this.subscriptions?.forEach((v) => v.remove());
         this.subscriptions = [
             Notifications.events().registerNotificationOpened(this.onNotificationOpened),
             Notifications.events().registerRemoteNotificationsRegistered(this.onRemoteNotificationsRegistered),
             Notifications.events().registerNotificationReceivedBackground(this.onNotificationReceivedBackground),
             Notifications.events().registerNotificationReceivedForeground(this.onNotificationReceivedForeground),
+            Notifications.events().registerRemoteNotificationsRegistrationFailed(this.NotificationsRegistrationFailed),
+            Notifications.events().registerRemoteNotificationsRegistrationDenied(this.onRemoteNotificationsRegistrationDenied),
         ];
 
         if (register) {
             this.registerIfNeeded();
         }
+    }
+
+    cleanup() {
+        this.subscriptions?.forEach((v) => v.remove());
+        this.subscriptions = [];
     }
 
     async registerIfNeeded() {
@@ -58,12 +87,15 @@ class PushNotifications {
             await requestNotifications(['alert', 'sound', 'badge']);
         }
         Notifications.registerRemoteNotifications();
+
+        // Never call Notifications.registerPushKit() — PushKit is owned by
+        // @mattermost/calls-native; a second PKPushRegistry would break it.
     }
 
     createReplyCategory = () => {
-        const replyTitle = getLocalizedMessage(DEFAULT_LOCALE, t('mobile.push_notification_reply.title'));
-        const replyButton = getLocalizedMessage(DEFAULT_LOCALE, t('mobile.push_notification_reply.button'));
-        const replyPlaceholder = getLocalizedMessage(DEFAULT_LOCALE, t('mobile.push_notification_reply.placeholder'));
+        const replyTitle = getLocalizedMessage(DEFAULT_LOCALE, messages.replyTitle.id);
+        const replyButton = getLocalizedMessage(DEFAULT_LOCALE, messages.replyButton.id);
+        const replyPlaceholder = getLocalizedMessage(DEFAULT_LOCALE, messages.replyPlaceholder.id);
         const replyTextInput: NotificationTextInput = {buttonTitle: replyButton, placeholder: replyPlaceholder};
         const replyAction = new NotificationAction(PushNotification.REPLY_ACTION, 'background', replyTitle, true, replyTextInput);
         return new NotificationCategory(PushNotification.CATEGORY, [replyAction]);
@@ -72,12 +104,8 @@ class PushNotifications {
     getServerUrlFromNotification = async (notification: NotificationWithData) => {
         const {payload} = notification;
 
-        if (!payload?.channel_id && (!payload?.server_url || !payload.server_id)) {
-            return payload?.server_url;
-        }
-
-        let serverUrl = payload.server_url;
-        if (!serverUrl && payload.server_id) {
+        let serverUrl = payload?.server_url;
+        if (!serverUrl && payload?.server_id) {
             serverUrl = await DatabaseManager.getServerUrlFromIdentifier(payload.server_id);
         }
 
@@ -100,10 +128,10 @@ class PushNotifications {
                             unread_replies: 0,
                             last_viewed_at: Date.now(),
                         };
-                        updateThread(serverUrl, payload.root_id, data);
+                        await updateThread(serverUrl, payload.root_id, data);
                     }
                 } else {
-                    markChannelAsViewed(serverUrl, payload.channel_id);
+                    await markChannelAsViewed(serverUrl, payload.channel_id);
                 }
             }
         }
@@ -135,7 +163,7 @@ class PushNotifications {
 
             let isInChannelScreen = NavigationStore.getVisibleScreen() === Screens.CHANNEL;
             if (isTabletDevice) {
-                isInChannelScreen = NavigationStore.getVisibleTab() === Screens.HOME;
+                isInChannelScreen = NavigationStore.getVisibleScreen() === Screens.CHANNEL_LIST;
             }
             const isInThreadScreen = NavigationStore.getVisibleScreen() === Screens.THREAD;
 
@@ -154,17 +182,7 @@ class PushNotifications {
             const condition3 = isInThreadScreen && !isSameThreadNotification;
 
             if (condition1 || condition2 || condition3) {
-                // Dismiss the screen if it's already visible or else it blocks the navigation
-                DeviceEventEmitter.emit(Navigation.NAVIGATION_SHOW_OVERLAY);
-
-                const screen = Screens.IN_APP_NOTIFICATION;
-                const passProps = {
-                    notification,
-                    serverName,
-                    serverUrl,
-                };
-
-                showOverlay(screen, passProps);
+                InAppNotificationStore.show(notification, serverUrl, serverName);
             }
         }
     };
@@ -180,7 +198,9 @@ class PushNotifications {
                 // Handle notification tapped
                 openNotification(serverUrl, notification);
             } else {
-                backgroundNotification(serverUrl, notification);
+                // Awaited so the caller can keep the app alive until the DB write
+                // completes (see onNotificationReceivedBackground).
+                await backgroundNotification(serverUrl, notification);
             }
         }
     };
@@ -194,8 +214,32 @@ class PushNotifications {
             if (notification.userInteraction) {
                 DeviceEventEmitter.emit(Events.SESSION_EXPIRED, serverUrl);
             } else {
-                DeviceEventEmitter.emit(Events.SERVER_LOGOUT, {serverUrl});
+                const auditEventId = await this.enqueueSessionWipeAuditEvent(serverUrl, notification.payload?.signature);
+                DeviceEventEmitter.emit(Events.SERVER_LOGOUT, {serverUrl, auditEventId});
             }
+        }
+    };
+
+    enqueueSessionWipeAuditEvent = async (serverUrl: string, signature?: string): Promise<string | undefined> => {
+        if (!EphemeralModeManager.isEphemeralModeEnabled(serverUrl)) {
+            logDebug('enqueueSessionWipeAuditEvent: ephemeral mode not enabled for', serverUrl);
+            return undefined;
+        }
+
+        if (!signature) {
+            logDebug('enqueueSessionWipeAuditEvent: no signature for', serverUrl);
+            return undefined;
+        }
+
+        try {
+            return await enqueueAuditEvent(serverUrl, {
+                kind: EphemeralModeAuditEventKind.SessionWipe,
+                signature,
+                occurredAt: Date.now(),
+            });
+        } catch (error) {
+            logError('enqueueSessionWipeAuditEvent', getFullErrorMessage(error));
+            return undefined;
         }
     };
 
@@ -205,13 +249,13 @@ class PushNotifications {
         if (payload) {
             switch (payload.type) {
                 case PushNotification.NOTIFICATION_TYPE.CLEAR:
-                    this.handleClearNotification(notification);
+                    await this.handleClearNotification(notification);
                     break;
                 case PushNotification.NOTIFICATION_TYPE.MESSAGE:
-                    this.handleMessageNotification(notification);
+                    await this.handleMessageNotification(notification);
                     break;
                 case PushNotification.NOTIFICATION_TYPE.SESSION:
-                    this.handleSessionNotification(notification);
+                    await this.handleSessionNotification(notification);
                     break;
             }
         }
@@ -234,12 +278,28 @@ class PushNotifications {
     onNotificationReceivedBackground = async (incoming: Notification, completion: (response: NotificationBackgroundFetchResult) => void) => {
         if (incoming.payload.verified === 'false') {
             logDebug('not handling background notification because it was not verified, ackId=', incoming.payload.ackId);
+
+            // Always finish the iOS background completion handler, or the OS
+            // keeps the app awake until it times out and then terminates it.
+            completion(NotificationBackgroundFetchResult.NO_DATA);
             return;
         }
         const notification = convertToNotificationData(incoming, false);
-        this.processNotification(notification);
 
-        completion(NotificationBackgroundFetchResult.NEW_DATA);
+        // Wait until the notification is fully processed (including its DB
+        // read/write) before signaling completion. iOS keeps the app alive
+        // until the fetch completion handler is called; calling it early lets
+        // the OS re-suspend the app while a WatermelonDB statement still holds
+        // the shared App Group SQLite lock, which triggers a RUNNINGBOARD
+        // 0xdead10cc termination. completion() must run on every path,
+        // including failures, for the same reason.
+        try {
+            await this.processNotification(notification);
+            completion(NotificationBackgroundFetchResult.NEW_DATA);
+        } catch (error) {
+            logWarning('onNotificationReceivedBackground', error);
+            completion(NotificationBackgroundFetchResult.FAILED);
+        }
     };
 
     // This triggers when the app was in the foreground (Android and iOS)
@@ -255,7 +315,10 @@ class PushNotifications {
 
             this.processNotification(notification);
         }
-        completion({alert: false, sound: true, badge: true});
+
+        // Always play a sound, except when this is a foreground notification about a call
+        const sound = !(notification.foreground && isCallsStartedMessage(notification.payload));
+        completion({alert: false, sound, badge: true});
     };
 
     onRemoteNotificationsRegistered = async (event: Registered) => {
@@ -273,7 +336,10 @@ class PushNotifications {
                 prefix = Device.PUSH_NOTIFY_ANDROID_REACT_NATIVE;
             }
 
-            storeDeviceToken(`${prefix}-v2:${deviceToken}`);
+            const token = `${prefix}-v2:${deviceToken}`;
+            storeDeviceToken(token);
+            const redactedDeviceId = deviceToken.substring(0, 16);
+            logDebug('Notification token registered', `${prefix}-v2:${redactedDeviceId}...`);
 
             // Store the device token in the default database
             this.requestNotificationReplyPermissions();
@@ -281,16 +347,24 @@ class PushNotifications {
         return null;
     };
 
+    onRemoteNotificationsRegistrationDenied = () => {
+        logDebug('Notification registration denied');
+    };
+
+    NotificationsRegistrationFailed = (event: RegistrationError) => {
+        logDebug('Notification registration failed', event);
+    };
+
     removeChannelNotifications = async (serverUrl: string, channelId: string) => {
-        NativeNotifications.removeChannelNotifications(serverUrl, channelId);
+        RNUtils.removeChannelNotifications(serverUrl, channelId);
     };
 
     removeServerNotifications = (serverUrl: string) => {
-        NativeNotifications.removeServerNotifications(serverUrl);
+        RNUtils.removeServerNotifications(serverUrl);
     };
 
     removeThreadNotifications = async (serverUrl: string, threadId: string) => {
-        NativeNotifications.removeThreadNotifications(serverUrl, threadId);
+        RNUtils.removeThreadNotifications(serverUrl, threadId);
     };
 
     requestNotificationReplyPermissions = () => {
@@ -317,4 +391,5 @@ class PushNotifications {
     };
 }
 
-export default new PushNotifications();
+const PushNotifications = new PushNotificationsSingleton();
+export default PushNotifications;

@@ -3,20 +3,29 @@
 
 import {DeviceEventEmitter} from 'react-native';
 
-import {updateChannelsDisplayName} from '@actions/local/channel';
+import {deletePostsForChannelsWithAutotranslation, updateChannelsDisplayName} from '@actions/local/channel';
+import {RedactionInvalidationReason} from '@actions/local/redaction';
 import {setCurrentUserStatus} from '@actions/local/user';
 import {fetchMe, fetchUsersByIds} from '@actions/remote/user';
-import {General, Events, Preferences} from '@constants';
+import {invalidateRedactionForCurrentUser} from '@actions/websocket/access_control';
+import {General, Events, Preferences, WebsocketEvents} from '@constants';
+import {SESSION_ATTRIBUTES_OBJECT_TYPE, SESSION_ATTRIBUTES_PLATFORM_MOBILE} from '@constants/session_attributes';
 import DatabaseManager from '@database/manager';
 import {getTeammateNameDisplaySetting} from '@helpers/api/preference';
+import SessionAttributesManager from '@managers/session_attributes_manager';
 import WebsocketManager from '@managers/websocket_manager';
 import {queryChannelsByTypes, queryUserChannelsByTypes} from '@queries/servers/channel';
 import {queryDisplayNamePreferences} from '@queries/servers/preference';
 import {getConfig, getLicense} from '@queries/servers/system';
 import {getCurrentUser} from '@queries/servers/user';
-import {displayUsername} from '@utils/user';
+import {customProfileAttributeId} from '@utils/custom_profile_attribute';
+import {getFullErrorMessage} from '@utils/errors';
+import {safeParseJSON} from '@utils/helpers';
+import {logError} from '@utils/log';
+import {displayUsername, haveSameRoles} from '@utils/user';
 
 import type {Model} from '@nozbe/watermelondb';
+import type {CustomProfileField} from '@typings/api/custom_profile_attributes';
 
 export async function handleUserUpdatedEvent(serverUrl: string, msg: WebSocketMessage) {
     const operator = DatabaseManager.serverDatabases[serverUrl]?.operator;
@@ -56,6 +65,9 @@ export async function handleUserUpdatedEvent(serverUrl: string, msg: WebSocketMe
                         modelsToBatch.push(...models);
                     }
                 }
+
+                // Delete posts for all channels with user autotranslation enabled when locale changes
+                await deletePostsForChannelsWithAutotranslation(serverUrl);
             }
         }
     } else {
@@ -65,6 +77,20 @@ export async function handleUserUpdatedEvent(serverUrl: string, msg: WebSocketMe
             if (models?.length) {
                 modelsToBatch.push(...models);
             }
+        }
+    }
+
+    if (user.id === currentUser.id) {
+        // BuildAccessControlSubject reads these native fields, so a change to one can flip a
+        // decision; cosmetic edits must not, or every nickname change invalidates the cache.
+        // email_verified and create_at are in the subject too but are not persisted locally.
+        const abacFieldChanged =
+            userToSave.email !== currentUser.email ||
+            Boolean(userToSave.is_bot) !== Boolean(currentUser.isBot) ||
+            !haveSameRoles(currentUser.roles, userToSave.roles);
+
+        if (abacFieldChanged) {
+            invalidateRedactionForCurrentUser(serverUrl, RedactionInvalidationReason.UserFields);
         }
     }
 
@@ -92,7 +118,7 @@ export async function handleUserTypingEvent(serverUrl: string, msg: WebSocketMes
         const {users, existingUsers} = await fetchUsersByIds(serverUrl, [msg.data.user_id]);
         const user = users?.[0] || existingUsers?.[0];
 
-        const namePreference = await queryDisplayNamePreferences(database, Preferences.NAME_NAME_FORMAT).fetch();
+        const namePreference = await queryDisplayNamePreferences(database, Preferences.NAME_NAME_FORMAT)?.fetch();
         const teammateDisplayNameSetting = getTeammateNameDisplaySetting(namePreference, config.LockTeammateNameDisplay, config.TeammateNameDisplay, license);
         const currentUser = await getCurrentUser(database);
         const username = displayUsername(user, currentUser?.locale, teammateDisplayNameSetting);
@@ -119,4 +145,126 @@ export const userTyping = async (serverUrl: string, channelId: string, rootId?: 
 export async function handleStatusChangedEvent(serverUrl: string, msg: WebSocketMessage) {
     const newStatus = msg.data.status;
     setCurrentUserStatus(serverUrl, newStatus);
+}
+
+export async function handleCustomProfileAttributesValuesUpdatedEvent(serverUrl: string, msg: WebSocketMessage) {
+    try {
+        const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        const {user_id, values} = msg.data;
+        const attributesForDatabase = Object.entries(values).map(([fieldId, value]) => ({
+            id: customProfileAttributeId(fieldId, user_id),
+            field_id: fieldId,
+            user_id,
+            value: value as string,
+        }));
+
+        try {
+            await operator.handleCustomProfileAttributes({
+                attributes: attributesForDatabase,
+                prepareRecordsOnly: false,
+            });
+        } catch (error) {
+            logError('Error handling custom profile attributes values updated event', error);
+        }
+
+        // The user's own attributes feed every policy on this server, so the epoch is raised for all
+        // channels; only visible ones refetch now, the rest converge when rendered.
+        const currentUser = await getCurrentUser(database);
+        if (currentUser?.id === user_id) {
+            invalidateRedactionForCurrentUser(serverUrl, RedactionInvalidationReason.UserAttributes, true);
+        }
+    } catch (error) {
+        logError('Error getting the operator for the custom profile attributes values updated event', error);
+    }
+}
+
+export async function handleCustomProfileAttributesFieldUpdatedEvent(serverUrl: string, msg: WebSocketMessage) {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        const {field} = msg.data;
+
+        try {
+            await operator.handleCustomProfileFields({
+                fields: [field],
+                prepareRecordsOnly: false,
+            });
+        } catch (error) {
+            logError('Error handling custom profile attributes field updated event', error);
+        }
+
+        // Renaming an option or changing a field's type rewrites what every policy is evaluated
+        // against without a values event. A new field has no values yet, so it cannot.
+        if (msg.event === WebsocketEvents.CUSTOM_PROFILE_ATTRIBUTES_FIELD_UPDATED) {
+            invalidateRedactionForCurrentUser(serverUrl, RedactionInvalidationReason.UserAttributes, true);
+        }
+    } catch (error) {
+        logError('Error getting the operator for the custom profile field updated event', error);
+    }
+
+}
+
+export async function handleCustomProfileAttributesFieldDeletedEvent(serverUrl: string, msg: WebSocketMessage) {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        const {field_id} = msg.data;
+
+        try {
+            // Delete the field from the database
+            const fieldForDatabase: CustomProfileField = {
+                id: field_id,
+                group_id: '',
+                name: '',
+                type: '',
+                target_id: '',
+                target_type: '',
+                create_at: 0,
+                update_at: 0,
+                delete_at: Date.now(),
+                attrs: {},
+            };
+
+            await operator.handleCustomProfileFields({
+                fields: [fieldForDatabase],
+                prepareRecordsOnly: false,
+            });
+        } catch (error) {
+            logError('Error handling custom profile field deleted event', error);
+        }
+
+        // Deleting a field drops its values for every user at once, so the subject can change with
+        // no per-user value event.
+        invalidateRedactionForCurrentUser(serverUrl, RedactionInvalidationReason.UserAttributes, true);
+    } catch (error) {
+        logError('Error getting the operator for the custom profile field deleted event', error);
+    }
+}
+
+export function handleSessionAttributesPropertyFieldEvent(serverUrl: string, msg: WebSocketMessage) {
+    try {
+        const {object_type, property_field} = msg.data;
+        if (object_type !== SESSION_ATTRIBUTES_OBJECT_TYPE) {
+            return;
+        }
+
+        const field = safeParseJSON(property_field) as SAPropertyField;
+        if (!field?.name || !field.attrs) {
+            return;
+        }
+        if (!Boolean(field.attrs.enabled) || !Boolean(field.attrs.platforms.includes(SESSION_ATTRIBUTES_PLATFORM_MOBILE))) {
+            SessionAttributesManager.removeManifestField(serverUrl, field.name);
+            return;
+        }
+
+        SessionAttributesManager.upsertManifestField(serverUrl, {
+            name: field.name,
+            type: field.type,
+            ttl_seconds: field.attrs.ttl_seconds,
+            grace_period_seconds: field.attrs.grace_period_seconds,
+        });
+    } catch (error) {
+        logError('[handleSessionAttributesPropertyFieldEvent]', getFullErrorMessage(error));
+    }
 }

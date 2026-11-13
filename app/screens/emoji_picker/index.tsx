@@ -4,18 +4,16 @@
 import React, {useCallback} from 'react';
 import {DeviceEventEmitter, StyleSheet} from 'react-native';
 
-import {Events} from '@constants';
+import {Events, Screens} from '@constants';
 import BottomSheet from '@screens/bottom_sheet';
+import CallbackStore from '@store/callback_store';
 
 import Picker from './picker';
 import PickerFooter from './picker/footer';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
-type Props = {
-    componentId: AvailableScreens;
-    onEmojiPress: (emoji: string) => void;
-    closeButtonId: string;
+export type EmojiPickerProps = {
+    imageUrl?: string;
+    file?: ExtractedFileInfo;
 };
 
 const style = StyleSheet.create({
@@ -24,26 +22,31 @@ const style = StyleSheet.create({
     },
 });
 
-const EmojiPickerScreen = ({closeButtonId, componentId, onEmojiPress}: Props) => {
+const EmojiPickerScreen = ({file, imageUrl}: EmojiPickerProps) => {
     const handleEmojiPress = useCallback((emoji: string) => {
-        onEmojiPress(emoji);
+        const callback = CallbackStore.getCallback<((emoji: string) => void)>();
+        if (callback) {
+            callback(emoji);
+        }
         DeviceEventEmitter.emit(Events.CLOSE_BOTTOM_SHEET);
+        CallbackStore.removeCallback();
     }, []);
 
     const renderContent = useCallback(() => {
         return (
             <Picker
                 onEmojiPress={handleEmojiPress}
+                imageUrl={imageUrl}
+                file={file}
                 testID='emoji_picker'
             />
         );
-    }, []);
+    }, [file, handleEmojiPress, imageUrl]);
 
     return (
         <BottomSheet
             renderContent={renderContent}
-            closeButtonId={closeButtonId}
-            componentId={componentId}
+            screen={Screens.EMOJI_PICKER}
             contentStyle={style.contentStyle}
             initialSnapIndex={1}
             footerComponent={PickerFooter}

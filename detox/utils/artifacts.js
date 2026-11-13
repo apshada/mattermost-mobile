@@ -17,15 +17,11 @@ const {ARTIFACTS_DIR} = require('./constants');
 require('dotenv').config();
 
 const {
-    BRANCH,
-    BUILD_ID,
-    COMMIT_HASH,
     DETOX_AWS_S3_BUCKET,
     DETOX_AWS_ACCESS_KEY_ID,
     DETOX_AWS_SECRET_ACCESS_KEY,
-    IOS,
+    REPORT_PATH,
 } = process.env;
-const platform = IOS === 'true' ? 'ios' : 'android';
 
 const s3 = new S3({
     credentials: {
@@ -38,14 +34,13 @@ function getFiles(dirPath) {
     return fs.existsSync(dirPath) ? readdir(dirPath) : [];
 }
 
-async function saveArtifacts() {
+async function saveArtifacts(platform) {
     if (!DETOX_AWS_S3_BUCKET || !DETOX_AWS_ACCESS_KEY_ID || !DETOX_AWS_SECRET_ACCESS_KEY) {
         console.log('No AWS credentials found. Test artifacts not uploaded to S3.');
 
         return;
     }
 
-    const s3Folder = `${BUILD_ID}-${COMMIT_HASH}-${BRANCH}`.replace(/\./g, '-');
     const uploadPath = path.resolve(__dirname, `../${ARTIFACTS_DIR}`);
     const filesToUpload = await getFiles(uploadPath);
 
@@ -54,7 +49,15 @@ async function saveArtifacts() {
             filesToUpload,
             10,
             async.asyncify(async (file) => {
-                const Key = file.replace(uploadPath, s3Folder);
+                // Skip Maestro CLI's own copyright/config files (they're copied in
+                // by the maestro workflow's `fse.copySync('../build', ...)`) — they
+                // are not test artifacts and were noisy "Failed to upload artifact"
+                // lines in the maestro CI log.
+                if (file.includes(`${path.sep}notice-file${path.sep}`)) {
+                    return {success: true};
+                }
+
+                const Key = file.replace(uploadPath, REPORT_PATH);
                 const contentType = mime.lookup(file);
                 const charset = mime.charset(contentType);
 
@@ -80,7 +83,14 @@ async function saveArtifacts() {
                     return reject(new Error(err));
                 }
 
-                const reportLink = `https://${DETOX_AWS_S3_BUCKET}.s3.amazonaws.com/${s3Folder}/jest-stare/${platform}-report.html`;
+                // Detox runs use jest-stare to produce an HTML report; maestro
+                // produces its own HTML via generateMaestroHtmlReport(). Pick the
+                // right URL so the logged "Uploaded:" line points at a file that
+                // actually exists.
+                const isMaestro = platform.startsWith('maestro-');
+                const reportLink = isMaestro ?
+                    `https://${DETOX_AWS_S3_BUCKET}.s3.amazonaws.com/${REPORT_PATH}/${platform}/maestro-report.html` :
+                    `https://${DETOX_AWS_S3_BUCKET}.s3.amazonaws.com/${REPORT_PATH}/jest-stare/${platform}-report.html`;
                 resolve({success: true, reportLink});
             },
         );

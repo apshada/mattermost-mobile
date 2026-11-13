@@ -1,0 +1,232 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {defineMessages, type IntlShape} from 'react-intl';
+
+import {submitInteractiveDialog} from '@actions/remote/integrations';
+import {AppCallResponseTypes} from '@constants/apps';
+import {getFullErrorMessage} from '@utils/errors';
+import {logDebug} from '@utils/log';
+
+import {collectFileIds, convertAppFormValuesToDialogSubmission, convertDialogToAppForm} from './dialog_conversion';
+import {flattenDialogElements} from './dialog_utils';
+
+const submissionMessages = defineMessages({
+    submissionFailed: {
+        id: 'interactive_dialog.submission_failed',
+        defaultMessage: 'Submission failed. Please try again.',
+    },
+    submissionFailedNetwork: {
+        id: 'interactive_dialog.submission_failed_network',
+        defaultMessage: 'Submission failed due to network error. Please check your connection and try again.',
+    },
+    submissionFailedValidation: {
+        id: 'interactive_dialog.submission_failed_validation',
+        defaultMessage: 'Submission failed due to form validation. Please check your inputs and try again.',
+    },
+});
+
+/**
+ * Mobile Interactive Dialog Adapter
+ * Converts between legacy Interactive Dialogs and modern AppsForm system
+ * Following the same pattern as webapp PR #31821
+ */
+export class InteractiveDialogAdapter {
+    // WeakMap cache for expensive form conversions
+    // Keys are garbage collected when config objects are no longer referenced
+    private static readonly appFormCache = new WeakMap<InteractiveDialogConfig, AppForm>();
+
+    /**
+     * Convert InteractiveDialog config to AppForm structure
+     * Pure data transformation - no component creation
+     * Cached using WeakMap for performance
+     */
+    static convertToAppForm(config: InteractiveDialogConfig): AppForm {
+        // Check cache first
+        const cached = InteractiveDialogAdapter.appFormCache.get(config);
+        if (cached) {
+            return cached;
+        }
+
+        // Convert and cache result
+        const converted = convertDialogToAppForm(config);
+        InteractiveDialogAdapter.appFormCache.set(config, converted);
+        return converted;
+    }
+
+    /**
+     * Convert AppForm values back to DialogSubmission format
+     * Used when submitting converted dialogs through legacy endpoints
+     */
+    static convertValuesToSubmission(
+        values: AppFormValues,
+        config: InteractiveDialogConfig,
+    ): DialogSubmission {
+        // Flatten so nested fields are reachable by name; otherwise they're
+        // silently dropped from the submission.
+        const elements = flattenDialogElements(config.dialog.elements || []);
+
+        const {submission, errors} = convertAppFormValuesToDialogSubmission(
+            values,
+            elements,
+        );
+
+        if (errors.length > 0) {
+            logDebug('Dialog conversion validation errors', {
+                errorCount: errors.length,
+                errors,
+            });
+        }
+
+        // Collect file IDs from file-type elements for server-side validation
+        const fileIds = collectFileIds(submission as {[x: string]: string}, elements);
+
+        return {
+            url: config.url || '',
+            callback_id: config.dialog.callback_id || '',
+            state: config.dialog.state || '',
+            submission: submission as {[x: string]: string},
+            user_id: '', // Will be populated by mobile action
+            channel_id: '', // Will be populated by mobile action
+            team_id: '', // Will be populated by mobile action
+            cancelled: false,
+            ...(fileIds.length > 0 && {file_ids: fileIds}),
+        };
+    }
+
+    /**
+     * Create a submission handler for AppsFormContainer
+     * Converts AppForm submission to legacy dialog submission
+     */
+    static createSubmitHandler(
+        config: InteractiveDialogConfig,
+        serverUrl: string,
+        intl: IntlShape,
+    ) {
+        return async (values: AppFormValues): Promise<DoAppCallResult<FormResponseData>> => {
+            try {
+                // Convert values to legacy dialog submission format
+                const legacySubmission = InteractiveDialogAdapter.convertValuesToSubmission(values, config);
+
+                // Submit through existing mobile action
+                const result = await submitInteractiveDialog(serverUrl, legacySubmission);
+
+                // Convert response back to AppCallResponse format
+                return InteractiveDialogAdapter.convertResponseToAppCall(result, intl);
+            } catch (error) {
+                const errorMessage = getFullErrorMessage(error);
+                logDebug('Dialog submission failed', errorMessage);
+
+                // Provide more context in error messages
+                let userFriendlyMessage: string;
+                if (error instanceof Error) {
+                    if (error.message.includes('network') || error.message.includes('fetch')) {
+                        userFriendlyMessage = intl.formatMessage(submissionMessages.submissionFailedNetwork);
+                    } else if (error.message.includes('conversion') || error.message.includes('validation')) {
+                        userFriendlyMessage = intl.formatMessage(submissionMessages.submissionFailedValidation);
+                    } else {
+                        userFriendlyMessage = intl.formatMessage(submissionMessages.submissionFailed);
+                    }
+                } else {
+                    userFriendlyMessage = intl.formatMessage(submissionMessages.submissionFailed);
+                }
+
+                return {
+                    error: {
+                        type: AppCallResponseTypes.ERROR,
+                        text: userFriendlyMessage,
+                        data: {
+                            errors: {},
+                        },
+                    },
+                };
+            }
+        };
+    }
+
+    /**
+     * Create a cancellation handler for AppsFormContainer
+     * Handles dialog cancellation notification if required
+     */
+    static createCancelHandler(
+        config: InteractiveDialogConfig,
+        serverUrl: string,
+    ) {
+        return async (): Promise<void> => {
+            if (config.dialog.notify_on_cancel) {
+                try {
+                    const legacySubmission = InteractiveDialogAdapter.convertValuesToSubmission({}, config);
+                    await submitInteractiveDialog(serverUrl, {
+                        ...legacySubmission,
+                        cancelled: true,
+                    });
+                } catch (error) {
+                    logDebug('Dialog cancellation failed', getFullErrorMessage(error));
+                }
+            }
+        };
+    }
+
+    /**
+     * Convert dialog submission response to AppCallResponse format
+     * Handles the response format conversion including multiform dialogs
+     */
+    static convertResponseToAppCall(
+        result: any,
+        intl: IntlShape,
+    ): DoAppCallResult<FormResponseData> {
+        // Handle server-side validation errors from the response data
+        if (result?.data?.error || result?.data?.errors) {
+            return {
+                error: {
+                    type: AppCallResponseTypes.ERROR,
+                    text: result.data.error || intl.formatMessage({
+                        id: 'interactive_dialog.submission_failed_validation',
+                        defaultMessage: 'Submission failed with validation errors',
+                    }),
+                    data: {
+                        errors: result.data.errors || {},
+                    },
+                },
+            };
+        }
+
+        // Handle network/action-level errors
+        if (result?.error) {
+            return {
+                error: {
+                    type: AppCallResponseTypes.ERROR,
+                    text: intl.formatMessage({
+                        id: 'interactive_dialog.submission_failed',
+                        defaultMessage: 'Submission failed',
+                    }),
+                    data: {
+                        errors: {},
+                    },
+                },
+            };
+        }
+
+        // Check for multiform response - server returns new dialog form
+        // Server returns {"form": {...}, "type": "form"} format for multiform dialogs
+        if (result?.data && typeof result.data === 'object' && 'form' in result.data) {
+            // Return the raw form data directly - don't convert it yet
+            // The DialogRouter will handle the conversion after updating its state
+            return {
+                data: {
+                    type: AppCallResponseTypes.FORM,
+                    form: result.data.form, // Return raw dialog data
+                },
+            };
+        }
+
+        // Success response or no form data - closes dialog
+        return {
+            data: {
+                type: AppCallResponseTypes.OK,
+                text: '',
+            },
+        };
+    }
+
+}

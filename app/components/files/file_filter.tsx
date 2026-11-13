@@ -1,15 +1,13 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {BottomSheetFlatList} from '@gorhom/bottom-sheet';
 import React, {useCallback} from 'react';
-import {useIntl} from 'react-intl';
+import {defineMessages, useIntl} from 'react-intl';
 import {type ListRenderItemInfo, View} from 'react-native';
-import {FlatList} from 'react-native-gesture-handler';
 
 import OptionItem, {ITEM_HEIGHT} from '@components/option_item';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
-import {t} from '@i18n';
 import BottomSheetContent from '@screens/bottom_sheet/content';
 import {dismissBottomSheet} from '@screens/navigation';
 import {type FileFilter, FileFilters} from '@utils/file';
@@ -24,6 +22,41 @@ const getStyleSheet = makeStyleSheetFromTheme((theme) => {
     };
 });
 
+const filterMessages = defineMessages({
+    allFileTypes: {
+        id: 'screen.search.results.filter.all_file_types',
+        defaultMessage: 'All file types',
+    },
+    documents: {
+        id: 'screen.search.results.filter.documents',
+        defaultMessage: 'Documents',
+    },
+    spreadsheets: {
+        id: 'screen.search.results.filter.spreadsheets',
+        defaultMessage: 'Spreadsheets',
+    },
+    presentations: {
+        id: 'screen.search.results.filter.presentations',
+        defaultMessage: 'Presentations',
+    },
+    code: {
+        id: 'screen.search.results.filter.code',
+        defaultMessage: 'Code',
+    },
+    images: {
+        id: 'screen.search.results.filter.images',
+        defaultMessage: 'Images',
+    },
+    audio: {
+        id: 'screen.search.results.filter.audio',
+        defaultMessage: 'Audio',
+    },
+    videos: {
+        id: 'screen.search.results.filter.videos',
+        defaultMessage: 'Videos',
+    },
+});
+
 type FilterItem = {
     id: string;
     defaultMessage: string;
@@ -32,43 +65,35 @@ type FilterItem = {
 }
 export const FilterData = {
     [FileFilters.ALL]: {
-        id: t('screen.search.results.filter.all_file_types'),
-        defaultMessage: 'All file types',
+        ...filterMessages.allFileTypes,
         filterType: FileFilters.ALL,
     },
     [FileFilters.DOCUMENTS]: {
-        id: t('screen.search.results.filter.documents'),
-        defaultMessage: 'Documents',
+        ...filterMessages.documents,
         filterType: FileFilters.DOCUMENTS,
     },
     [FileFilters.SPREADSHEETS]: {
-        id: t('screen.search.results.filter.spreadsheets'),
-        defaultMessage: 'Spreadsheets',
+        ...filterMessages.spreadsheets,
         filterType: FileFilters.SPREADSHEETS,
     },
     [FileFilters.PRESENTATIONS]: {
-        id: t('screen.search.results.filter.presentations'),
-        defaultMessage: 'Presentations',
+        ...filterMessages.presentations,
         filterType: FileFilters.PRESENTATIONS,
     },
     [FileFilters.CODE]: {
-        id: t('screen.search.results.filter.code'),
-        defaultMessage: 'Code',
+        ...filterMessages.code,
         filterType: FileFilters.CODE,
     },
     [FileFilters.IMAGES]: {
-        id: t('screen.search.results.filter.images'),
-        defaultMessage: 'Images',
+        ...filterMessages.images,
         filterType: FileFilters.IMAGES,
     },
     [FileFilters.AUDIO]: {
-        id: t('screen.search.results.filter.audio'),
-        defaultMessage: 'Audio',
+        ...filterMessages.audio,
         filterType: FileFilters.AUDIO,
     },
     [FileFilters.VIDEOS]: {
-        id: t('screen.search.results.filter.videos'),
-        defaultMessage: 'Videos',
+        ...filterMessages.videos,
         filterType: FileFilters.VIDEOS,
         separator: false,
     },
@@ -90,42 +115,39 @@ const File_filter = ({initialFilter, setFilter, title}: FilterProps) => {
     const intl = useIntl();
     const theme = useTheme();
     const style = getStyleSheet(theme);
-    const isTablet = useIsTablet();
 
     const handleOnPress = useCallback((fileType: FileFilter) => {
         if (fileType !== initialFilter) {
             setFilter(fileType);
         }
         dismissBottomSheet();
-    }, [initialFilter]);
+    }, [initialFilter, setFilter]);
 
     const separator = useCallback(() => <View style={style.divider}/>, [style]);
 
     const renderFilterItem = useCallback(({item}: ListRenderItemInfo<FilterItem>) => {
         return (
             <OptionItem
-                label={intl.formatMessage({id: item.id, defaultMessage: item.defaultMessage})}
+                label={intl.formatMessage(item)}
                 type={'select'}
                 action={() => handleOnPress(item.filterType)}
                 selected={initialFilter === item.filterType}
             />
         );
-    }, [handleOnPress, initialFilter, theme]);
+    }, [handleOnPress, initialFilter, intl]);
 
     return (
         <BottomSheetContent
             showButton={false}
-            showTitle={!isTablet}
+            showTitle={true}
             testID='search.filters'
             title={title}
         >
-            <View>
-                <FlatList
-                    data={data}
-                    renderItem={renderFilterItem}
-                    ItemSeparatorComponent={separator}
-                />
-            </View>
+            <BottomSheetFlatList
+                data={data}
+                renderItem={renderFilterItem}
+                ItemSeparatorComponent={separator}
+            />
         </BottomSheetContent>
     );
 };

@@ -1,11 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {useHardwareKeyboardEvents} from '@mattermost/hardware-keyboard';
 import {useIsFocused, useNavigation} from '@react-navigation/native';
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {useIntl} from 'react-intl';
-import {FlatList, type LayoutChangeEvent, Platform, StyleSheet, type ViewStyle, KeyboardAvoidingView, Keyboard} from 'react-native';
-import HWKeyboardEvent from 'react-native-hw-keyboard-event';
+import {defineMessage, useIntl} from 'react-intl';
+import {FlatList, type LayoutChangeEvent, Platform, type ViewStyle, KeyboardAvoidingView, Keyboard, StyleSheet} from 'react-native';
 import Animated, {useAnimatedStyle, useDerivedValue, withTiming, type AnimatedStyle} from 'react-native-reanimated';
 import {type Edge, SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
 
@@ -13,20 +13,23 @@ import {getPosts} from '@actions/local/post';
 import {addSearchToTeamSearchHistory} from '@actions/local/team';
 import {searchPosts, searchFiles} from '@actions/remote/search';
 import Autocomplete from '@components/autocomplete';
-import FreezeScreen from '@components/freeze_screen';
 import Loading from '@components/loading';
 import NavigationHeader from '@components/navigation_header';
 import RoundedHeaderContext from '@components/rounded_header_context';
 import {Screens} from '@constants';
+import {SCREENS_AS_BOTTOM_SHEET} from '@constants/screens';
+import {ALL_TEAMS_ID} from '@constants/team';
 import {BOTTOM_TAB_HEIGHT} from '@constants/view';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
+import useAndroidHomeTabBackHandler from '@hooks/android_home_tab_back_handler';
 import {useKeyboardHeight} from '@hooks/device';
 import useDidUpdate from '@hooks/did_update';
 import {useCollapsibleHeader} from '@hooks/header';
-import NavigationStore from '@store/navigation_store';
+import useTabs from '@hooks/use_tabs';
+import {useCurrentScreen} from '@store/navigation_store';
 import {type FileFilter, FileFilters, filterFileExtensions} from '@utils/file';
-import {TabTypes, type TabType} from '@utils/search';
+import {TabTypes} from '@utils/search';
 
 import Initial from './initial';
 import Results from './results';
@@ -36,8 +39,7 @@ import type {SearchRef} from '@components/search';
 import type PostModel from '@typings/database/models/servers/post';
 import type TeamModel from '@typings/database/models/servers/team';
 
-const EDGES: Edge[] = ['bottom', 'left', 'right'];
-const AnimatedFlatList = Animated.createAnimatedComponent(FlatList);
+const EDGES: Edge[] = ['left', 'right'];
 
 const emptyFileResults: FileInfo[] = [];
 const emptyPosts: PostModel[] = [];
@@ -50,6 +52,7 @@ const AutocompletePaddingTop = 4;
 type Props = {
     teamId: string;
     teams: TeamModel[];
+    crossTeamSearchEnabled: boolean;
 }
 
 const styles = StyleSheet.create({
@@ -77,13 +80,37 @@ const getSearchParams = (terms: string, filterValue?: FileFilter) => {
 
 const searchScreenIndex = 1;
 
-const SearchScreen = ({teamId, teams}: Props) => {
+const CHANNEL_AND_USER_FILTERS_REGEX = /(?:from|channel|in):\s?[^\s\n]+/gi;
+
+const tabs = [{
+    name: defineMessage({
+        id: 'screen.search.header.messages',
+        defaultMessage: 'Messages',
+    }),
+    id: TabTypes.MESSAGES,
+},
+{
+    name: defineMessage({
+        id: 'screen.search.header.files',
+        defaultMessage: 'Files',
+    }),
+    id: TabTypes.FILES,
+}];
+
+const SearchScreen = ({teamId, teams, crossTeamSearchEnabled}: Props) => {
     const nav = useNavigation();
     const isFocused = useIsFocused();
     const intl = useIntl();
     const theme = useTheme();
     const insets = useSafeAreaInsets();
     const keyboardHeight = useKeyboardHeight();
+    const currentScreen = useCurrentScreen();
+    const isBottomSheetOpen = currentScreen && SCREENS_AS_BOTTOM_SHEET.has(currentScreen);
+
+    const isPemalinkScreen = currentScreen === Screens.PERMALINK;
+    const isGalleryScreen = currentScreen === Screens.GALLERY;
+
+    useAndroidHomeTabBackHandler(Screens.SEARCH);
 
     const stateIndex = nav.getState()?.index;
     const serverUrl = useServerUrl();
@@ -91,12 +118,13 @@ const SearchScreen = ({teamId, teams}: Props) => {
 
     const clearRef = useRef<boolean>(false);
     const cancelRef = useRef<boolean>(false);
+    const searchRequestRef = useRef<number>(0);
     const searchRef = useRef<SearchRef>(null);
+    const processedSearchTermRef = useRef<string>('');
 
     const [cursorPosition, setCursorPosition] = useState(searchTerm?.length || 0);
     const [searchValue, setSearchValue] = useState<string>(searchTerm || '');
     const [searchTeamId, setSearchTeamId] = useState<string>(teamId);
-    const [selectedTab, setSelectedTab] = useState<TabType>(TabTypes.MESSAGES);
     const [filter, setFilter] = useState<FileFilter>(FileFilters.ALL);
     const [showResults, setShowResults] = useState(false);
     const [containerHeight, setContainerHeight] = useState(0);
@@ -110,25 +138,28 @@ const SearchScreen = ({teamId, teams}: Props) => {
     const [fileInfos, setFileInfos] = useState<FileInfo[]>(emptyFileResults);
     const [fileChannelIds, setFileChannelIds] = useState<string[]>([]);
 
+    const [selectedTab, tabsProps] = useTabs(TabTypes.MESSAGES, tabs, undefined, 'search.tabs');
+
     useEffect(() => {
         setSearchTeamId(teamId);
     }, [teamId]);
 
-    useEffect(() => {
-        if (searchTerm) {
-            resetToInitial();
-            setSearchValue(searchTerm);
-            handleSearch(searchTeamId, searchTerm);
-        }
-    }, [searchTerm]);
-
-    const onSnap = (offset: number, animated = true) => {
+    const onSnap = useCallback((offset: number, animated = true) => {
         scrollRef.current?.scrollToOffset({offset, animated});
-    };
+
+    // scrollRef is a ref object, so its reference should not change between renders
+    // Also, adding it to the dependency creates a use before define error, circular
+    // with the useCollapsibleHeader hook call later.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const onSnapWithTimeout = useCallback((offset: number, animated = true) => {
+        // wait until the keyboard is completely dismissed before scrolling to where the header should be
+        setTimeout(() => onSnap(offset, animated), 100);
+    }, [onSnap]);
 
     const {
         headerHeight,
-        headerOffset,
         hideHeader,
         lockValue,
         onScroll,
@@ -141,7 +172,16 @@ const SearchScreen = ({teamId, teams}: Props) => {
     } = useCollapsibleHeader<FlatList>(true, onSnap);
 
     const resetToInitial = useCallback(() => {
+        // Invalidate any search still in flight so its completion cannot re-open the
+        // results view over the cleared input.
+        searchRequestRef.current += 1;
         setShowResults(false);
+        setSearchValue('');
+        setLastSearchedValue('');
+        setFilter(FileFilters.ALL);
+    }, []);
+
+    const clearInputs = useCallback(() => {
         setSearchValue('');
         setLastSearchedValue('');
         setFilter(FileFilters.ALL);
@@ -156,7 +196,6 @@ const SearchScreen = ({teamId, teams}: Props) => {
     const handleCancelSearch = useCallback(() => {
         cancelRef.current = true;
         resetToInitial();
-        onSnap(0);
     }, [resetToInitial]);
 
     const handleTextChange = useCallback((newValue: string) => {
@@ -185,11 +224,26 @@ const SearchScreen = ({teamId, teams}: Props) => {
         hideHeader(true);
         handleLoading(true);
         setLastSearchedValue(term);
-        addSearchToTeamSearchHistory(serverUrl, newSearchTeamId, term);
+        searchRequestRef.current += 1;
+        const requestId = searchRequestRef.current;
+
+        const persistHistory = newSearchTeamId === ALL_TEAMS_ID
+            ? undefined
+            : addSearchToTeamSearchHistory(serverUrl, newSearchTeamId, term);
         const [postResults, {files, channels}] = await Promise.all([
             searchPosts(serverUrl, newSearchTeamId, searchParams),
             searchFiles(serverUrl, newSearchTeamId, searchParams),
+            persistHistory,
         ]);
+
+        if (requestId !== searchRequestRef.current) {
+            // The input was cleared or cancelled, or a newer search started, while this one
+            // was in flight. Applying these results would put the results view back over an
+            // empty input and hide the recent searches list.
+            setLoading(false);
+            setResultsLoading(false);
+            return;
+        }
 
         setFileInfos(files?.length ? files : emptyFileResults);
         if (postResults.order) {
@@ -200,11 +254,14 @@ const SearchScreen = ({teamId, teams}: Props) => {
         setFileChannelIds(channels?.length ? channels : emptyChannelIds);
         handleLoading(false);
         setShowResults(true);
-    }, [filter, handleClearSearch, handleLoading]);
+    }, [filter, handleClearSearch, handleLoading, hideHeader, serverUrl]);
 
     const onBlur = useCallback(() => {
         setSearchIsFocused(false);
-    }, []);
+        if (!cancelRef.current && !clearRef.current) {
+            onSnapWithTimeout(0);
+        }
+    }, [onSnapWithTimeout]);
 
     const onFocus = useCallback(() => {
         setSearchIsFocused(true);
@@ -227,11 +284,22 @@ const SearchScreen = ({teamId, teams}: Props) => {
         setFileInfos(files?.length ? files : emptyFileResults);
         setFileChannelIds(channels?.length ? channels : emptyChannelIds);
         setResultsLoading(false);
-    }, [lastSearchedValue, searchTeamId]);
+    }, [lastSearchedValue, searchTeamId, serverUrl]);
+
+    const removeChannelAndUserFiltersFromString = (str: string) => {
+        return str.replace(CHANNEL_AND_USER_FILTERS_REGEX, '').trim();
+    };
+
+    const updateSearchTeamId = useCallback((newTeamId: string) => {
+        setSearchTeamId(newTeamId);
+        setSearchValue(removeChannelAndUserFiltersFromString(searchValue));
+    }, [searchValue]);
 
     const handleResultsTeamChange = useCallback((newTeamId: string) => {
         setSearchTeamId(newTeamId);
-        handleSearch(newTeamId, lastSearchedValue);
+        const cleanedSearchValue = removeChannelAndUserFiltersFromString(lastSearchedValue);
+        setSearchValue(cleanedSearchValue);
+        handleSearch(newTeamId, cleanedSearchValue);
     }, [lastSearchedValue, handleSearch]);
 
     const initialContainerStyle: AnimatedStyle<ViewStyle> = useMemo(() => {
@@ -239,6 +307,7 @@ const SearchScreen = ({teamId, teams}: Props) => {
             paddingTop: scrollPaddingTop,
             flexGrow: 1,
             justifyContent: (resultsLoading || loading) ? 'center' : 'flex-start',
+            paddingHorizontal: 18,
         };
     }, [loading, resultsLoading, scrollPaddingTop]);
 
@@ -256,15 +325,29 @@ const SearchScreen = ({teamId, teams}: Props) => {
                 setRecentValue={handleRecentSearch}
                 searchRef={searchRef}
                 setSearchValue={handleModifierTextChange}
-                setTeamId={setSearchTeamId}
+                setTeamId={updateSearchTeamId}
                 teamId={searchTeamId}
                 teams={teams}
             />
         );
-    }, [handleRecentSearch, handleTextChange, loading,
-        scrollPaddingTop, searchTeamId, searchValue, theme]);
+    }, [
+        handleModifierTextChange,
+        handleRecentSearch,
+        loading,
+        scrollEnabled,
+        scrollPaddingTop,
+        searchTeamId,
+        searchValue,
+        teams,
+        theme.buttonBg,
+        updateSearchTeamId,
+    ]);
 
     const animated = useAnimatedStyle(() => {
+        if (isBottomSheetOpen || isPemalinkScreen || isGalleryScreen) {
+            return {};
+        }
+
         if (isFocused) {
             return {
                 opacity: withTiming(1, {duration: 150}),
@@ -278,10 +361,10 @@ const SearchScreen = ({teamId, teams}: Props) => {
             flex: 1,
             transform: [{translateX: withTiming((stateIndex || 0) < searchScreenIndex ? 25 : -25, {duration: 150})}],
         };
-    }, [isFocused, stateIndex]);
+    }, [isFocused, isBottomSheetOpen, isPemalinkScreen, isGalleryScreen, stateIndex]);
 
     const headerTopStyle = useAnimatedStyle(() => ({
-        top: lockValue.value ? lockValue.value : headerHeight.value,
+        top: lockValue || headerHeight.value,
         zIndex: lastSearchedValue ? 10 : 0,
     }), [headerHeight, lastSearchedValue, lockValue]);
 
@@ -304,15 +387,31 @@ const SearchScreen = ({teamId, teams}: Props) => {
     const onFlatLayout = useCallback(() => {
         if (clearRef.current || cancelRef.current) {
             unlock();
+            onSnapWithTimeout(0);
         }
+
         if (clearRef.current) {
-            onSnap(headerOffset, false);
             clearRef.current = false;
         } else if (cancelRef.current) {
-            onSnap(0);
             cancelRef.current = false;
         }
-    }, [headerOffset, scrollRef]);
+    }, [unlock, onSnapWithTimeout]);
+
+    useEffect(() => {
+        if (!searchTerm || searchTerm === processedSearchTermRef.current) {
+            return undefined;
+        }
+
+        processedSearchTermRef.current = searchTerm;
+        clearInputs();
+        setSearchValue(searchTerm);
+
+        const raf = requestAnimationFrame(() => {
+            handleSearch(searchTeamId, searchTerm);
+        });
+
+        return () => cancelAnimationFrame(raf);
+    }, [handleSearch, clearInputs, searchTeamId, searchTerm]);
 
     useDidUpdate(() => {
         if (isFocused) {
@@ -321,49 +420,65 @@ const SearchScreen = ({teamId, teams}: Props) => {
             }, 300);
         } else {
             setAutoScroll(false);
+            processedSearchTermRef.current = '';
         }
     }, [isFocused]);
 
-    useEffect(() => {
-        const listener = HWKeyboardEvent.onHWKeyPressed((keyEvent: {pressedKey: string}) => {
-            const topScreen = NavigationStore.getVisibleScreen();
-            if (topScreen === Screens.HOME && isFocused && keyEvent.pressedKey === 'enter') {
-                searchRef.current?.blur();
-                onSubmit();
-            }
-        });
-        return () => {
-            listener.remove();
-        };
-    }, [onSubmit]);
+    useDidUpdate(() => {
+        if (searchTerm && searchTerm !== lastSearchedValue) {
+            // searchTerm changed (case for hashtag tap) — useEffect handles it; skip to avoid double search
+            return;
+        }
+
+        if (isFocused && lastSearchedValue && showResults) {
+            // requestAnimationFrame for smooth UI updates
+            requestAnimationFrame(() => {
+                handleSearch(searchTeamId, lastSearchedValue);
+            });
+        }
+
+        // Only watch isFocused to re-run search when screen comes back into focus
+        // Removed lastSearchedValue, showResults, handleSearch, searchTeamId from dependencies
+        // to prevent duplicate search calls (these values are updated by handleSearch itself)
+    }, [isFocused]);
+
+    const handleEnterPressed = useCallback(() => {
+        if (isFocused && searchValue.trim().length > 0) {
+            searchRef.current?.blur();
+            onSubmit();
+        }
+    }, [isFocused, onSubmit, searchValue]);
+
+    const events = useMemo(() => ({onEnterPressed: handleEnterPressed}), [handleEnterPressed]);
+    useHardwareKeyboardEvents(events);
 
     return (
-        <FreezeScreen freeze={!isFocused}>
-            <NavigationHeader
-                isLargeTitle={true}
-                showBackButton={false}
-                title={intl.formatMessage({id: 'screen.search.title', defaultMessage: 'Search'})}
-                hasSearch={true}
-                scrollValue={scrollValue}
-                lockValue={lockValue}
-                hideHeader={hideHeader}
-                onChangeText={handleTextChange}
-                onSubmitEditing={onSubmit}
-                blurOnSubmit={true}
-                placeholder={intl.formatMessage({id: 'screen.search.placeholder', defaultMessage: 'Search messages & files'})}
-                onBlur={onBlur}
-                onClear={handleClearSearch}
-                onCancel={handleCancelSearch}
-                onFocus={onFocus}
-                defaultValue={searchValue}
-                ref={searchRef}
-            />
+        <>
             <SafeAreaView
                 style={styles.flex}
                 edges={EDGES}
                 onLayout={onLayout}
                 testID='search_messages.screen'
             >
+                <NavigationHeader
+                    isLargeTitle={true}
+                    showBackButton={false}
+                    title={intl.formatMessage({id: 'screen.search.title', defaultMessage: 'Search'})}
+                    hasSearch={true}
+                    scrollValue={scrollValue}
+                    lockValue={lockValue}
+                    hideHeader={hideHeader}
+                    onChangeText={handleTextChange}
+                    onSubmitEditing={onSubmit}
+                    blurOnSubmit={true}
+                    placeholder={intl.formatMessage({id: 'screen.search.placeholder', defaultMessage: 'Search messages & files'})}
+                    onBlur={onBlur}
+                    onClear={handleClearSearch}
+                    onCancel={handleCancelSearch}
+                    onFocus={onFocus}
+                    defaultValue={searchValue}
+                    ref={searchRef}
+                />
                 <KeyboardAvoidingView
                     style={styles.flex}
                     behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -375,16 +490,17 @@ const SearchScreen = ({teamId, teams}: Props) => {
                             <Header
                                 teamId={searchTeamId}
                                 setTeamId={handleResultsTeamChange}
-                                onTabSelect={setSelectedTab}
                                 onFilterChanged={handleFilterChange}
                                 selectedTab={selectedTab}
                                 selectedFilter={filter}
                                 teams={teams}
+                                crossTeamSearchEnabled={crossTeamSearchEnabled}
+                                tabsProps={tabsProps}
                             />
                             }
                         </Animated.View>
                         {!showResults &&
-                        <AnimatedFlatList
+                        <Animated.FlatList
                             onLayout={onFlatLayout}
                             data={dummyData}
                             contentContainerStyle={initialContainerStyle}
@@ -409,7 +525,7 @@ const SearchScreen = ({teamId, teams}: Props) => {
                             posts={posts}
                             matches={matches}
                             fileInfos={fileInfos}
-                            scrollPaddingTop={lockValue.value}
+                            scrollPaddingTop={lockValue}
                             fileChannelIds={fileChannelIds}
                         />
                         }
@@ -422,7 +538,7 @@ const SearchScreen = ({teamId, teams}: Props) => {
                 cursorPosition={cursorPosition}
                 value={searchValue}
                 isSearch={true}
-                hasFilesAttached={false}
+                shouldDirectlyReact={false}
                 availableSpace={autocompleteMaxHeight}
                 position={autocompletePosition}
                 growDown={true}
@@ -430,7 +546,7 @@ const SearchScreen = ({teamId, teams}: Props) => {
                 teamId={searchTeamId}
             />
             }
-        </FreezeScreen>
+        </>
     );
 };
 

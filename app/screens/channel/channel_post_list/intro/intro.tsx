@@ -7,8 +7,8 @@ import {ActivityIndicator, DeviceEventEmitter, Platform, StyleSheet, View} from 
 import {Events, General} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import useDidUpdate from '@hooks/did_update';
 import EphemeralStore from '@store/ephemeral_store';
+import {isDefaultChannel} from '@utils/channel';
 
 import DirectChannel from './direct_channel';
 import PublicOrPrivateChannel from './public_or_private_channel';
@@ -19,6 +19,7 @@ import type RoleModel from '@typings/database/models/servers/role';
 
 type Props = {
     channel?: ChannelModel;
+    managementDenied: boolean;
     roles: RoleModel[];
 }
 
@@ -32,21 +33,23 @@ const styles = StyleSheet.create({
     },
 });
 
-const Intro = ({channel, roles}: Props) => {
+const Intro = ({channel, managementDenied, roles}: Props) => {
     const theme = useTheme();
     const serverUrl = useServerUrl();
     const [fetching, setFetching] = useState(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channel?.id || ''));
+    const [showActivityIndicator, setShowActivityIndicator] = useState(false);
 
     const element = useMemo(() => {
         if (!channel) {
             return null;
         }
 
-        if (channel.type === General.OPEN_CHANNEL && channel.name === General.DEFAULT_CHANNEL) {
+        if (channel.type === General.OPEN_CHANNEL && isDefaultChannel(channel)) {
             return (
                 <TownSquare
                     channelId={channel.id}
                     displayName={channel.displayName}
+                    managementDenied={managementDenied}
                     roles={roles}
                     theme={theme}
                 />
@@ -59,6 +62,7 @@ const Intro = ({channel, roles}: Props) => {
                 return (
                     <PublicOrPrivateChannel
                         channel={channel}
+                        managementDenied={managementDenied}
                         roles={roles}
                         theme={theme}
                     />
@@ -71,7 +75,7 @@ const Intro = ({channel, roles}: Props) => {
                     />
                 );
         }
-    }, [channel, roles, theme]);
+    }, [channel, managementDenied, roles, theme]);
 
     useEffect(() => {
         const listener = DeviceEventEmitter.addListener(Events.LOADING_CHANNEL_POSTS, ({serverUrl: eventServerUrl, channelId: eventChannelId, value}) => {
@@ -80,14 +84,30 @@ const Intro = ({channel, roles}: Props) => {
             }
         });
 
+        // A load that ended between the render and this subscription was not heard, so re-read it.
+        setFetching(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channel?.id || ''));
+
         return () => listener.remove();
     }, [serverUrl, channel?.id]);
 
-    useDidUpdate(() => {
-        setFetching(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channel?.id || ''));
-    }, [serverUrl, channel?.id]);
+    useEffect(() => {
+        let timeout: NodeJS.Timeout;
+        if (fetching) {
+            timeout = setTimeout(() => {
+                setShowActivityIndicator(true);
+            }, 500);
+        } else {
+            setShowActivityIndicator(false);
+        }
 
-    if (fetching) {
+        return () => {
+            if (timeout) {
+                clearTimeout(timeout);
+            }
+        };
+    }, [fetching]);
+
+    if (showActivityIndicator) {
         return (
             <ActivityIndicator
                 size='small'

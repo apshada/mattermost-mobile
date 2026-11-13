@@ -2,8 +2,8 @@
 // See LICENSE.txt for license information.
 
 import {ChannelListScreen} from '@support/ui/screen';
-import {timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {timeouts, wait, waitForElementToExist} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class BrowseChannelsScreen {
     testID = {
@@ -19,8 +19,12 @@ class BrowseChannelsScreen {
         channelDropdownTextArchived: 'browse_channels.channel_dropdown.text.archived',
         channelDropdownTextShared: 'browse_channels.channel_dropdown.text.shared',
         flatChannelList: 'browse_channels.channel_list.flat_list',
+        scheduledPostTooltipCloseButton: 'scheduled_post.tooltip.close.button',
+        scheduledPostTooltipCloseButtonAdminAccount: 'scheduled_post_tutorial_tooltip.close',
     };
 
+    scheduledPostTooltipCloseButton = element(by.id(this.testID.scheduledPostTooltipCloseButton));
+    scheduledPostTooltipCloseButtonAdminAccount = element(by.id(this.testID.scheduledPostTooltipCloseButtonAdminAccount));
     browseChannelsScreen = element(by.id(this.testID.browseChannelsScreen));
     closeButton = element(by.id(this.testID.closeButton));
     createButton = element(by.id(this.testID.createButton));
@@ -42,23 +46,66 @@ class BrowseChannelsScreen {
     };
 
     toBeVisible = async () => {
-        await waitFor(this.browseChannelsScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        // Use TWENTY_SEC on both platforms — CI simulators/emulators are slower than
+        // local devices, so TEN_SEC was timing out on iOS CI before the screen appeared.
+        await waitFor(this.browseChannelsScreen).toExist().withTimeout(timeouts.TWENTY_SEC);
 
         return this.browseChannelsScreen;
     };
 
     open = async () => {
-        // # Open browse channels screen
-        await ChannelListScreen.headerPlusButton.tap();
-        await wait(timeouts.ONE_SEC);
-        await ChannelListScreen.browseChannelsItem.tap();
+        // If Browse Channels is already open (e.g. a previous test failed mid-navigation
+        // and left the modal on screen), close it first so we start from the channel list.
+        try {
+            await waitFor(this.browseChannelsScreen).toExist().withTimeout(2000);
+            await this.closeButton.tap();
+            await waitFor(this.browseChannelsScreen).not.toExist().withTimeout(timeouts.TEN_SEC);
+        } catch {
+            // Browse Channels is not open — proceed normally
+        }
 
-        return this.toBeVisible();
+        // # Open browse channels screen from the channel list header plus button.
+        // On Android the menu-item tap runs inside openPlusMenu's sync-off window, so sync is not turned back on
+        // between the plus tap and this tap and off again (the looper race of MM-T4932_3 / MM-T1719_1).
+        // archive_channel's hang on browse_channels.screen (runs 42521284188, 42620618054) began earlier: a
+        // disable 5s after reloadReactNative hit the same race; reloads now settle first (reloadApp).
+        await ChannelListScreen.openPlusMenu(async () => {
+            await ChannelListScreen.browseChannelsItem.tap();
+        });
+        await wait(timeouts.ONE_SEC);
+
+        // openPlusMenu disables sync on Android; wait for the screen before returning.
+        await waitForElementToExist(this.browseChannelsScreen, timeouts.TWENTY_SEC);
+
+        return this.browseChannelsScreen;
     };
 
     close = async () => {
         await this.closeButton.tap();
         await expect(this.browseChannelsScreen).not.toBeVisible();
+    };
+
+    // Wait for the tooltip before tapping it, the way ChannelScreen does. Tapping straight
+    // away raced the tooltip's own entry animation: the tap threw because nothing was there
+    // yet, the throw was swallowed, and the tooltip then rendered over the channel with its
+    // scrim swallowing every later tap. It outlives the test that opened it, so the next two
+    // tests in the file failed on elements the scrim was covering rather than on anything of
+    // their own. The second testID is the icon inside the close button, which is what the
+    // admin account's tree exposes.
+    dismissScheduledPostTooltip = async () => {
+        try {
+            await waitFor(this.scheduledPostTooltipCloseButton).toBeVisible().withTimeout(timeouts.FOUR_SEC);
+            await this.scheduledPostTooltipCloseButton.tap();
+            await wait(timeouts.HALF_SEC);
+        } catch {
+            try {
+                await waitFor(this.scheduledPostTooltipCloseButtonAdminAccount).toBeVisible().withTimeout(timeouts.FOUR_SEC);
+                await this.scheduledPostTooltipCloseButtonAdminAccount.tap();
+                await wait(timeouts.HALF_SEC);
+            } catch {
+                // Tooltip not visible.
+            }
+        }
     };
 }
 

@@ -8,26 +8,22 @@ import {DeviceEventEmitter} from 'react-native';
 import OptionItem from '@components/option_item';
 import {Events, Screens} from '@constants';
 import {ACCOUNT_OUTLINE_IMAGE} from '@constants/profile';
-import {showModal} from '@screens/navigation';
-import {preventDoubleTap} from '@utils/tap';
+import {usePreventDoubleTap} from '@hooks/utils';
+import {navigateToScreen} from '@screens/navigation';
 
 type Props = {
     isTablet: boolean;
-    theme: Theme;
 }
 
-const YourProfile = ({isTablet, theme}: Props) => {
+const YourProfile = ({isTablet}: Props) => {
     const intl = useIntl();
-    const openProfile = useCallback(preventDoubleTap(() => {
+    const openProfile = usePreventDoubleTap(useCallback(() => {
         if (isTablet) {
             DeviceEventEmitter.emit(Events.ACCOUNT_SELECT_TABLET_VIEW, Screens.EDIT_PROFILE);
         } else {
-            showModal(
-                Screens.EDIT_PROFILE,
-                intl.formatMessage({id: 'mobile.screen.your_profile', defaultMessage: 'Your Profile'}),
-            );
+            navigateToScreen(Screens.EDIT_PROFILE);
         }
-    }), [isTablet, theme]);
+    }, [isTablet]));
 
     return (
         <OptionItem

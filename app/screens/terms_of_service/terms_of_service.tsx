@@ -20,18 +20,15 @@ import {Screens} from '@constants/index';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {dismissOverlay} from '@screens/navigation';
-import NavigationStore from '@store/navigation_store';
-import {getMarkdownTextStyles, getMarkdownBlockStyles} from '@utils/markdown';
+import useDidMount from '@hooks/did_mount';
+import {navigateBack} from '@screens/navigation';
+import {NavigationStore} from '@store/navigation_store';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
-type Props = {
+type TermsOfServiceProps = {
     siteName?: string;
     showToS: boolean;
-    componentId: AvailableScreens;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme) => {
@@ -83,11 +80,12 @@ const getStyleSheet = makeStyleSheetFromTheme((theme) => {
             color: theme.centerChannelColor,
             ...typography('Body', 200, 'Regular'),
         },
-        firstButton: {
-            marginBottom: 10,
-        },
         loadingContainer: {
             justifyContent: 'center',
+        },
+        buttonContainer: {
+            flexDirection: 'column',
+            gap: 10,
         },
     };
 });
@@ -95,8 +93,7 @@ const getStyleSheet = makeStyleSheetFromTheme((theme) => {
 const TermsOfService = ({
     siteName = 'Mattermost',
     showToS,
-    componentId,
-}: Props) => {
+}: TermsOfServiceProps) => {
     const theme = useTheme();
     const styles = getStyleSheet(theme);
     const intl = useIntl();
@@ -123,10 +120,10 @@ const TermsOfService = ({
         }
     }, [serverUrl]);
 
-    const closeTermsAndLogout = useCallback(() => {
-        dismissOverlay(componentId);
-        logout(serverUrl);
-    }, [serverUrl, componentId]);
+    const closeTermsAndLogout = useCallback(async () => {
+        await navigateBack();
+        logout(serverUrl, intl, {logoutOnAlert: true});
+    }, [serverUrl, intl]);
 
     const alertError = useCallback((retry: () => void) => {
         Alert.alert(
@@ -144,7 +141,7 @@ const TermsOfService = ({
                 onPress: retry,
             }],
         );
-    }, [intl, closeTermsAndLogout]);
+    }, [siteName, intl, closeTermsAndLogout]);
 
     const alertDecline = useCallback(() => {
         Alert.alert(
@@ -161,7 +158,7 @@ const TermsOfService = ({
                 onPress: closeTermsAndLogout,
             }],
         );
-    }, [intl, siteName, closeTermsAndLogout]);
+    }, [intl, closeTermsAndLogout]);
 
     const acceptTerms = useCallback(async () => {
         setLoading(true);
@@ -169,7 +166,7 @@ const TermsOfService = ({
         if (error) {
             alertError(acceptTerms);
         }
-    }, [alertError, alertDecline, termsId, serverUrl, componentId]);
+    }, [alertError, termsId, serverUrl]);
 
     const declineTerms = useCallback(async () => {
         setLoading(true);
@@ -179,7 +176,7 @@ const TermsOfService = ({
         } else {
             alertDecline();
         }
-    }, [serverUrl, termsId, closeTermsAndLogout]);
+    }, [serverUrl, termsId, alertError, alertDecline]);
 
     const onPressClose = useCallback(async () => {
         if (getTermsError) {
@@ -189,9 +186,9 @@ const TermsOfService = ({
         }
     }, [declineTerms, closeTermsAndLogout, getTermsError]);
 
-    useEffect(() => {
+    useDidMount(() => {
         getTerms();
-    }, []);
+    });
 
     useEffect(() => {
         return () => {
@@ -201,14 +198,11 @@ const TermsOfService = ({
 
     useEffect(() => {
         if (!showToS) {
-            dismissOverlay(componentId);
+            navigateBack();
         }
-    }, [showToS, componentId]);
+    }, [showToS]);
 
-    useAndroidHardwareBackHandler(componentId, onPressClose);
-
-    const blockStyles = useMemo(() => getMarkdownBlockStyles(theme), [theme]);
-    const textStyles = useMemo(() => getMarkdownTextStyles(theme), [theme]);
+    useAndroidHardwareBackHandler(Screens.TERMS_OF_SERVICE, onPressClose);
 
     let content;
     if (loading) {
@@ -226,20 +220,21 @@ const TermsOfService = ({
                 <Text style={styles.errorDescription}>
                     {intl.formatMessage({id: 'terms_of_service.error.description', defaultMessage: 'It was not possible to get the Terms of Service from the Server.'})}
                 </Text>
-                <Button
-                    onPress={getTerms}
-                    theme={theme}
-                    text={intl.formatMessage({id: 'terms_of_service.error.retry', defaultMessage: 'Retry'})}
-                    size={'lg'}
-                    backgroundStyle={styles.firstButton}
-                />
-                <Button
-                    onPress={onPressClose}
-                    theme={theme}
-                    text={intl.formatMessage({id: 'terms_of_service.error.logout', defaultMessage: 'Logout'})}
-                    size={'lg'}
-                    emphasis={'link'}
-                />
+                <View style={styles.buttonContainer}>
+                    <Button
+                        onPress={getTerms}
+                        theme={theme}
+                        text={intl.formatMessage({id: 'terms_of_service.error.retry', defaultMessage: 'Retry'})}
+                        size={'lg'}
+                    />
+                    <Button
+                        onPress={onPressClose}
+                        theme={theme}
+                        text={intl.formatMessage({id: 'terms_of_service.error.logout', defaultMessage: 'Logout'})}
+                        size={'lg'}
+                        emphasis={'link'}
+                    />
+                </View>
             </>
         );
     } else {
@@ -250,8 +245,6 @@ const TermsOfService = ({
                 >
                     <Markdown
                         baseTextStyle={styles.baseText}
-                        textStyles={textStyles}
-                        blockStyles={blockStyles}
                         value={termsText}
                         disableHashtags={true}
                         disableAtMentions={true}
@@ -266,7 +259,7 @@ const TermsOfService = ({
                     theme={theme}
                     text={intl.formatMessage({id: 'terms_of_service.acceptButton', defaultMessage: 'Accept'})}
                     size={'lg'}
-                    backgroundStyle={styles.firstButton}
+                    testID='terms_of_service.accept.button'
                 />
 
                 <Button
@@ -275,6 +268,7 @@ const TermsOfService = ({
                     text={intl.formatMessage({id: 'terms_of_service.decline', defaultMessage: 'Decline'})}
                     size={'lg'}
                     emphasis={'link'}
+                    testID='terms_of_service.decline.button'
                 />
 
             </>
@@ -291,10 +285,18 @@ const TermsOfService = ({
     }, [styles, insets]);
 
     return (
-        <View style={styles.root}>
+        <View
+            style={styles.root}
+            testID='terms_of_service.screen'
+        >
             <View style={containerStyle}>
                 <View style={styles.wrapper}>
-                    <Text style={styles.title}>{intl.formatMessage({id: 'terms_of_service.title', defaultMessage: 'Terms of Service'})}</Text>
+                    <Text
+                        style={styles.title}
+                        testID='terms_of_service.title'
+                    >
+                        {intl.formatMessage({id: 'terms_of_service.title', defaultMessage: 'Terms of Service'})}
+                    </Text>
                     {content}
                 </View>
             </View>

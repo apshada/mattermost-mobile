@@ -4,19 +4,23 @@
 import moment from 'moment-timezone';
 import React, {useCallback} from 'react';
 import {useIntl} from 'react-intl';
-import {Text, TouchableOpacity, View} from 'react-native';
+import {Pressable, Text, View} from 'react-native';
 
-import {leaveCall} from '@calls/actions';
-import {leaveAndJoinWithAlert, showLimitRestrictedAlert} from '@calls/alerts';
+import {joinCallAndOpenCallScreen, leaveCallConfirmation} from '@calls/actions/calls';
+import {showLimitRestrictedAlert} from '@calls/alerts';
+import {CallCardState} from '@calls/types/calls';
+import {getCallCardState, getCallPropsFromPost} from '@calls/utils';
 import CompassIcon from '@components/compass_icon';
 import FormattedRelativeTime from '@components/formatted_relative_time';
 import FormattedText from '@components/formatted_text';
 import FormattedTime from '@components/formatted_time';
+import Loading from '@components/loading';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
-import {getUserTimezone} from '@utils/user';
+import {displayUsername, getUserTimezone} from '@utils/user';
 
 import type {LimitRestrictedInfo} from '@calls/observers';
 import type PostModel from '@typings/database/models/servers/post';
@@ -24,10 +28,19 @@ import type UserModel from '@typings/database/models/servers/user';
 
 type Props = {
     post: PostModel;
-    currentUser?: UserModel;
     isMilitaryTime: boolean;
+    joiningChannelId: string | null;
+    otherParticipants: boolean;
+    isAdmin: boolean;
+    isHost: boolean;
+    currentUser?: UserModel;
+    caller?: UserModel;
+    callee?: UserModel;
+    teammateNameDisplay?: string;
     limitRestrictedInfo?: LimitRestrictedInfo;
     ccChannelId?: string;
+    numUsers?: number;
+    callExists?: boolean;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -95,6 +108,9 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         leaveCallButton: {
             backgroundColor: theme.dndIndicator,
         },
+        pressed: {
+            opacity: 0.72,
+        },
         buttonText: {
             color: theme.buttonColor,
             ...typography('Body', 100, 'SemiBold'),
@@ -121,98 +137,237 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     };
 });
 
-export const CallsCustomMessage = ({post, currentUser, isMilitaryTime, ccChannelId, limitRestrictedInfo}: Props) => {
+export const CallsCustomMessage = ({
+    post,
+    currentUser,
+    caller,
+    callee,
+    teammateNameDisplay,
+    isMilitaryTime,
+    ccChannelId,
+    limitRestrictedInfo,
+    joiningChannelId,
+    otherParticipants,
+    isAdmin,
+    isHost,
+    numUsers = 0,
+
+    // An ended call post has no live call to observe, so the HOC does not pass this through.
+    callExists = false,
+}: Props) => {
     const intl = useIntl();
     const theme = useTheme();
     const style = getStyleSheet(theme);
     const serverUrl = useServerUrl();
     const timezone = getUserTimezone(currentUser);
 
+    const joiningThisCall = Boolean(joiningChannelId === post.channelId);
     const alreadyInTheCall = Boolean(ccChannelId && ccChannelId === post.channelId);
     const isLimitRestricted = Boolean(limitRestrictedInfo?.limitRestricted);
+    const joiningMsg = intl.formatMessage({id: 'mobile.calls_joining', defaultMessage: 'Joining...'});
 
-    const joinHandler = useCallback(() => {
+    const handleJoinPress = useCallback(async () => {
         if (isLimitRestricted) {
             showLimitRestrictedAlert(limitRestrictedInfo!, intl);
             return;
         }
 
-        leaveAndJoinWithAlert(intl, serverUrl, post.channelId);
-    }, [limitRestrictedInfo, intl, serverUrl, post.channelId]);
+        await joinCallAndOpenCallScreen(intl, serverUrl, post.channelId);
+    }, [isLimitRestricted, post.channelId, intl, serverUrl, limitRestrictedInfo]);
+    const joinHandler = usePreventDoubleTap(handleJoinPress);
 
-    const leaveHandler = useCallback(() => {
-        leaveCall();
-    }, []);
+    // Hanging up while a DM call is still ringing is what the server turns into a canceled call,
+    // so the caller's "Cancel" and a participant's "Leave" are the same action.
+    const leaveCallHandler = useCallback(() => {
+        leaveCallConfirmation(intl, otherParticipants, isAdmin, isHost, serverUrl, post.channelId);
+    }, [intl, otherParticipants, isAdmin, isHost, serverUrl, post.channelId]);
 
-    const title = post.props.title ? (
+    const callProps = getCallPropsFromPost(post);
+    const cardState = getCallCardState(callProps, numUsers, callExists);
+
+    // The author of the call post is the caller.
+    const isCaller = Boolean(currentUser && currentUser.id === post.userId);
+    const isCalling = cardState === CallCardState.Calling;
+    const callEnded = cardState !== CallCardState.Calling && cardState !== CallCardState.Active;
+
+    const title = callProps.title ? (
         <Text style={style.title}>
-            {post.props.title}
+            {callProps.title}
         </Text>
     ) : null;
 
-    if (post.props.end_at) {
-        return (
-            <>
-                {title}
-                <View style={style.messageStyle}>
-                    <CompassIcon
-                        name='phone-hangup'
-                        size={20}
-                        style={[style.callIcon, style.phoneHangupIcon]}
-                    />
-                    <View style={style.message}>
-                        <FormattedText
-                            id={'mobile.calls_call_ended'}
-                            defaultMessage={'Call ended'}
-                            style={style.text}
-                        />
-                        <View style={style.endCallInfo}>
-                            <FormattedText
-                                style={style.timeText}
-                                id={'mobile.calls_ended_at'}
-                                defaultMessage={'Ended at'}
-                            />
-                            <Text>{' '}</Text>
-                            <FormattedTime
-                                style={style.timeText}
-                                value={post.props.end_at}
-                                isMilitaryTime={isMilitaryTime}
-                                timezone={timezone}
-                            />
-                            <Text style={style.separator}>{'•'}</Text>
-                            <FormattedText
-                                id={'mobile.calls_lasted'}
-                                style={style.timeText}
-                                defaultMessage={'Lasted {duration}'}
-                                values={{duration: moment.duration(post.props.end_at - post.props.start_at).humanize(false)}}
-                            />
-                        </View>
-                    </View>
-                </View>
-            </>
+    let heading;
+    if (isCalling) {
+        heading = isCaller ? (
+            <FormattedText
+                id={'mobile.calls_calling'}
+                defaultMessage={'Calling...'}
+                style={style.text}
+                testID='calls_custom_message.heading'
+            />
+        ) : (
+            <FormattedText
+                id={'mobile.calls_incoming_call'}
+                defaultMessage={'Incoming call...'}
+                style={style.text}
+                testID='calls_custom_message.heading'
+            />
+        );
+    } else if (callEnded) {
+        heading = (
+            <FormattedText
+                id={'mobile.calls_call_ended'}
+                defaultMessage={'Call ended'}
+                style={style.text}
+                testID='calls_custom_message.heading'
+            />
+        );
+    } else {
+        heading = (
+            <FormattedText
+                id={'mobile.calls_started_call'}
+                defaultMessage={'Call started'}
+                style={style.text}
+                testID='calls_custom_message.heading'
+            />
         );
     }
 
-    const button = alreadyInTheCall ? (
-        <TouchableOpacity
-            style={[style.callButton, style.leaveCallButton]}
-            onPress={leaveHandler}
+    let subHeading;
+    switch (cardState) {
+        case CallCardState.Calling:
+            break;
+        case CallCardState.NoAnswer:
+            subHeading = isCaller ? (
+                <FormattedText
+                    id={'mobile.calls_no_answer'}
+                    defaultMessage={'No answer'}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            ) : (
+                <FormattedText
+                    id={'mobile.calls_missed_call'}
+                    defaultMessage={'Missed call'}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            );
+            break;
+        case CallCardState.Canceled:
+            subHeading = isCaller ? (
+                <FormattedText
+                    id={'mobile.calls_you_canceled_call'}
+                    defaultMessage={'You canceled the call'}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            ) : (
+                <FormattedText
+                    id={'mobile.calls_canceled_by'}
+                    defaultMessage={'Canceled by {user}'}
+                    values={{user: displayUsername(caller, intl.locale, teammateNameDisplay)}}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            );
+            break;
+        case CallCardState.Declined:
+            subHeading = isCaller ? (
+                <FormattedText
+                    id={'mobile.calls_declined_by'}
+                    defaultMessage={'Declined by {user}'}
+                    values={{user: displayUsername(callee, intl.locale, teammateNameDisplay)}}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            ) : (
+                <FormattedText
+                    id={'mobile.calls_you_declined_call'}
+                    defaultMessage={'You declined the call'}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            );
+            break;
+        case CallCardState.Ended: {
+            if (callProps.end_at === 0) {
+                break;
+            }
+
+            // The card reaches this state from the call_end event, before the post is updated with
+            // end_at, so the timings are only rendered once they are known.
+            subHeading = (
+                <View
+                    style={style.endCallInfo}
+                    testID='calls_custom_message.sub_heading'
+                >
+                    <FormattedText
+                        style={style.timeText}
+                        id={'mobile.calls_ended_at'}
+                        defaultMessage={'Ended at'}
+                    />
+                    <Text>{' '}</Text>
+                    <FormattedTime
+                        style={style.timeText}
+                        value={callProps.end_at}
+                        isMilitaryTime={isMilitaryTime}
+                        timezone={timezone}
+                    />
+                    <Text style={style.separator}>{'•'}</Text>
+                    <FormattedText
+                        id={'mobile.calls_lasted'}
+                        style={style.timeText}
+                        defaultMessage={'Lasted {duration}'}
+                        values={{duration: moment.duration(callProps.end_at - callProps.start_at).humanize(false)}}
+                    />
+                </View>
+            );
+            break;
+        }
+        default:
+            subHeading = (
+                <FormattedRelativeTime
+                    value={callProps.start_at}
+                    updateIntervalInSeconds={1}
+                    style={style.timeText}
+                    testID='calls_custom_message.sub_heading'
+                />
+            );
+    }
+
+    const hangupButton = (
+        <Pressable
+            style={({pressed}) => [style.callButton, style.leaveCallButton, pressed && style.pressed]}
+            onPress={leaveCallHandler}
+            testID='calls_custom_message.hangup_button'
         >
             <CompassIcon
                 name='phone-hangup'
                 size={18}
-                style={[style.buttonIcon]}
+                style={style.buttonIcon}
             />
-            <FormattedText
-                id={'mobile.calls_leave'}
-                defaultMessage={'Leave'}
-                style={style.buttonText}
-            />
-        </TouchableOpacity>
-    ) : (
-        <TouchableOpacity
-            style={[style.callButton, style.joinCallButton, isLimitRestricted && style.joinCallButtonRestricted]}
+            {isCalling ? (
+                <FormattedText
+                    id={'mobile.calls_cancel'}
+                    defaultMessage={'Cancel'}
+                    style={style.buttonText}
+                />
+            ) : (
+                <FormattedText
+                    id={'mobile.calls_leave'}
+                    defaultMessage={'Leave'}
+                    style={style.buttonText}
+                />
+            )}
+        </Pressable>
+    );
+
+    const joinButton = (
+        <Pressable
+            style={({pressed}) => [style.callButton, style.joinCallButton, isLimitRestricted && style.joinCallButtonRestricted, pressed && style.pressed]}
             onPress={joinHandler}
+            testID='calls_custom_message.join_button'
         >
             <CompassIcon
                 name='phone-in-talk'
@@ -224,33 +379,43 @@ export const CallsCustomMessage = ({post, currentUser, isMilitaryTime, ccChannel
                 defaultMessage={'Join'}
                 style={[style.buttonText, isLimitRestricted && style.buttonRestricted]}
             />
-        </TouchableOpacity>
+        </Pressable>
     );
+
+    const joiningButton = (
+        <Loading
+            color={theme.buttonColor}
+            size={'small'}
+            footerText={joiningMsg}
+            containerStyle={[style.callButton, style.joinCallButton]}
+            footerTextStyles={style.buttonText}
+        />
+    );
+
+    let button;
+    if (callEnded) {
+        button = null;
+    } else if (joiningThisCall) {
+        button = joiningButton;
+    } else {
+        button = alreadyInTheCall ? hangupButton : joinButton;
+    }
 
     return (
         <>
             {title}
             <View style={style.messageStyle}>
                 <CompassIcon
-                    name='phone-in-talk'
+                    name={callEnded ? 'phone-hangup' : 'phone-in-talk'}
                     size={20}
-                    style={[style.callIcon, style.joinCallIcon]}
+                    style={[style.callIcon, callEnded ? style.phoneHangupIcon : style.joinCallIcon]}
                 />
                 <View style={style.message}>
-                    <FormattedText
-                        id={'mobile.calls_started_call'}
-                        defaultMessage={'Call started'}
-                        style={style.text}
-                    />
-                    <FormattedRelativeTime
-                        value={post.props.start_at}
-                        updateIntervalInSeconds={1}
-                        style={style.timeText}
-                    />
+                    {heading}
+                    {subHeading}
                 </View>
                 {button}
             </View>
         </>
     );
 };
-

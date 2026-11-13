@@ -1,8 +1,6 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-/* eslint-disable max-lines */
-
 import type {DatabaseType} from '@constants/database';
 import type AppDataOperator from '@database/operator/app_data_operator';
 import type ServerDataOperator from '@database/operator/server_data_operator';
@@ -10,7 +8,10 @@ import type {Database} from '@nozbe/watermelondb';
 import type Model from '@nozbe/watermelondb/Model';
 import type {Clause} from '@nozbe/watermelondb/QueryDescription';
 import type {Class} from '@nozbe/watermelondb/types';
+import type {CustomProfileField, CustomProfileAttribute} from '@typings/api/custom_profile_attributes';
 import type System from '@typings/database/models/servers/system';
+
+export type SyncStatus = 'synced' | 'pending' | 'failed';
 
 export type WithDatabaseArgs = { database: Database }
 
@@ -43,24 +44,24 @@ export type ServerDatabases = {
   [x: string]: ServerDatabase | undefined;
 };
 
-export type TransformerArgs = {
+export type TransformerArgs<T extends Model, R extends RawValue> = {
   action: string;
   database: Database;
   fieldsMapper?: (model: Model) => void;
   tableName?: string;
-  value: RecordPair;
+  value: RecordPair<T, R>;
 };
 
-export type PrepareBaseRecordArgs = TransformerArgs & {
+export type PrepareBaseRecordArgs<T extends Model, R extends RawValue> = TransformerArgs<T, R> & {
   fieldsMapper: (model: Model) => void;
 }
 
-export type OperationArgs<T extends Model> = {
+export type OperationArgs<T extends Model, R extends RawValue> = {
   tableName: string;
-  createRaws?: RecordPair[];
-  updateRaws?: RecordPair[];
+  createRaws?: Array<RecordPair<T, R>>;
+  updateRaws?: Array<RecordPair<T, R>>;
   deleteRaws?: T[];
-  transformer: (args: TransformerArgs) => Promise<T>;
+  transformer: (args: TransformerArgs<T, R>) => Promise<T>;
 };
 
 export type Models = Array<Class<Model>>;
@@ -88,7 +89,20 @@ export type HandlePostsArgs = {
   previousPostId?: string;
   posts?: Post[];
   prepareRecordsOnly?: boolean;
+
+  // Set when the posts are fetched on their own (e.g. the post behind a permalink preview)
+  // rather than as part of a channel's timeline, so they must not extend or create a
+  // PostsInChannel interval that claims continuity the client does not have.
+  skipPostsInChannel?: boolean;
+
+  // Supplied only for responses that went through ABAC sanitization; local mutations omit it so the
+  // stored value is preserved. Never sent to the server.
+  redactionVerifiedEpoch?: number;
 };
+
+// Threaded from handlePosts to the transformer on the raw itself, because transformers take no
+// arguments beyond the record pair. Not part of the server-facing Post contract.
+export type PostWithRedactionEpoch = Post & {redaction_verified_epoch?: number};
 
 export type HandleThreadsArgs = {
   threads?: ThreadWithLastFetchedAt[];
@@ -137,9 +151,9 @@ export type SanitizePostsArgs = {
   posts: Post[];
 };
 
-export type IdenticalRecordArgs = {
-  existingRecord: Model;
-  newValue: RawValue;
+export type IdenticalRecordArgs<T extends Model, R extends RawValue> = {
+  existingRecord: T;
+  newValue: R;
   tableName: string;
 };
 
@@ -149,21 +163,21 @@ export type RetrieveRecordsArgs = {
   condition: Clause;
 };
 
-export type ProcessRecordsArgs = {
-  createOrUpdateRawValues: RawValue[];
-  deleteRawValues: RawValue[];
+export type ProcessRecordsArgs<R extends RawValue> = {
+  createOrUpdateRawValues: R[];
+  deleteRawValues: R[];
   tableName: string;
   fieldName: string;
   buildKeyRecordBy?: (obj: Record<string, any>) => string;
   shouldUpdate?: (existing: Record<string, any>, newRaw: Record<string, any>) => boolean;
 };
 
-export type HandleRecordsArgs<T extends Model> = {
+export type HandleRecordsArgs<T extends Model, R extends RawValue> = {
   buildKeyRecordBy?: (obj: Record<string, any>) => string;
   fieldName: string;
-  transformer: (args: TransformerArgs) => Promise<T>;
-  createOrUpdateRawValues: RawValue[];
-  deleteRawValues?: RawValue[];
+  transformer: (args: TransformerArgs<T, R>) => Promise<T>;
+  createOrUpdateRawValues: R[];
+  deleteRawValues?: R[];
   tableName: string;
   prepareRecordsOnly: boolean;
   shouldUpdate?: (existingRecord: T, newRaw: RawValue) => boolean;
@@ -174,9 +188,9 @@ export type RangeOfValueArgs = {
   fieldName: string;
 };
 
-export type RecordPair = {
-  record?: Model;
-  raw: RawValue;
+export type RecordPair<T extends Model, R extends RawValue> = {
+  record?: T;
+  raw: R;
 };
 
 type PrepareOnly = {
@@ -224,6 +238,10 @@ export type HandleMyChannelSettingsArgs = PrepareOnly & {
 
 export type HandleChannelArgs = PrepareOnly & {
   channels?: Channel[];
+};
+
+export type HandleChannelBookmarkArgs = PrepareOnly & {
+  bookmarks?: ChannelBookmarkWithFileInfo[];
 };
 
 export type HandleCategoryArgs = PrepareOnly & {
@@ -290,6 +308,43 @@ export type HandleDraftArgs = PrepareOnly & {
   drafts?: Draft[];
 };
 
+export type HandleScheduledPostsArgs = PrepareOnly & {
+  actionType: string;
+  scheduledPosts?: ScheduledPost[];
+  includeDirectChannelPosts?: boolean;
+};
+
+export type HandleScheduledPostErrorCodeArgs = PrepareOnly & {
+  scheduledPostId: string;
+  errorCode: string;
+}
+
+export type HandleCustomProfileFieldsArgs = PrepareOnly & {
+  fields?: CustomProfileField[];
+};
+
+export type HandleCustomProfileAttributesArgs = PrepareOnly & {
+  attributes?: CustomProfileAttribute[];
+};
+
+export type HandlePropertyFieldsArgs = PrepareOnly & {
+  fields?: PropertyField[];
+  groupId?: string;
+
+  // Restricts groupId-driven pruning to fields whose object_type is in this
+  // list. The access_control group also holds user/session fields owned by
+  // other features; a groupId-only prune would delete those too whenever a
+  // caller's fetch only covers a subset of object types. Optional so callers
+  // that genuinely fetch every object type in the group are unaffected.
+  objectTypes?: PropertyFieldObjectType[];
+};
+
+export type HandlePropertyValuesArgs = PrepareOnly & {
+  values?: PropertyValue[];
+  targetId?: string;
+  groupId?: string;
+};
+
 export type LoginArgs = {
   config: Partial<ClientConfig>;
   ldapOnly?: boolean;
@@ -313,8 +368,8 @@ export type GetDatabaseConnectionArgs = {
   setAsActiveDatabase: boolean;
 }
 
-export type ProcessRecordResults<T extends Model> = {
-    createRaws: RecordPair[];
-    updateRaws: RecordPair[];
+export type ProcessRecordResults<T extends Model, R extends RawValue> = {
+    createRaws: Array<RecordPair<T, R>>;
+    updateRaws: Array<RecordPair<T, R>>;
     deleteRaws: T[];
 }

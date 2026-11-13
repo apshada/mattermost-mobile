@@ -1,0 +1,599 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React, {useCallback, useEffect, useMemo} from 'react';
+import {Platform, Pressable, Text, View} from 'react-native';
+import Animated, {FadeIn, FadeOut, useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
+
+import {ToolApprovalStage, ToolCallStatus, type ToolCall} from '@agents/types';
+import CompassIcon from '@components/compass_icon';
+import FormattedText from '@components/formatted_text';
+import Loading from '@components/loading';
+import Markdown from '@components/markdown';
+import {Screens} from '@constants';
+import {useTheme} from '@context/theme';
+import {usePreventDoubleTap} from '@hooks/utils';
+import {safeParseJSON} from '@utils/helpers';
+import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
+import {typography} from '@utils/typography';
+
+const HIT_SLOP_VERTICAL = 4;
+
+// Indent to align content under the tool name (past the chevron icon column)
+const CONTENT_INDENT = 13;
+const BUTTON_HIT_SLOP = {top: HIT_SLOP_VERTICAL, bottom: HIT_SLOP_VERTICAL, left: 0, right: 0};
+
+interface ToolCardProps {
+    tool: ToolCall;
+    isCollapsed: boolean;
+    isProcessing: boolean;
+    localDecision?: boolean; // true = approved, false = rejected, undefined = undecided
+    onToggleCollapse: (toolId: string) => void;
+    onApprove?: (toolId: string) => void;
+    onReject?: (toolId: string) => void;
+    approvalStage: ToolApprovalStage;
+    canExpand?: boolean;
+    showArguments?: boolean;
+    showResults?: boolean;
+}
+
+const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
+    return {
+        container: {
+        },
+        header: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8,
+            paddingVertical: 8,
+        },
+        chevronIcon: {
+            width: 12,
+        },
+        statusIcon: {
+            width: 12,
+            height: 12,
+        },
+        toolName: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            flex: 1,
+            ...typography('Body', 100),
+        },
+        argumentsContainer: {
+            marginLeft: CONTENT_INDENT,
+        },
+        markdownText: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            ...typography('Body', 50),
+        },
+        responseLabel: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8,
+            paddingTop: 8,
+            paddingBottom: 8,
+            paddingLeft: CONTENT_INDENT,
+        },
+        responseLabelText: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            ...typography('Body', 100),
+        },
+        autoApprovedBadge: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 4,
+            paddingVertical: 2,
+            paddingHorizontal: 8,
+            borderRadius: 4,
+            backgroundColor: changeOpacity(theme.onlineIndicator, 0.12),
+        },
+        autoApprovedBadgeText: {
+            color: theme.onlineIndicator,
+            ...typography('Body', 75, 'SemiBold'),
+        },
+        resultContainer: {
+            marginLeft: CONTENT_INDENT,
+        },
+        statusContainer: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8,
+            marginTop: 16,
+            paddingLeft: CONTENT_INDENT,
+        },
+        statusText: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            ...typography('Body', 100),
+        },
+        buttonContainer: {
+            flexDirection: 'row',
+            gap: 8,
+            marginTop: 4,
+            paddingLeft: 36,
+        },
+        resultButtonContainer: {
+            flexDirection: 'row',
+            gap: 8,
+            marginTop: 12,
+            marginLeft: 24,
+        },
+        button: {
+            backgroundColor: changeOpacity(theme.buttonBg, 0.08),
+            borderRadius: 4,
+            paddingVertical: 8,
+            paddingHorizontal: 16,
+            justifyContent: 'center',
+            alignItems: 'center',
+            minHeight: 32,
+        },
+        buttonText: {
+            color: theme.buttonBg,
+            ...typography('Body', 75, 'SemiBold'),
+        },
+        shareButton: {
+            backgroundColor: theme.buttonBg,
+            borderRadius: 4,
+            paddingVertical: 8,
+            paddingHorizontal: 16,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
+            justifyContent: 'center',
+        },
+        shareButtonText: {
+            color: theme.buttonColor,
+            ...typography('Body', 75, 'SemiBold'),
+        },
+        keepPrivateButton: {
+            backgroundColor: changeOpacity(theme.centerChannelColor, 0.08),
+            borderRadius: 4,
+            paddingVertical: 8,
+            paddingHorizontal: 16,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
+            justifyContent: 'center',
+        },
+        keepPrivateButtonText: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            ...typography('Body', 75, 'SemiBold'),
+        },
+        warningCallout: {
+            backgroundColor: changeOpacity(theme.dndIndicator, 0.08),
+            borderLeftWidth: 3,
+            borderLeftColor: theme.dndIndicator,
+            borderRadius: 4,
+            padding: 12,
+            marginTop: 8,
+            marginLeft: 24,
+            gap: 4,
+        },
+        warningHeader: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
+        },
+        warningHeaderText: {
+            color: theme.centerChannelColor,
+            ...typography('Body', 100, 'SemiBold'),
+        },
+        warningBodyText: {
+            color: changeOpacity(theme.centerChannelColor, 0.75),
+            ...typography('Body', 75),
+        },
+    };
+});
+
+/**
+ * Individual tool card component showing tool details and approval buttons
+ */
+const ToolCard = ({
+    tool,
+    isCollapsed,
+    isProcessing,
+    localDecision,
+    onToggleCollapse,
+    onApprove,
+    onReject,
+    approvalStage,
+    canExpand = true,
+    showArguments = true,
+    showResults = true,
+}: ToolCardProps) => {
+    const theme = useTheme();
+    const styles = getStyleSheet(theme);
+    const chevronRotation = useSharedValue(isCollapsed ? 0 : 90);
+
+    useEffect(() => {
+        chevronRotation.value = withTiming(isCollapsed ? 0 : 90, {duration: 200});
+    }, [isCollapsed, chevronRotation]);
+
+    const isPending = tool.status === ToolCallStatus.Pending;
+
+    // Accepted is the in-flight state between approval and the result landing;
+    // show the same processing spinner as Pending.
+    const isAccepted = tool.status === ToolCallStatus.Accepted;
+    const hasLocalDecision = localDecision !== undefined;
+    const isAutoApprovedStatus = tool.status === ToolCallStatus.AutoApproved;
+
+    // Treat auto-approved as success so the result affordances render.
+    const isSuccess = tool.status === ToolCallStatus.Success || isAutoApprovedStatus;
+    const isError = tool.status === ToolCallStatus.Error;
+    const isRejected = tool.status === ToolCallStatus.Rejected;
+    const isResultPhase = approvalStage === ToolApprovalStage.Result;
+
+    // A pending call flagged would_auto_execute is executed server-side, so it
+    // must never offer an approval decision — only the result-stage
+    // share/keep-private controls stay available.
+    // onApprove is withheld for calls that can't be accepted from this card
+    // (questions the app can't render), leaving only Reject in the call stage.
+    const showDecisionButtons = Boolean(onReject) && (
+        (isResultPhase && Boolean(onApprove)) ||
+        (approvalStage === ToolApprovalStage.Call && isPending && !tool.would_auto_execute)
+    );
+
+    const displayName = useMemo(() => {
+        return tool.name.
+            replace(/_/g, ' ').
+            replace(/\b\w/g, (char) => char.toUpperCase());
+    }, [tool.name]);
+
+    const argumentsMarkdown = useMemo(() => {
+        const value = tool.arguments ?? {};
+        return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+    }, [tool.arguments]);
+
+    // Render result as code block - try to detect if it's JSON
+    const resultMarkdown = useMemo(() => {
+        if (!tool.result) {
+            return '';
+        }
+
+        const parsed = safeParseJSON(tool.result);
+        if (typeof parsed === 'object' && parsed !== null) {
+            return `\`\`\`json\n${tool.result}\n\`\`\``;
+        }
+        return `\`\`\`\n${tool.result}\n\`\`\``;
+    }, [tool.result]);
+
+    const handleToggle = useCallback(() => {
+        if (!canExpand) {
+            return;
+        }
+        onToggleCollapse(tool.id);
+    }, [canExpand, onToggleCollapse, tool.id]);
+
+    const handleApprove = usePreventDoubleTap(useCallback(() => {
+        onApprove?.(tool.id);
+    }, [onApprove, tool.id]));
+
+    const handleReject = usePreventDoubleTap(useCallback(() => {
+        onReject?.(tool.id);
+    }, [onReject, tool.id]));
+
+    const chevronAnimatedStyle = useAnimatedStyle(() => ({
+        transform: [{rotate: `${chevronRotation.value}deg`}],
+    }));
+
+    // Determine icon based on status
+    const getStatusIcon = () => {
+        if (isPending || isAccepted) {
+            return (
+                <Loading
+                    size='small'
+                    color={changeOpacity(theme.centerChannelColor, 0.64)}
+                    containerStyle={styles.statusIcon}
+                />
+            );
+        }
+
+        if (isSuccess) {
+            return (
+                <CompassIcon
+                    name='check-circle'
+                    size={12}
+                    color={theme.onlineIndicator}
+                    style={styles.statusIcon}
+                />
+            );
+        }
+
+        if (isError) {
+            return (
+                <CompassIcon
+                    name='alert-circle-outline'
+                    size={12}
+                    color={theme.errorTextColor}
+                    style={styles.statusIcon}
+                />
+            );
+        }
+
+        if (isRejected) {
+            return (
+                <CompassIcon
+                    name='close-circle-outline'
+                    size={12}
+                    color={theme.dndIndicator}
+                    style={styles.statusIcon}
+                />
+            );
+        }
+
+        return null;
+    };
+
+    const testIdPrefix = `agents.tool_card.${tool.id}`;
+
+    return (
+        <View
+            style={styles.container}
+            testID={testIdPrefix}
+        >
+            <Pressable
+                onPress={canExpand ? handleToggle : undefined}
+                style={({pressed}) => [styles.header, canExpand && pressed && {opacity: 0.72}]}
+                testID={`${testIdPrefix}.header`}
+            >
+                {canExpand ? (
+                    <Animated.View style={[styles.chevronIcon, chevronAnimatedStyle]}>
+                        <CompassIcon
+                            name='chevron-right'
+                            size={16}
+                            color={changeOpacity(theme.centerChannelColor, 0.56)}
+                        />
+                    </Animated.View>
+                ) : null}
+                {getStatusIcon()}
+                <Text
+                    style={styles.toolName}
+                    numberOfLines={1}
+                    testID={`${testIdPrefix}.name`}
+                >
+                    {displayName}
+                </Text>
+                {isAutoApprovedStatus && (
+                    <View
+                        style={styles.autoApprovedBadge}
+                        testID={`${testIdPrefix}.auto_approved_badge`}
+                    >
+                        <CompassIcon
+                            name='check-circle'
+                            size={12}
+                            color={theme.onlineIndicator}
+                        />
+                        <FormattedText
+                            id='agents.tool_call.auto_approved_badge'
+                            defaultMessage='Auto-approved'
+                            style={styles.autoApprovedBadgeText}
+                        />
+                    </View>
+                )}
+            </Pressable>
+
+            {!isCollapsed && (
+                <Animated.View
+                    entering={FadeIn.duration(200)}
+                    exiting={Platform.select({ios: FadeOut.duration(200)})}
+                >
+                    {showArguments && (
+                        <View
+                            style={styles.argumentsContainer}
+                            testID={`${testIdPrefix}.arguments`}
+                        >
+                            <Markdown
+                                baseTextStyle={styles.markdownText}
+                                value={argumentsMarkdown}
+                                theme={theme}
+                                location={Screens.CHANNEL}
+                            />
+                        </View>
+                    )}
+
+                    {showResults && (isSuccess || isError) && resultMarkdown && (
+                        <>
+                            <View
+                                style={styles.responseLabel}
+                                testID={`${testIdPrefix}.result`}
+                            >
+                                {isSuccess && (
+                                    <CompassIcon
+                                        name='check-circle'
+                                        size={12}
+                                        color={theme.onlineIndicator}
+                                    />
+                                )}
+                                {isError && (
+                                    <CompassIcon
+                                        name='alert-circle-outline'
+                                        size={12}
+                                        color={theme.errorTextColor}
+                                    />
+                                )}
+                                <FormattedText
+                                    id='agents.tool_call.response'
+                                    defaultMessage='Response'
+                                    style={styles.responseLabelText}
+                                />
+                            </View>
+                            <View style={styles.resultContainer}>
+                                <Markdown
+                                    baseTextStyle={styles.markdownText}
+                                    value={resultMarkdown}
+                                    theme={theme}
+                                    location={Screens.CHANNEL}
+                                />
+                            </View>
+                            {isResultPhase && showDecisionButtons && !hasLocalDecision && (
+                                <View
+                                    style={styles.warningCallout}
+                                    testID={`${testIdPrefix}.warning`}
+                                >
+                                    <View style={styles.warningHeader}>
+                                        <CompassIcon
+                                            name='information-outline'
+                                            size={14}
+                                            color={theme.dndIndicator}
+                                        />
+                                        <FormattedText
+                                            id='agents.tool_call.review_tool_response'
+                                            defaultMessage='Review tool response'
+                                            style={styles.warningHeaderText}
+                                        />
+                                    </View>
+                                    <FormattedText
+                                        id='agents.tool_call.approval_warning'
+                                        defaultMessage='Approving lets Agents use this response in their next message. That message will be visible to everyone in the channel — only approve results you are comfortable sharing.'
+                                        style={styles.warningBodyText}
+                                    />
+                                </View>
+                            )}
+                        </>
+                    )}
+
+                    {isRejected && (
+                        <View
+                            style={styles.statusContainer}
+                            testID={`${testIdPrefix}.status.rejected`}
+                        >
+                            <CompassIcon
+                                name='close-circle-outline'
+                                size={12}
+                                color={theme.dndIndicator}
+                            />
+                            <FormattedText
+                                id='agents.tool_call.status.rejected'
+                                defaultMessage='Rejected'
+                                style={styles.statusText}
+                            />
+                        </View>
+                    )}
+                </Animated.View>
+            )}
+
+            {/* A decided card in a multi-tool batch keeps reflecting the
+                user's choice while the remaining tools await decisions. */}
+            {hasLocalDecision && (
+                <View
+                    style={styles.statusContainer}
+                    testID={`${testIdPrefix}.status.local_decision`}
+                >
+                    {localDecision ? (
+                        <>
+                            <CompassIcon
+                                name='check-circle'
+                                size={12}
+                                color={theme.onlineIndicator}
+                            />
+                            <FormattedText
+                                id='agents.tool_call.status.accepted'
+                                defaultMessage='Accepted'
+                                style={styles.statusText}
+                            />
+                        </>
+                    ) : (
+                        <>
+                            <CompassIcon
+                                name='close-circle-outline'
+                                size={12}
+                                color={theme.dndIndicator}
+                            />
+                            <FormattedText
+                                id='agents.tool_call.status.rejected'
+                                defaultMessage='Rejected'
+                                style={styles.statusText}
+                            />
+                        </>
+                    )}
+                </View>
+            )}
+
+            {isPending && !hasLocalDecision && isProcessing && (
+                <View
+                    style={styles.statusContainer}
+                    testID={`${testIdPrefix}.status.processing`}
+                >
+                    <Loading
+                        size='small'
+                        color={changeOpacity(theme.centerChannelColor, 0.64)}
+                    />
+                    <FormattedText
+                        id='agents.tool_call.processing'
+                        defaultMessage='Processing...'
+                        style={styles.statusText}
+                    />
+                </View>
+            )}
+
+            {isPending && !hasLocalDecision && !isProcessing && showDecisionButtons && (
+                <View style={styles.buttonContainer}>
+                    {Boolean(onApprove) && (
+                        <Pressable
+                            onPress={handleApprove}
+                            style={({pressed}) => [styles.button, pressed && {opacity: 0.72}]}
+                            hitSlop={BUTTON_HIT_SLOP}
+                            testID={`${testIdPrefix}.approve`}
+                        >
+                            <FormattedText
+                                id='agents.tool_call.approve'
+                                defaultMessage='Accept'
+                                style={styles.buttonText}
+                            />
+                        </Pressable>
+                    )}
+                    <Pressable
+                        onPress={handleReject}
+                        style={({pressed}) => [styles.button, pressed && {opacity: 0.72}]}
+                        hitSlop={BUTTON_HIT_SLOP}
+                        testID={`${testIdPrefix}.reject`}
+                    >
+                        <FormattedText
+                            id='agents.tool_call.reject'
+                            defaultMessage='Reject'
+                            style={styles.buttonText}
+                        />
+                    </Pressable>
+                </View>
+            )}
+
+            {isResultPhase && (isSuccess || isError) && !hasLocalDecision && !isProcessing && showDecisionButtons && (
+                <View style={styles.resultButtonContainer}>
+                    <Pressable
+                        onPress={handleApprove}
+                        style={({pressed}) => [styles.shareButton, pressed && {opacity: 0.72}]}
+                        testID={`${testIdPrefix}.share`}
+                    >
+                        <CompassIcon
+                            name='globe'
+                            size={14}
+                            color={theme.buttonColor}
+                        />
+                        <FormattedText
+                            id='agents.tool_call.share'
+                            defaultMessage='Share'
+                            style={styles.shareButtonText}
+                        />
+                    </Pressable>
+                    <Pressable
+                        onPress={handleReject}
+                        style={({pressed}) => [styles.keepPrivateButton, pressed && {opacity: 0.72}]}
+                        testID={`${testIdPrefix}.keep_private`}
+                    >
+                        <CompassIcon
+                            name='lock-outline'
+                            size={14}
+                            color={changeOpacity(theme.centerChannelColor, 0.75)}
+                        />
+                        <FormattedText
+                            id='agents.tool_call.keep_private'
+                            defaultMessage='Keep private'
+                            style={styles.keepPrivateButtonText}
+                        />
+                    </Pressable>
+                </View>
+            )}
+        </View>
+    );
+};
+
+export default ToolCard;

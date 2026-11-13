@@ -10,9 +10,11 @@ import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import Footer from './footer';
 import Label from './label';
 
+import type {AvailableScreens} from '@typings/screens/navigation';
+
 type Props = {
     label?: string;
-    value: boolean;
+    value?: boolean;
     placeholder?: string;
     helpText?: string;
     errorText?: string;
@@ -21,6 +23,7 @@ type Props = {
     disabled?: boolean;
     onChange: (value: boolean) => void;
     testID: string;
+    location: AvailableScreens;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -30,7 +33,8 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
             flexDirection: 'row',
             alignItems: 'center',
             paddingHorizontal: 15,
-            height: 40,
+            paddingVertical: 10,
+            minHeight: 40,
         },
         disabled: {
             backgroundColor: changeOpacity(theme.centerChannelColor, 0.1),
@@ -38,6 +42,8 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         placeholderText: {
             color: changeOpacity(theme.centerChannelColor, 0.5),
             fontSize: 15,
+            width: '80%',
+            flexWrap: 'wrap',
         },
         inputSwitch: {
             position: 'absolute',
@@ -62,6 +68,7 @@ function BoolSetting({
     disabled = false,
     onChange,
     testID,
+    location,
 }: Props) {
     const theme = useTheme();
     const style = getStyleSheet(theme);
@@ -80,7 +87,7 @@ function BoolSetting({
                     <View style={style.separator}/>
                 </>
             )}
-            <View style={[inputContainerStyle]}>
+            <View style={inputContainerStyle}>
                 <Text style={style.placeholderText}>
                     {placeholder}
                 </Text>
@@ -89,6 +96,7 @@ function BoolSetting({
                     value={value}
                     style={style.inputSwitch}
                     disabled={disabled}
+                    testID={`${testID}.toggled.${value}.button`}
                 />
             </View>
             <View style={style.separator}/>
@@ -98,6 +106,7 @@ function BoolSetting({
                     disabledText={disabledText}
                     errorText={errorText}
                     helpText={helpText}
+                    location={location}
                 />
             </View>
         </>

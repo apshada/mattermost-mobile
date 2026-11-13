@@ -10,25 +10,24 @@ import {searchFiles} from '@actions/remote/search';
 import FileResults from '@components/files_search/file_results';
 import Loading from '@components/loading';
 import Search from '@components/search';
-import {General} from '@constants';
+import {General, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {popTopScreen} from '@screens/navigation';
+import {navigateBack} from '@screens/navigation';
 import {type FileFilter, FileFilters, filterFileExtensions} from '@utils/file';
 import {changeOpacity, getKeyboardAppearanceFromTheme} from '@utils/theme';
 
 import Header from './header';
 
 import type ChannelModel from '@typings/database/models/servers/channel';
-import type {AvailableScreens} from '@typings/screens/navigation';
 
 const TEST_ID = 'channel_files';
 
 type Props = {
     channel: ChannelModel;
-    componentId: AvailableScreens;
     canDownloadFiles: boolean;
+    enableSecureFilePreview: boolean;
     publicLinkEnabled: boolean;
 }
 
@@ -73,8 +72,8 @@ const emptyFileResults: FileInfo[] = [];
 
 function ChannelFiles({
     channel,
-    componentId,
     canDownloadFiles,
+    enableSecureFilePreview,
     publicLinkEnabled,
 }: Props) {
     const theme = useTheme();
@@ -84,21 +83,17 @@ function ChannelFiles({
     const [filter, setFilter] = useState<FileFilter>(FileFilters.ALL);
     const [loading, setLoading] = useState(true);
     const [term, setTerm] = useState('');
-    const lastSearchRequest = useRef<number>();
+    const lastSearchRequest = useRef<number | undefined>(undefined);
 
     const [fileInfos, setFileInfos] = useState<FileInfo[]>(emptyFileResults);
 
-    const close = useCallback(() => {
-        popTopScreen(componentId);
-    }, [componentId]);
-
-    useAndroidHardwareBackHandler(componentId, close);
+    useAndroidHardwareBackHandler(Screens.CHANNEL_FILES, navigateBack);
 
     const handleSearch = useCallback(async (searchTerm: string, ftr: FileFilter) => {
         const t = Date.now();
         lastSearchRequest.current = t;
         const searchParams = getSearchParams(channel.id, searchTerm, ftr);
-        const {files} = await searchFiles(serverUrl, channel.teamId, searchParams);
+        const {files} = await searchFiles(serverUrl, channel.teamId, searchParams, channel);
         if (lastSearchRequest.current !== t) {
             return;
         }
@@ -135,48 +130,51 @@ function ChannelFiles({
     const fileChannels = useMemo(() => [channel], [channel]);
 
     return (
-        <SafeAreaView
-            edges={edges}
-            style={styles.flex}
-            testID={`${TEST_ID}.screen`}
-        >
-            <View style={styles.searchBar}>
-                <Search
-                    testID={`${TEST_ID}.search_bar`}
-                    placeholder={formatMessage({id: 'search_bar.search', defaultMessage: 'Search'})}
-                    cancelButtonTitle={formatMessage({id: 'mobile.post.cancel', defaultMessage: 'Cancel'})}
-                    placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
-                    onChangeText={onTextChange}
-                    onCancel={clearSearch}
-                    autoCapitalize='none'
-                    keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
-                    value={term}
+        <View style={styles.flex}>
+            <SafeAreaView
+                edges={edges}
+                style={styles.flex}
+                testID={`${TEST_ID}.screen`}
+            >
+                <View style={styles.searchBar}>
+                    <Search
+                        testID={`${TEST_ID}.search_bar`}
+                        placeholder={formatMessage({id: 'search_bar.search', defaultMessage: 'Search'})}
+                        cancelButtonTitle={formatMessage({id: 'mobile.post.cancel', defaultMessage: 'Cancel'})}
+                        placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
+                        onChangeText={onTextChange}
+                        onCancel={clearSearch}
+                        autoCapitalize='none'
+                        keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
+                        value={term}
+                    />
+                </View>
+                <Header
+                    onFilterChanged={handleFilterChange}
+                    selectedFilter={filter}
                 />
-            </View>
-            <Header
-                onFilterChanged={handleFilterChange}
-                selectedFilter={filter}
-            />
-            {loading &&
+                {loading &&
                 <Loading
                     color={theme.buttonBg}
                     size='large'
                     containerStyle={styles.loading}
                 />
-            }
-            {!loading &&
-            <FileResults
-                canDownloadFiles={canDownloadFiles}
-                fileChannels={fileChannels}
-                fileInfos={fileInfos}
-                paddingTop={styles.noPaddingTop}
-                publicLinkEnabled={publicLinkEnabled}
-                searchValue={term}
-                isChannelFiles={true}
-                isFilterEnabled={filter !== FileFilters.ALL}
-            />
-            }
-        </SafeAreaView>
+                }
+                {!loading &&
+                <FileResults
+                    canDownloadFiles={canDownloadFiles}
+                    enableSecureFilePreview={enableSecureFilePreview}
+                    fileChannels={fileChannels}
+                    fileInfos={fileInfos}
+                    paddingTop={styles.noPaddingTop}
+                    publicLinkEnabled={publicLinkEnabled}
+                    searchValue={term}
+                    isChannelFiles={true}
+                    isFilterEnabled={filter !== FileFilters.ALL}
+                />
+                }
+            </SafeAreaView>
+        </View>
     );
 }
 

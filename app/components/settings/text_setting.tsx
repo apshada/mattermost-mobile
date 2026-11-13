@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import React, {useMemo} from 'react';
-import {View, TextInput, Platform, type KeyboardTypeOptions} from 'react-native';
+import {View, TextInput, Platform, type KeyboardTypeOptions, type TextInputProps} from 'react-native';
 
 import {useTheme} from '@context/theme';
 import {
@@ -13,6 +13,8 @@ import {
 
 import Footer from './footer';
 import Label from './label';
+
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 const getStyleSheet = makeStyleSheetFromTheme((theme) => {
     const input = {
@@ -55,11 +57,13 @@ type Props = {
     maxLength?: number;
     optional: boolean;
     onChange: (value: string) => void;
-    value: string;
+    value?: string;
     multiline: boolean;
     keyboardType: KeyboardTypeOptions;
     secureTextEntry: boolean;
+    textContentType?: TextInputProps['textContentType'];
     testID: string;
+    location: AvailableScreens;
 }
 function TextSetting({
     label,
@@ -75,13 +79,15 @@ function TextSetting({
     multiline,
     keyboardType,
     secureTextEntry,
+    textContentType,
     testID,
+    location,
 }: Props) {
     const theme = useTheme();
     const style = getStyleSheet(theme);
 
     const inputContainerStyle = useMemo(() => (disabled ? [style.inputContainer, style.disabled] : style.inputContainer), [style, disabled]);
-    const inputStyle = useMemo(() => (multiline ? style.multiline : style.input), [multiline]);
+    const inputStyle = useMemo(() => (multiline ? style.multiline : style.input), [multiline, style]);
 
     const actualKeyboardType: KeyboardTypeOptions = keyboardType === 'url' ? Platform.select({android: 'default', default: 'url'}) : keyboardType;
 
@@ -112,6 +118,7 @@ function TextSetting({
                         multiline={multiline}
                         keyboardType={actualKeyboardType}
                         secureTextEntry={secureTextEntry}
+                        textContentType={textContentType}
                         keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
                         testID={`${testID}.input`}
                     />
@@ -123,6 +130,7 @@ function TextSetting({
                     disabledText={disabledText}
                     errorText={errorText}
                     helpText={helpText}
+                    location={location}
                 />
             </View>
         </View>

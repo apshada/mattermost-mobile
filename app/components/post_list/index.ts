@@ -6,37 +6,42 @@ import React from 'react';
 import {of as of$} from 'rxjs';
 import {switchMap} from 'rxjs/operators';
 
+import {withServerUrl} from '@context/server';
+import {observeIsChannelAutotranslated} from '@queries/servers/channel';
 import {queryAllCustomEmojis} from '@queries/servers/custom_emoji';
 import {observeSavedPostsByIds, observeIsPostAcknowledgementsEnabled} from '@queries/servers/post';
 import {observeConfigBooleanValue} from '@queries/servers/system';
 import {observeCurrentUser} from '@queries/servers/user';
 import {mapCustomEmojiNames} from '@utils/emoji/helpers';
-import {getTimezone} from '@utils/user';
 
 import PostList from './post_list';
 
 import type {WithDatabaseArgs} from '@typings/database/database';
 import type PostModel from '@typings/database/models/servers/post';
 
-const enhancedWithoutPosts = withObservables([], ({database}: WithDatabaseArgs) => {
-    const currentUser = observeCurrentUser(database);
+type OwnProps = {
+    channelId: string;
+    serverUrl?: string;
+} & WithDatabaseArgs;
+
+const enhancedWithoutPosts = withObservables(['channelId'], ({database, channelId}: OwnProps) => {
     return {
         appsEnabled: observeConfigBooleanValue(database, 'FeatureFlagAppsEnabled'),
-        currentTimezone: currentUser.pipe((switchMap((user) => of$(getTimezone(user?.timezone || null))))),
-        currentUserId: currentUser.pipe((switchMap((user) => of$(user?.id)))),
-        currentUsername: currentUser.pipe((switchMap((user) => of$(user?.username)))),
+        mmBlocksEnabled: observeConfigBooleanValue(database, 'FeatureFlagMmBlocksEnabled'),
+        currentUser: observeCurrentUser(database),
         customEmojiNames: queryAllCustomEmojis(database).observeWithColumns(['name']).pipe(
             switchMap((customEmojis) => of$(mapCustomEmojiNames(customEmojis))),
         ),
         isPostAcknowledgementEnabled: observeIsPostAcknowledgementsEnabled(database),
+        isChannelAutotranslated: observeIsChannelAutotranslated(database, channelId),
     };
 });
 
-const enhanced = withObservables(['posts'], ({database, posts}: {posts: PostModel[]} & WithDatabaseArgs) => {
+const enhanced = withObservables(['posts', 'serverUrl'], ({database, posts, serverUrl}: {posts: PostModel[]; serverUrl?: string} & WithDatabaseArgs) => {
     const postIds = posts.map((p) => p.id);
     return {
-        savedPostIds: observeSavedPostsByIds(database, postIds),
+        savedPostIds: observeSavedPostsByIds(database, postIds, serverUrl),
     };
 });
 
-export default React.memo(withDatabase(enhancedWithoutPosts(enhanced(PostList))));
+export default React.memo(withDatabase(enhancedWithoutPosts(withServerUrl(enhanced(PostList)))));

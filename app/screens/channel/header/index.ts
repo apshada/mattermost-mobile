@@ -4,16 +4,25 @@
 import {withDatabase, withObservables} from '@nozbe/watermelondb/react';
 import React from 'react';
 import {of as of$} from 'rxjs';
-import {combineLatestWith, switchMap} from 'rxjs/operators';
+import {combineLatestWith, distinctUntilChanged, map, switchMap} from 'rxjs/operators';
 
 import {General} from '@constants';
-import {observeChannel, observeChannelInfo} from '@queries/servers/channel';
+import {DISPLAY_LABEL_HEADER} from '@constants/channel_attributes';
+import {queryPlaybookRunsPerChannel} from '@playbooks/database/queries/run';
+import {observeIsPlaybooksEnabled} from '@playbooks/database/queries/version';
+import {observeChannel, observeChannelInfo, observeIsChannelAutotranslated} from '@queries/servers/channel';
+import {observeCanAddBookmarks, queryBookmarks} from '@queries/servers/channel_bookmark';
+import {observeChannelBookmarksEnabled} from '@queries/servers/features';
+import {observeChannelAttributesEnabled, observeResolvedChannelAttributes} from '@queries/servers/properties';
 import {observeConfigBooleanValue, observeCurrentTeamId, observeCurrentUserId} from '@queries/servers/system';
-import {observeUser} from '@queries/servers/user';
+import {observeIsUserLanguageSupportedByAutotranslation, observeUser} from '@queries/servers/user';
+import {selectAttributesForAction, type ResolvedChannelAttribute} from '@utils/channel_attributes';
 import {
     getUserCustomStatus,
     getUserIdFromChannelName,
+    isBot,
     isCustomStatusExpired as checkCustomStatusIsExpired,
+    isDeactivated,
 } from '@utils/user';
 
 import ChannelHeader from './header';
@@ -23,6 +32,8 @@ import type {WithDatabaseArgs} from '@typings/database/database';
 type OwnProps = {
     channelId: string;
 };
+
+const NO_ATTRIBUTES: ResolvedChannelAttribute[] = [];
 
 const enhanced = withObservables(['channelId'], ({channelId, database}: OwnProps & WithDatabaseArgs) => {
     const currentUserId = observeCurrentUserId(database);
@@ -50,6 +61,12 @@ const enhanced = withObservables(['channelId'], ({channelId, database}: OwnProps
         switchMap(([userId, dm]) => of$(userId === dm?.id)),
     );
 
+    const canCallDMUser = currentUserId.pipe(
+        combineLatestWith(dmUser),
+        switchMap(([userId, dm]) => of$(Boolean(dm && dm.id !== userId && !isBot(dm) && !isDeactivated(dm)))),
+        distinctUntilChanged(),
+    );
+
     const customStatus = dmUser.pipe(
         switchMap((dm) => of$(getUserCustomStatus(dm))),
     );
@@ -59,35 +76,101 @@ const enhanced = withObservables(['channelId'], ({channelId, database}: OwnProps
     );
 
     const isCustomStatusEnabled = observeConfigBooleanValue(database, 'EnableCustomUserStatuses');
+    const isPlaybooksEnabled = observeIsPlaybooksEnabled(database);
+    const isChannelAutotranslatedBase = observeIsChannelAutotranslated(database, channelId);
+    const isUserLanguageSupported = observeIsUserLanguageSupportedByAutotranslation(database);
 
-    const searchTerm = channel.pipe(
-        combineLatestWith(dmUser),
-        switchMap(([c, dm]) => {
-            if (c?.type === General.DM_CHANNEL) {
-                return of$(dm ? `@${dm.username}` : '');
-            } else if (c?.type === General.GM_CHANNEL) {
-                return of$(`@${c.name}`);
-            }
-
-            return of$(c?.name);
-        }),
+    const isChannelAutotranslated = isChannelAutotranslatedBase.pipe(
+        combineLatestWith(isUserLanguageSupported),
+        switchMap(([isAutotranslated, isLanguageSupported]) => of$(isAutotranslated && isLanguageSupported)),
+        distinctUntilChanged(),
     );
+
+    // const searchTerm = channel.pipe(
+    //     combineLatestWith(dmUser),
+    //     switchMap(([c, dm]) => {
+    //         if (c?.type === General.DM_CHANNEL) {
+    //             return of$(dm ? `@${dm.username}` : '');
+    //         } else if (c?.type === General.GM_CHANNEL) {
+    //             return of$(`@${c.name}`);
+    //         }
+
+    //         return of$(c?.name);
+    //     }),
+    // );
 
     const displayName = channel.pipe(switchMap((c) => of$(c?.displayName)));
     const memberCount = channelInfo.pipe(
         combineLatestWith(dmUser),
         switchMap(([ci, dm]) => of$(dm ? undefined : ci?.memberCount)));
+    const hasBookmarks = queryBookmarks(database, channelId).observeCount(false).pipe(
+        switchMap((count) => of$(count > 0)),
+        distinctUntilChanged(),
+    );
+
+    const isBookmarksEnabled = observeChannelBookmarksEnabled(database);
+    const canAddBookmarks = observeCanAddBookmarks(database, channelId);
+
+    const activeRuns = isPlaybooksEnabled.pipe(
+        switchMap((enabled) => {
+            if (!enabled) {
+                return of$([]);
+            }
+            return queryPlaybookRunsPerChannel(database, channelId, false).observe();
+        }),
+    );
+    const activeRunId = activeRuns.pipe(
+        switchMap((runs) => {
+            if (runs.length !== 1) {
+                // if there is more than one active run, we directly go to the playbook list
+                // so we don't need the id (since it is more than one)
+                return of$(undefined);
+            }
+            return of$(runs[0].id);
+        }),
+    );
+
+    // The header owns this rather than the chip component so it can tell an empty
+    // set from a populated one: chips displace the member count, so an empty row
+    // must not be mounted at all.
+    const channelAttributes = observeChannelAttributesEnabled(database).pipe(
+        switchMap((enabled) => (enabled ? observeResolvedChannelAttributes(database, channelId) : of$(NO_ATTRIBUTES))),
+        map((resolved) => selectAttributesForAction(resolved, DISPLAY_LABEL_HEADER)),
+    );
 
     return {
+        canAddBookmarks,
+        channelAttributes,
+        canCallDMUser,
         channelType,
+        currentUserId,
         customStatus,
         displayName,
+        hasBookmarks,
+        isBookmarksEnabled,
+        isChannelAutotranslated,
         isCustomStatusEnabled,
         isCustomStatusExpired,
         isOwnDirectMessage,
         memberCount,
-        searchTerm,
         teamId,
+        playbooksActiveRuns: activeRuns.pipe(switchMap((r) => of$(r.length))),
+        hasPlaybookRuns: isPlaybooksEnabled.pipe(
+            switchMap((enabled) => {
+                if (!enabled) {
+                    return of$(false);
+                }
+                return queryPlaybookRunsPerChannel(database, channelId).observeCount(false).pipe(
+                    // eslint-disable-next-line max-nested-callbacks
+                    switchMap((v) => of$(v > 0)),
+                    distinctUntilChanged(),
+                );
+            }),
+        ),
+        isPlaybooksEnabled,
+        activeRunId,
+
+        // searchTerm,
     };
 });
 

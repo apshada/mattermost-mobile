@@ -7,8 +7,8 @@ import {Pressable, Text, View} from 'react-native';
 
 import {switchToChannelById} from '@actions/remote/channel';
 import {fetchProfilesInChannel} from '@actions/remote/user';
-import {dismissIncomingCall} from '@calls/actions/calls';
-import {removeIncomingCall} from '@calls/state';
+import {dismissIncomingCall, joinCallAndOpenCallScreen} from '@calls/actions/calls';
+import {playIncomingCallsRinging, removeIncomingCall} from '@calls/state';
 import {ChannelType, type IncomingCallNotification} from '@calls/types/calls';
 import CompassIcon from '@components/compass_icon';
 import FormattedText from '@components/formatted_text';
@@ -17,6 +17,9 @@ import {CALL_NOTIFICATION_BAR_HEIGHT} from '@constants/view';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import DatabaseManager from '@database/manager';
+import {useAppState} from '@hooks/device';
+import useDidMount from '@hooks/did_mount';
+import {usePreventDoubleTap} from '@hooks/utils';
 import WebsocketManager from '@managers/websocket_manager';
 import {getServerDisplayName} from '@queries/app/servers';
 import ChannelMembershipModel from '@typings/database/models/servers/channel_membership';
@@ -65,6 +68,9 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         borderColor: changeOpacity(theme.buttonColor, 0.16),
         backgroundColor: changeOpacity('#000', 0.12),
     },
+    pressed: {
+        opacity: 0.72,
+    },
     profileContainer: {
         width: 32,
         alignItems: 'center',
@@ -107,7 +113,8 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
 type Props = {
     servers: ServersModel[];
     incomingCall: IncomingCallNotification;
-    currentUserId: string;
+    currentUserId?: string;
+    userStatus?: string;
     teammateNameDisplay: string;
     members?: ChannelMembershipModel[];
     onCallsScreen?: boolean;
@@ -117,23 +124,33 @@ export const CallNotification = ({
     servers,
     incomingCall,
     currentUserId,
+    userStatus,
     teammateNameDisplay,
     members,
     onCallsScreen,
 }: Props) => {
     const intl = useIntl();
     const serverUrl = useServerUrl();
+    const appState = useAppState();
     const theme = useTheme();
     const style = getStyleSheet(theme);
     const [serverName, setServerName] = useState('');
     const moreThanOneServer = servers.length > 1;
 
-    useEffect(() => {
+    useDidMount(() => {
         const channelMembers = members?.filter((m) => m.userId !== currentUserId);
         if (!channelMembers?.length) {
             fetchProfilesInChannel(serverUrl, incomingCall.channelID, currentUserId, undefined, false);
         }
-    }, []);
+    });
+
+    useEffect(() => {
+        playIncomingCallsRinging(incomingCall.serverUrl, incomingCall.callID, userStatus || '');
+
+    // We don't care about `userStatus` changes as long as
+    // it is up to date when the effect runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [incomingCall.serverUrl, incomingCall.callID, appState]);
 
     // We only need to getServerDisplayName once
     useEffect(() => {
@@ -146,18 +163,22 @@ export const CallNotification = ({
         }
     }, [moreThanOneServer, incomingCall.serverUrl]);
 
-    const onContainerPress = useCallback(async () => {
+    const handleContainerPress = useCallback(async () => {
         if (incomingCall.serverUrl !== serverUrl) {
             await DatabaseManager.setActiveServerDatabase(incomingCall.serverUrl);
-            await WebsocketManager.initializeClient(incomingCall.serverUrl);
+            await WebsocketManager.initializeClient(incomingCall.serverUrl, 'Server Switch');
         }
-        switchToChannelById(incomingCall.serverUrl, incomingCall.channelID);
-    }, [incomingCall, serverUrl]);
+
+        await switchToChannelById(incomingCall.serverUrl, incomingCall.channelID);
+
+        await joinCallAndOpenCallScreen(intl, incomingCall.serverUrl, incomingCall.channelID);
+    }, [incomingCall, serverUrl, intl]);
+    const onContainerPress = usePreventDoubleTap(handleContainerPress);
 
     const onDismissPress = useCallback(() => {
         removeIncomingCall(serverUrl, incomingCall.callID, incomingCall.channelID);
         dismissIncomingCall(incomingCall.serverUrl, incomingCall.channelID);
-    }, [incomingCall]);
+    }, [incomingCall, serverUrl]);
 
     let message: React.ReactElement;
     if (incomingCall.type === ChannelType.DM) {
@@ -194,7 +215,8 @@ export const CallNotification = ({
     return (
         <View style={[style.outerContainer, moreThanOneServer && style.outerContainerServerName]}>
             <Pressable
-                style={[style.innerContainer, onCallsScreen && style.innerOnCallsScreen]}
+                testID='calls.call_notification.answer'
+                style={({pressed}) => [style.innerContainer, onCallsScreen && style.innerOnCallsScreen, pressed && style.pressed]}
                 onPress={onContainerPress}
             >
                 <View style={style.profileContainer}>
@@ -213,7 +235,10 @@ export const CallNotification = ({
                         </Text>
                     }
                 </View>
-                <Pressable onPress={onDismissPress}>
+                <Pressable
+                    testID='calls.call_notification.dismiss'
+                    onPress={onDismissPress}
+                >
                     <View style={style.dismissContainer}>
                         <CompassIcon
                             name='close'

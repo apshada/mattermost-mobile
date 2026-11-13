@@ -7,25 +7,13 @@ const fse = require('fs-extra');
 const glob = require('glob');
 const processor = require('jest-stare');
 
-function flatten(items) {
-    return items.reduce((acc, arr) => {
-        return [...acc, ...arr];
-    }, []);
-}
-
-function flatMap(fn) {
-    return (items) => {
-        return flatten(items.map(fn));
-    };
-}
-
-const collectSourceFiles = flatMap((pattern) => {
-    const files = glob.sync(pattern);
+function collectSourceFilesFromPatterns(patterns) {
+    const files = patterns.flatMap((pattern) => glob.sync(pattern));
     if (!files.length) {
-        throw new Error(`Pattern ${pattern} matched no report files`);
+        throw new Error(`No report files matched patterns: ${patterns.join(', ')}`);
     }
     return files;
-});
+}
 
 function collectReportFiles(files) {
     return Promise.all(files.map((filename) => {
@@ -129,13 +117,13 @@ function collectReportSuites(reports) {
     };
 }
 
-function generateJestStareHtmlReport(outputDir, outputFile, inputFilePath) {
+function generateJestStareHtmlReport(outputDir, outputFile, inputFilePath, platform) {
     const suites = fse.readJsonSync(inputFilePath);
-    processor(suites, {log: false, resultDir: outputDir, resultHtml: outputFile, reportHeadline: 'Mobile App E2E with Detox and Jest'});
+    processor(suites, {log: false, resultDir: outputDir, resultHtml: outputFile, reportHeadline: `${platform} Mobile App E2E with Detox and Jest`});
 }
 
 async function mergeJestStareJsonFiles(outputFilePath, inputFiles) {
-    const files = collectSourceFiles(inputFiles);
+    const files = collectSourceFilesFromPatterns(inputFiles);
     const reports = await collectReportFiles(files);
     const suites = collectReportSuites(reports);
     fse.writeJsonSync(outputFilePath, suites);

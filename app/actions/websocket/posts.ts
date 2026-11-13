@@ -4,25 +4,33 @@
 import {DeviceEventEmitter} from 'react-native';
 
 import {storeMyChannelsForTeam, markChannelAsUnread, markChannelAsViewed, updateLastPostAt} from '@actions/local/channel';
-import {addPostAcknowledgement, markPostAsDeleted, removePostAcknowledgement} from '@actions/local/post';
+import {addPostAcknowledgement, markPostAsDeleted, removePostAcknowledgement, updatePostTranslation} from '@actions/local/post';
+import {captureRedactionEpoch} from '@actions/local/redaction';
 import {createThreadFromNewPost, updateThread} from '@actions/local/thread';
+import {getCurrentUserLocale} from '@actions/local/user';
 import {fetchChannelStats, fetchMyChannel} from '@actions/remote/channel';
 import {fetchPostAuthors, fetchPostById} from '@actions/remote/post';
 import {openChannelIfNeeded} from '@actions/remote/preference';
 import {fetchThread} from '@actions/remote/thread';
 import {fetchMissingProfilesByIds} from '@actions/remote/user';
+import {settleStreamedPost} from '@agents/actions/websocket';
+import streamingStore from '@agents/store/streaming_store';
+import {isAgentPost} from '@agents/utils';
 import {ActionType, Events, Screens} from '@constants';
+import {PostTypes} from '@constants/post';
 import DatabaseManager from '@database/manager';
 import {getChannelById, getMyChannel} from '@queries/servers/channel';
-import {getPostById} from '@queries/servers/post';
+import {getPostById, syncPermalinkPreviewsForEditedPost} from '@queries/servers/post';
 import {getCurrentChannelId, getCurrentTeamId, getCurrentUserId} from '@queries/servers/system';
 import {getIsCRTEnabled} from '@queries/servers/thread';
 import EphemeralStore from '@store/ephemeral_store';
-import NavigationStore from '@store/navigation_store';
-import {isTablet} from '@utils/helpers';
-import {isFromWebhook, isSystemMessage, shouldIgnorePost} from '@utils/post';
+import {NavigationStore} from '@store/navigation_store';
+import {hasArrayChanged, isTablet} from '@utils/helpers';
+import {logDebug, logWarning} from '@utils/log';
+import {isFromWebhook, isPostEphemeral, isSystemMessage, restoreEphemeralIdentityFieldsForEdit, shouldIgnorePost} from '@utils/post';
 
 import type {Model} from '@nozbe/watermelondb';
+import type {PostWithRedactionEpoch} from '@typings/database/database';
 import type MyChannelModel from '@typings/database/models/servers/my_channel';
 
 function preparedMyChannelHack(myChannel: MyChannelModel) {
@@ -30,6 +38,24 @@ function preparedMyChannelHack(myChannel: MyChannelModel) {
         myChannel._preparedState = null;
     }
 }
+
+const UNSANITIZED_BROADCAST_POST_TYPES = new Set<string>([PostTypes.BURN_ON_READ, PostTypes.EPHEMERAL, PostTypes.EPHEMERAL_ADD_TO_CHANNEL]);
+
+/**
+ * `posted` and `post_edited` payloads are redacted per recipient by the server's `abac_files`
+ * broadcast hook, so they can be stamped as verified. Burn-on-read is outside that hook and at least
+ * one ephemeral emitter bypasses it; returning undefined leaves those at their stored epoch.
+ *
+ * Call it as soon as the payload is parsed: it vouches for the decision the server made when it
+ * broadcast, and an invalidation flushed while the handler awaits the network would otherwise be
+ * stamped onto that older decision.
+ */
+const captureEpochForBroadcastPost = async (serverUrl: string, post: Post) => {
+    if (UNSANITIZED_BROADCAST_POST_TYPES.has(post.type)) {
+        return undefined;
+    }
+    return captureRedactionEpoch(serverUrl);
+};
 
 export async function handleNewPostEvent(serverUrl: string, msg: WebSocketMessage) {
     const operator = DatabaseManager.serverDatabases[serverUrl]?.operator;
@@ -45,6 +71,7 @@ export async function handleNewPostEvent(serverUrl: string, msg: WebSocketMessag
     } catch {
         return;
     }
+    let redactionVerifiedEpoch = await captureEpochForBroadcastPost(serverUrl, post);
     const currentUserId = await getCurrentUserId(database);
 
     const existing = await getPostById(database, post.pending_post_id) || await getPostById(database, post.id);
@@ -144,14 +171,18 @@ export async function handleNewPostEvent(serverUrl: string, msg: WebSocketMessag
                 models.push(viewedAt);
             }
         } else if (!isCRTEnabled || !post.root_id) {
-            const hasMentions = msg.data.mentions?.includes(currentUserId);
+            const hasMentions = Boolean(msg.data.mentions?.includes(currentUserId));
+            const hasUrgentMention = hasMentions && post.metadata?.priority?.priority === 'urgent';
             preparedMyChannelHack(myChannel);
             const {member: unreadAt} = await markChannelAsUnread(
                 serverUrl,
-                post.channel_id,
-                myChannel.messageCount + 1,
-                myChannel.mentionsCount + (hasMentions ? 1 : 0),
-                myChannel.lastViewedAt,
+                {
+                    channelId: post.channel_id,
+                    messageCount: myChannel.messageCount + 1,
+                    mentionsCount: myChannel.mentionsCount + (hasMentions ? 1 : 0),
+                    urgentMentionCount: myChannel.urgentMentionCount + (hasUrgentMention ? 1 : 0),
+                    lastViewed: myChannel.lastViewedAt,
+                },
                 true,
             );
             if (unreadAt) {
@@ -178,7 +209,15 @@ export async function handleNewPostEvent(serverUrl: string, msg: WebSocketMessag
     }
 
     if (outOfOrderWebsocketEvent?.post) {
-        post = outOfOrderWebsocketEvent.post;
+        const editedPost = outOfOrderWebsocketEvent.post;
+        if (post.type === PostTypes.EPHEMERAL || post.type === PostTypes.EPHEMERAL_ADD_TO_CHANNEL) {
+            post = restoreEphemeralIdentityFieldsForEdit(editedPost, post);
+        } else {
+            post = editedPost;
+        }
+
+        // The stored payload is the edit, so the epoch is the one captured when the edit arrived.
+        redactionVerifiedEpoch = (editedPost as PostWithRedactionEpoch).redaction_verified_epoch;
     }
 
     const postModels = await operator.handlePosts({
@@ -186,11 +225,12 @@ export async function handleNewPostEvent(serverUrl: string, msg: WebSocketMessag
         order: [post.id],
         posts: [post],
         prepareRecordsOnly: true,
+        redactionVerifiedEpoch,
     });
 
     models.push(...postModels);
 
-    operator.batchRecords(models, 'handleNewPostEvent');
+    await operator.batchRecords(models, 'handleNewPostEvent');
 }
 
 export async function handlePostEdited(serverUrl: string, msg: WebSocketMessage) {
@@ -206,16 +246,44 @@ export async function handlePostEdited(serverUrl: string, msg: WebSocketMessage)
     } catch {
         return;
     }
+    const redactionVerifiedEpoch = await captureEpochForBroadcastPost(serverUrl, post);
 
-    const models: Model[] = [];
+    const permalinkModels: Model[] = [];
+    try {
+        const updatedPermalinkPosts = await syncPermalinkPreviewsForEditedPost(database, post);
+        if (updatedPermalinkPosts.length) {
+            permalinkModels.push(...updatedPermalinkPosts);
+        }
+    } catch (error) {
+        logWarning('Failed to sync permalink previews for edited post:', error);
+    }
 
     const oldPost = await getPostById(database, post.id);
     if (!oldPost) {
-        EphemeralStore.addEditingPost(serverUrl, post);
+        EphemeralStore.addEditingPost(serverUrl, {...post, redaction_verified_epoch: redactionVerifiedEpoch} as PostWithRedactionEpoch);
+
+        // If we have permalink updates but no post to process, batch just the permalinks
+        if (permalinkModels.length) {
+            await operator.batchRecords(permalinkModels, 'handlePostEdited - permalink sync only');
+        }
         return;
     }
 
-    if (oldPost.isPinned !== post.is_pinned) {
+    const models: Model[] = [...permalinkModels];
+
+    if (isPostEphemeral(oldPost)) {
+        post = restoreEphemeralIdentityFieldsForEdit(post, {
+            create_at: oldPost.createAt,
+            root_id: oldPost.rootId,
+            user_id: oldPost.userId,
+        });
+    }
+
+    const oldFileIds = oldPost.metadata?.files?.map((f) => f.id).filter((id): id is string => Boolean(id)) || [];
+    const newFileIds = post.file_ids || [];
+    const filesChanged = hasArrayChanged(oldFileIds, newFileIds);
+
+    if (oldPost.isPinned !== post.is_pinned || filesChanged) {
         fetchChannelStats(serverUrl, post.channel_id);
     }
 
@@ -236,10 +304,23 @@ export async function handlePostEdited(serverUrl: string, msg: WebSocketMessage)
         order: [post.id],
         posts: [post],
         prepareRecordsOnly: true,
+        redactionVerifiedEpoch,
     });
     models.push(...postModels);
 
-    operator.batchRecords(models, 'handlePostEdited');
+    await operator.batchRecords(models, 'handlePostEdited');
+
+    // Conversation-backed agent posts are edited before the stream's `end`;
+    // their streaming state is dropped once the post-stream refetch lands.
+    // Websocket handlers aren't awaited, so `end` may already have been
+    // handled before this post was stored; settle a finished stream again.
+    if (isAgentPost(post)) {
+        if (!post.props?.conversation_id) {
+            streamingStore.removePost(serverUrl, post.id);
+        } else if (streamingStore.getStreamingState(serverUrl, post.id) && !streamingStore.isStreaming(serverUrl, post.id)) {
+            settleStreamedPost(serverUrl, post.id);
+        }
+    }
 }
 
 export async function handlePostDeleted(serverUrl: string, msg: WebSocketMessage) {
@@ -259,6 +340,12 @@ export async function handlePostDeleted(serverUrl: string, msg: WebSocketMessage
         const {model: deleteModel} = await markPostAsDeleted(serverUrl, post, true);
         if (deleteModel) {
             models.push(deleteModel);
+        }
+
+        // Check if the deleted post had files to refresh channel stats
+        const hadFiles = (oldPost.metadata?.files?.length || 0) > 0;
+        if (hadFiles) {
+            fetchChannelStats(serverUrl, post.channel_id);
         }
 
         // update thread when a reply is deleted and CRT is enabled
@@ -318,12 +405,23 @@ export async function handlePostUnread(serverUrl: string, msg: WebSocketMessage)
     }
 
     if (!myChannel?.manuallyUnread) {
-        const {channels} = await fetchMyChannel(serverUrl, teamId, channelId, true);
+        const {channels, memberships, error} = await fetchMyChannel(serverUrl, teamId, channelId, true);
         const channel = channels?.[0];
+        const membership = memberships?.[0];
+        if (error || !membership) {
+            logDebug('handlePostUnread', 'skipping unread update, fetchMyChannel failed or membership absent', channelId);
+            return;
+        }
         const postNumber = isCRTEnabled ? channel?.total_msg_count_root : channel?.total_msg_count;
         const delta = postNumber ? postNumber - messages : messages;
 
-        markChannelAsUnread(serverUrl, channelId, delta, mentions, lastViewedAt);
+        markChannelAsUnread(serverUrl, {
+            channelId,
+            messageCount: delta,
+            mentionsCount: mentions,
+            urgentMentionCount: membership.urgent_mention_count ?? 0,
+            lastViewed: lastViewedAt,
+        });
     }
 }
 
@@ -335,7 +433,7 @@ export async function handlePostAcknowledgementAdded(serverUrl: string, msg: Web
         if (!database) {
             return;
         }
-        const currentUserId = getCurrentUserId(database);
+        const currentUserId = await getCurrentUserId(database);
         if (EphemeralStore.isAcknowledgingPost(post_id) && currentUserId === user_id) {
             return;
         }
@@ -355,11 +453,32 @@ export async function handlePostAcknowledgementRemoved(serverUrl: string, msg: W
         if (!database) {
             return;
         }
-        const currentUserId = getCurrentUserId(database);
+        const currentUserId = await getCurrentUserId(database);
         if (EphemeralStore.isUnacknowledgingPost(post_id) && currentUserId === user_id) {
             return;
         }
         await removePostAcknowledgement(serverUrl, post_id, user_id);
+    } catch (error) {
+        // Do nothing
+    }
+}
+
+export async function handlePostTranslationUpdatedEvent(serverUrl: string, msg: WebSocketMessage) {
+    try {
+        const translationData: PostTranslationUpdateData = msg.data;
+        const locale = await getCurrentUserLocale(serverUrl);
+        const myLanguageTranslation = translationData.translations[locale];
+
+        if (!myLanguageTranslation) {
+            return;
+        }
+
+        const translationObject: PostTranslation['object'] = myLanguageTranslation?.translation ? JSON.parse(myLanguageTranslation.translation) : undefined;
+        await updatePostTranslation(serverUrl, translationData.object_id, locale, {
+            object: translationObject,
+            state: myLanguageTranslation.state,
+            source_lang: myLanguageTranslation.src_lang,
+        });
     } catch (error) {
         // Do nothing
     }

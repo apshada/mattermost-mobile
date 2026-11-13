@@ -5,14 +5,14 @@ import React, {useMemo} from 'react';
 import {Animated, type StyleProp, Text, View, type ViewStyle} from 'react-native';
 import {RectButton} from 'react-native-gesture-handler';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
 import {useTheme} from '@context/theme';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 type Props = {
     color: string;
-    icon: string;
+    icon: CompassIconName;
     onPress: () => void;
     positionX: number;
     progress: Animated.AnimatedInterpolation<number>;
@@ -43,8 +43,8 @@ const ServerOption = ({color, icon, onPress, positionX, progress, style, testID,
     const styles = getStyleSheet(theme);
     const containerStyle = useMemo(() => {
         return [styles.container, {backgroundColor: color}, style];
-    }, [color, style]);
-    const centeredStyle = useMemo(() => [styles.container, styles.centered], []);
+    }, [color, style, styles]);
+    const centeredStyle = useMemo(() => [styles.container, styles.centered], [styles]);
 
     const trans = progress.interpolate({
         inputRange: [0, 1],
@@ -55,11 +55,11 @@ const ServerOption = ({color, icon, onPress, positionX, progress, style, testID,
         <Animated.View style={{transform: [{translateX: trans}]}}>
             <View
                 style={containerStyle}
-                testID={testID}
             >
                 <RectButton
                     style={centeredStyle}
                     onPress={onPress}
+                    testID={testID}
                 >
                     <CompassIcon
                         color={theme.buttonColor}

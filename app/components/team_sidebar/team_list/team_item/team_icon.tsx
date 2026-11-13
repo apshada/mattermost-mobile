@@ -3,10 +3,10 @@
 
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {View, Text, type StyleProp, type TextStyle} from 'react-native';
-import FastImage from 'react-native-fast-image';
 
 import {buildAbsoluteUrl} from '@actions/remote/file';
 import {buildTeamIconUrl} from '@actions/remote/team';
+import ExpoImage from '@components/expo_image';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import NetworkManager from '@managers/network_manager';
@@ -124,7 +124,8 @@ export default function TeamIcon({
         );
     } else {
         teamIconContent = (
-            <FastImage
+            <ExpoImage
+                id={`team-icon-${id}-${lastIconUpdate}`}
                 style={styles.image}
                 source={{uri: buildAbsoluteUrl(serverUrl, buildTeamIconUrl(serverUrl, id, lastIconUpdate))}}
                 onError={handleImageError}

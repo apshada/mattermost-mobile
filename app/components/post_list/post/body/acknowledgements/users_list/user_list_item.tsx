@@ -2,26 +2,21 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
-import {useIntl} from 'react-intl';
-import {Keyboard} from 'react-native';
 
 import FormattedRelativeTime from '@components/formatted_relative_time';
 import UserItem from '@components/user_item';
-import {Screens} from '@constants';
 import {useTheme} from '@context/theme';
-import {dismissBottomSheet, openAsBottomSheet} from '@screens/navigation';
+import {dismissBottomSheet} from '@screens/navigation';
+import {openUserProfile} from '@utils/navigation';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 import type UserModel from '@typings/database/models/servers/user';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 export const USER_ROW_HEIGHT = 60;
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
-    container: {
-        paddingLeft: 0,
-        height: USER_ROW_HEIGHT,
-    },
     pictureContainer: {
         alignItems: 'flex-start',
         width: 40,
@@ -34,7 +29,7 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
 
 type Props = {
     channelId: string;
-    location: string;
+    location: AvailableScreens;
     user: UserModel;
     userAcknowledgement: number;
     timezone?: UserTimezone;
@@ -47,20 +42,17 @@ const UserListItem = ({
     user,
     userAcknowledgement,
 }: Props) => {
-    const intl = useIntl();
     const theme = useTheme();
     const style = getStyleSheet(theme);
 
     const handleUserPress = useCallback(async (userProfile: UserProfile) => {
         if (userProfile) {
-            await dismissBottomSheet(Screens.BOTTOM_SHEET);
-            const screen = Screens.USER_PROFILE;
-            const title = intl.formatMessage({id: 'mobile.routes.user_profile', defaultMessage: 'Profile'});
-            const closeButtonId = 'close-user-profile';
-            const props = {closeButtonId, location, userId: userProfile.id, channelId};
-
-            Keyboard.dismiss();
-            openAsBottomSheet({screen, title, theme, closeButtonId, props});
+            await dismissBottomSheet();
+            await openUserProfile({
+                userId: userProfile.id,
+                channelId,
+                location,
+            });
         }
     }, [channelId, location]);
 
@@ -73,7 +65,6 @@ const UserListItem = ({
                     style={style.time}
                 />
             }
-            containerStyle={style.container}
             onUserPress={handleUserPress}
             size={40}
             user={user}

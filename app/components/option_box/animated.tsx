@@ -3,9 +3,10 @@
 
 import React, {useCallback, useEffect, useState} from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
-import Animated, {Easing, interpolate, interpolateColor, runOnJS, useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
+import Animated, {Easing, interpolate, interpolateColor, useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
+import {scheduleOnRN} from 'react-native-worklets';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
 import {useTheme} from '@context/theme';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
@@ -15,9 +16,9 @@ import {OPTIONS_HEIGHT} from '.';
 type OptionBoxProps = {
     animatedBackgroundColor: string;
     animatedColor: string;
-    animatedIconName: string;
+    animatedIconName: CompassIconName;
     animatedText: string;
-    iconName: string;
+    iconName: CompassIconName;
     onAnimationEnd?: () => void;
     onPress: () => void;
     testID?: string;
@@ -61,7 +62,7 @@ const AnimatedOptionBox = ({
         animate.value = withTiming(1, {duration: 150, easing: Easing.out(Easing.linear)});
         setActivated(true);
         onPress();
-    }, [onPress]);
+    }, [animate, onPress]);
 
     const backgroundStyle = useAnimatedStyle(() => ({
         backgroundColor: interpolateColor(
@@ -95,7 +96,7 @@ const AnimatedOptionBox = ({
         const callback = () => {
             'worklet';
             if (onAnimationEnd) {
-                runOnJS(onAnimationEnd)();
+                scheduleOnRN(onAnimationEnd);
             }
         };
 
@@ -111,7 +112,7 @@ const AnimatedOptionBox = ({
                 clearTimeout(t);
             }
         };
-    }, [activated, animate.value, onAnimationEnd]);
+    }, [activated, animate, onAnimationEnd]);
 
     return (
         <AnimatedPressable

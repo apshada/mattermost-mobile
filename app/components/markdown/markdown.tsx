@@ -1,22 +1,31 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
+/* eslint-disable max-lines */
 
 import {useManagedConfig} from '@mattermost/react-native-emm';
 import {Parser, Node} from 'commonmark';
 import Renderer from 'commonmark-react-renderer';
-import React, {type ReactElement, useMemo, useRef} from 'react';
-import {Dimensions, type GestureResponderEvent, Platform, type StyleProp, StyleSheet, Text, type TextStyle, View, type ViewStyle} from 'react-native';
+import React, {type ReactElement, useCallback, useMemo, useRef} from 'react';
+import {Dimensions, type StyleProp, StyleSheet, Text, type TextStyle, View, type ViewStyle} from 'react-native';
+import performance from 'react-native-performance';
 
 import CompassIcon from '@components/compass_icon';
+import EditedIndicator from '@components/edited_indicator';
 import Emoji from '@components/emoji';
 import FormattedText from '@components/formatted_text';
-import {computeTextStyle} from '@utils/markdown';
-import {blendColors, changeOpacity, concatStyles, makeStyleSheetFromTheme} from '@utils/theme';
+import {useServerUrl} from '@context/server';
+import {logError} from '@utils/log';
+import {computeTextStyle, getMarkdownBlockStyles, getMarkdownTextStyles} from '@utils/markdown';
+import PostListPerformance from '@utils/performance/post_list_performance';
+import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
+import {typography} from '@utils/typography';
 import {getScheme} from '@utils/url';
 
 import AtMention from './at_mention';
-import ChannelMention, {type ChannelMentions} from './channel_mention';
+import ChannelMention from './channel_mention';
 import Hashtag from './hashtag';
+import InlineActionButton from './inline_action_button';
+import InlineEntityLink, {type InlineEntityType} from './inline_entity_link';
 import MarkdownBlockQuote from './markdown_block_quote';
 import MarkdownCodeBlock from './markdown_code_block';
 import MarkdownImage from './markdown_image';
@@ -29,18 +38,19 @@ import MarkdownTable from './markdown_table';
 import MarkdownTableCell, {type MarkdownTableCellProps} from './markdown_table_cell';
 import MarkdownTableImage from './markdown_table_image';
 import MarkdownTableRow, {type MarkdownTableRowProps} from './markdown_table_row';
-import {addListItemIndices, combineTextNodes, highlightMentions, highlightWithoutNotification, highlightSearchPatterns, parseTaskLists, pullOutImages} from './transform';
+import {addListItemIndices, autolinkPhoneNumbers, combineTextNodes, highlightMentions, highlightWithoutNotification, highlightSearchPatterns, parseTaskLists, processInlineEntities, pullOutImages} from './transform';
 
+import type {ChannelMentions} from './channel_mention/channel_mention';
 import type {
     MarkdownAtMentionRenderer, MarkdownBaseRenderer, MarkdownBlockStyles, MarkdownChannelMentionRenderer,
     MarkdownEmojiRenderer, MarkdownImageRenderer, MarkdownLatexRenderer, MarkdownTextStyles, SearchPattern, UserMentionKey, HighlightWithoutNotificationKey,
 } from '@typings/global/markdown';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
-type MarkdownProps = {
-    autolinkedUrlSchemes?: string[];
+export type MarkdownProps = {
+    allowInlineActions?: boolean;
     baseTextStyle: StyleProp<TextStyle>;
     baseParagraphStyle?: StyleProp<TextStyle>;
-    blockStyles?: MarkdownBlockStyles;
     channelId?: string;
     channelMentions?: ChannelMentions;
     disableAtChannelMentionHighlight?: boolean;
@@ -50,6 +60,7 @@ type MarkdownProps = {
     disableCodeBlock?: boolean;
     disableGallery?: boolean;
     disableHashtags?: boolean;
+    disableLinks?: boolean;
     disableHeading?: boolean;
     disableQuotes?: boolean;
     disableTables?: boolean;
@@ -62,41 +73,34 @@ type MarkdownProps = {
     isSearchResult?: boolean;
     layoutHeight?: number;
     layoutWidth?: number;
-    location: string;
+    location: AvailableScreens;
     maxNodes: number;
     mentionKeys?: UserMentionKey[];
     minimumHashtagLength?: number;
-    onPostPress?: (event: GestureResponderEvent) => void;
     postId?: string;
     searchPatterns?: SearchPattern[];
-    textStyles?: MarkdownTextStyles;
     theme: Theme;
     value?: string;
     onLinkLongPress?: (url?: string) => void;
+
+    /** Encrypted mm_blocks_actions cookie from post.props; used with allowInlineActions for mmaction:// links. */
+    mmBlocksActionCookie?: string;
+
+    /** integration_format for postActionWithCookie when mmBlocksActionCookie is set. */
+    integrationFormat?: PostActionIntegrationFormat;
     isUnsafeLinksPost?: boolean;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme) => {
-    // Android has trouble giving text transparency depending on how it's nested,
-    // so we calculate the resulting colour manually
-    const editedOpacity = Platform.select({
-        ios: 0.3,
-        android: 1.0,
-    });
-    const editedColor = Platform.select({
-        ios: theme.centerChannelColor,
-        android: blendColors(theme.centerChannelBg, theme.centerChannelColor, 0.3),
-    });
-
     return {
         block: {
             alignItems: 'flex-start',
             flexDirection: 'row',
             flexWrap: 'wrap',
         },
-        editedIndicatorText: {
-            color: editedColor,
-            opacity: editedOpacity,
+        errorMessage: {
+            color: theme.errorTextColor,
+            ...typography('Body', 100),
         },
         maxNodesWarning: {
             color: theme.errorTextColor,
@@ -126,27 +130,118 @@ const getExtraPropsForNode = (node: any) => {
         extraProps.isChecked = node.isChecked;
     }
 
+    if (node.type === 'inline_entity_link') {
+        extraProps.entityType = node.entityType;
+        extraProps.entityId = node.entityId;
+        extraProps.linkUrl = node.linkUrl;
+    }
+
     return extraProps;
 };
 
+const renderHashtagWithStyles = (
+    context: string[],
+    hashtag: string,
+    textStyles: MarkdownTextStyles,
+    baseTextStyle: StyleProp<TextStyle>,
+) => {
+    const computedStyle = computeTextStyle(textStyles, baseTextStyle, context);
+    const linkStyle = [computedStyle, textStyles.link];
+    const headingIndex = context.findIndex((c) => c.includes('heading'));
+    if (headingIndex > -1) {
+        linkStyle.push(textStyles[context[headingIndex]]);
+    }
+
+    return (
+        <Hashtag
+            hashtag={hashtag}
+            linkStyle={linkStyle}
+        />
+    );
+};
+
 const Markdown = ({
-    autolinkedUrlSchemes, baseTextStyle, blockStyles, channelId, channelMentions,
-    disableAtChannelMentionHighlight, disableAtMentions, disableBlockQuote, disableChannelLink,
-    disableCodeBlock, disableGallery, disableHashtags, disableHeading, disableTables,
-    enableInlineLatex, enableLatex, maxNodes,
-    imagesMetadata, isEdited, isReplyPost, isSearchResult, layoutHeight, layoutWidth,
-    location, mentionKeys, highlightKeys, minimumHashtagLength = 3, onPostPress, postId, searchPatterns,
-    textStyles = {}, theme, value = '', baseParagraphStyle, onLinkLongPress, isUnsafeLinksPost,
+    allowInlineActions,
+    baseTextStyle,
+    channelId,
+    channelMentions,
+    disableAtChannelMentionHighlight,
+    disableAtMentions,
+    disableBlockQuote,
+    disableChannelLink,
+    disableCodeBlock,
+    disableGallery,
+    disableHashtags,
+    disableLinks,
+    disableHeading,
+    disableTables,
+    enableInlineLatex,
+    enableLatex,
+    maxNodes,
+    imagesMetadata,
+    isEdited,
+    isReplyPost,
+    isSearchResult,
+    layoutHeight,
+    layoutWidth,
+    location,
+    mentionKeys,
+    highlightKeys,
+    minimumHashtagLength = 3,
+    postId,
+    searchPatterns,
+    theme,
+    value = '',
+    baseParagraphStyle,
+    onLinkLongPress,
+    mmBlocksActionCookie,
+    integrationFormat,
+    isUnsafeLinksPost,
 }: MarkdownProps) => {
     const style = getStyleSheet(theme);
+    const blockStyles = useMemo<MarkdownBlockStyles>(() => getMarkdownBlockStyles(theme), [theme]);
+    const textStyles = useMemo<MarkdownTextStyles>(() => getMarkdownTextStyles(theme), [theme]);
     const managedConfig = useManagedConfig<ManagedConfig>();
+    const serverUrl = useServerUrl();
 
-    const urlFilter = (url: string) => {
-        const scheme = getScheme(url);
-        return !scheme || autolinkedUrlSchemes?.indexOf(scheme) !== -1;
-    };
+    const renderText = useCallback(({context, literal}: MarkdownBaseRenderer) => {
+        const selectable = (managedConfig.copyAndPasteProtection !== 'true') && context.includes('table_cell');
+        if (context.indexOf('image') !== -1) {
+            // If this text is displayed, it will be styled by the image component
+            return (
+                <Text
+                    testID='markdown_text'
+                    selectable={selectable}
+                >
+                    {literal}
+                </Text>
+            );
+        }
 
-    const renderAtMention = ({context, mentionName}: MarkdownAtMentionRenderer) => {
+        // Construct the text style based off of the parents of this node since RN's inheritance is limited
+        let styles: StyleProp<TextStyle>;
+        if (disableHeading) {
+            styles = computeTextStyle(textStyles, baseTextStyle, context.filter((c) => !c.startsWith('heading')));
+        } else {
+            styles = computeTextStyle(textStyles, baseTextStyle, context);
+        }
+
+        if (context.includes('mention_highlight')) {
+            styles = [styles, {backgroundColor: theme.mentionHighlightBg}];
+        }
+
+        return (
+            <Text
+                testID='markdown_text'
+                style={styles}
+                selectable={selectable}
+            >
+                {literal}
+            </Text>
+        );
+    }, [baseTextStyle, disableHeading, managedConfig.copyAndPasteProtection, textStyles, theme.mentionHighlightBg]);
+
+    const renderAtMention = useCallback(({context, mentionName}: MarkdownAtMentionRenderer) => {
         if (disableAtMentions) {
             return renderText({context, literal: `@${mentionName}`});
         }
@@ -162,13 +257,13 @@ const Markdown = ({
                 isSearchResult={isSearchResult}
                 location={location}
                 mentionName={mentionName}
-                onPostPress={onPostPress}
                 mentionKeys={mentionKeys}
+                theme={theme}
             />
         );
-    };
+    }, [baseTextStyle, channelId, disableAtChannelMentionHighlight, disableAtMentions, isSearchResult, location, mentionKeys, renderText, style.atMentionOpacity, textStyles, theme]);
 
-    const renderBlockQuote = ({children, ...otherProps}: any) => {
+    const renderBlockQuote = useCallback(({children, ...otherProps}: any) => {
         if (disableBlockQuote) {
             return null;
         }
@@ -181,13 +276,13 @@ const Markdown = ({
                 {children}
             </MarkdownBlockQuote>
         );
-    };
+    }, [disableBlockQuote, blockStyles?.quoteBlockIcon]);
 
     const renderBreak = () => {
         return <Text testID='markdown_break'>{'\n'}</Text>;
     };
 
-    const renderChannelLink = ({context, channelName}: MarkdownChannelMentionRenderer) => {
+    const renderChannelLink = useCallback(({context, channelName}: MarkdownChannelMentionRenderer) => {
         if (disableChannelLink || isUnsafeLinksPost) {
             return renderText({context, literal: `~${channelName}`});
         }
@@ -200,9 +295,9 @@ const Markdown = ({
                 channelMentions={channelMentions}
             />
         );
-    };
+    }, [baseTextStyle, channelMentions, disableChannelLink, isUnsafeLinksPost, renderText, textStyles]);
 
-    const renderCheckbox = ({isChecked}: {isChecked: boolean}) => {
+    const renderCheckbox = useCallback(({isChecked}: {isChecked: boolean}) => {
         return (
             <Text testID='markdown_checkbox'>
                 <CompassIcon
@@ -213,9 +308,22 @@ const Markdown = ({
                 {' '}
             </Text>
         );
-    };
+    }, [theme.centerChannelColor]);
 
-    const renderCodeBlock = (props: any) => {
+    const renderInlineEntityLink = useCallback(({entityType, entityId, linkUrl}: {entityType: InlineEntityType; entityId: string; linkUrl?: string}) => {
+        if (!entityType || !entityId) {
+            return null;
+        }
+        return (
+            <InlineEntityLink
+                entityType={entityType}
+                entityId={entityId}
+                linkUrl={linkUrl}
+            />
+        );
+    }, []);
+
+    const renderCodeBlock = useCallback((props: any) => {
         if (disableCodeBlock) {
             return null;
         }
@@ -224,10 +332,12 @@ const Markdown = ({
         const content = props.literal.replace(/\n$/, '');
 
         if (enableLatex && !isUnsafeLinksPost && props.language === 'latex') {
+            const baseFontSize = StyleSheet.flatten(baseTextStyle)?.fontSize;
             return (
                 <MarkdownLatexCodeBlock
                     content={content}
                     theme={theme}
+                    baseFontSize={baseFontSize}
                 />
             );
         }
@@ -237,11 +347,12 @@ const Markdown = ({
                 content={content}
                 language={props.language}
                 textStyle={textStyles.codeBlock}
+                theme={theme}
             />
         );
-    };
+    }, [disableCodeBlock, enableLatex, isUnsafeLinksPost, baseTextStyle, textStyles.codeBlock, theme]);
 
-    const renderCodeSpan = ({context, literal}: MarkdownBaseRenderer) => {
+    const renderCodeSpan = useCallback(({context, literal}: MarkdownBaseRenderer) => {
         const {code} = textStyles;
         return (
             <Text
@@ -251,31 +362,22 @@ const Markdown = ({
                 {literal}
             </Text>
         );
-    };
+    }, [baseTextStyle, textStyles]);
 
-    const renderEditedIndicator = ({context}: {context: string[]}) => {
-        let spacer = '';
-        const styles = [baseTextStyle, style.editedIndicatorText];
-
-        if (context[0] === 'paragraph') {
-            spacer = ' ';
-        }
-
+    const renderEditedIndicator = useCallback(({context}: {context: string[]}) => {
         return (
-            <Text
-                style={styles}
+            <EditedIndicator
+                baseTextStyle={baseTextStyle}
+                theme={theme}
+                context={context}
+                iconSize={14}
+                checkHeadings={true}
                 testID='edited_indicator'
-            >
-                {spacer}
-                <FormattedText
-                    id='post_message_view.edited'
-                    defaultMessage='(edited)'
-                />
-            </Text>
+            />
         );
-    };
+    }, [baseTextStyle, theme]);
 
-    const renderEmoji = ({context, emojiName, literal}: MarkdownEmojiRenderer) => {
+    const renderEmoji = useCallback(({context, emojiName, literal}: MarkdownEmojiRenderer) => {
         return (
             <Emoji
                 emojiName={emojiName}
@@ -284,28 +386,17 @@ const Markdown = ({
                 textStyle={computeTextStyle(textStyles, baseTextStyle, context)}
             />
         );
-    };
+    }, [baseTextStyle, textStyles]);
 
-    const renderHashtag = ({context, hashtag}: {context: string[]; hashtag: string}) => {
+    const renderHashtag = useCallback(({context, hashtag}: {context: string[]; hashtag: string}) => {
         if (disableHashtags || isUnsafeLinksPost) {
             return renderText({context, literal: `#${hashtag}`});
         }
 
-        const linkStyle = [textStyles.link];
-        const headingIndex = context.findIndex((c) => c.includes('heading'));
-        if (headingIndex > -1) {
-            linkStyle.push(textStyles[context[headingIndex]]);
-        }
+        return renderHashtagWithStyles(context, hashtag, textStyles, baseTextStyle);
+    }, [baseTextStyle, disableHashtags, isUnsafeLinksPost, renderText, textStyles]);
 
-        return (
-            <Hashtag
-                hashtag={hashtag}
-                linkStyle={linkStyle}
-            />
-        );
-    };
-
-    const renderHeading = ({children, level}: {children: ReactElement; level: string}) => {
+    const renderHeading = useCallback(({children, level}: {children: ReactElement; level: string}) => {
         if (disableHeading) {
             return (
                 <Text
@@ -325,7 +416,7 @@ const Markdown = ({
 
         return (
             <View
-                style={containerStyle}
+                style={containerStyle as StyleProp<ViewStyle>}
                 testID='markdown_heading'
             >
                 <Text style={textStyle}>
@@ -333,9 +424,9 @@ const Markdown = ({
                 </Text>
             </View>
         );
-    };
+    }, [disableHeading, style.block, style.bold, textStyles]);
 
-    const renderHtml = (props: any) => {
+    const renderHtml = useCallback((props: any) => {
         let rendered = renderText(props);
 
         if (props.isBlock) {
@@ -350,29 +441,34 @@ const Markdown = ({
         }
 
         return rendered;
-    };
+    }, [renderText, style.block]);
 
-    const renderImage = ({linkDestination, context, src, size}: MarkdownImageRenderer) => {
+    const renderImage = useCallback(({linkDestination, context, src, size}: MarkdownImageRenderer) => {
         if (!imagesMetadata || isUnsafeLinksPost) {
             return null;
         }
+
+        const isInsideLink = context.indexOf('link') !== -1;
+
+        const disableInteraction = (disableGallery ?? Boolean(!location)) || isInsideLink;
 
         if (context.indexOf('table') !== -1) {
             // We have enough problems rendering images as is, so just render a link inside of a table
             return (
                 <MarkdownTableImage
-                    disabled={disableGallery ?? Boolean(!location)}
+                    disabled={disableInteraction}
                     imagesMetadata={imagesMetadata}
                     location={location}
                     postId={postId!}
                     source={src}
+                    theme={theme}
                 />
             );
         }
 
         return (
             <MarkdownImage
-                disabled={disableGallery ?? Boolean(!location)}
+                disabled={disableInteraction}
                 errorTextStyle={[computeTextStyle(textStyles, baseTextStyle, context), textStyles.error]}
                 layoutHeight={layoutHeight}
                 layoutWidth={layoutWidth}
@@ -383,30 +479,51 @@ const Markdown = ({
                 postId={postId!}
                 source={src}
                 sourceSize={size}
+                theme={theme}
             />
         );
-    };
+    }, [baseTextStyle, disableGallery, imagesMetadata, isReplyPost, isUnsafeLinksPost, layoutHeight, layoutWidth, location, postId, textStyles, theme]);
 
-    const renderLatexInline = ({context, latexCode}: MarkdownLatexRenderer) => {
+    const renderLatexInline = useCallback(({context, latexCode}: MarkdownLatexRenderer) => {
         if (!enableInlineLatex || isUnsafeLinksPost) {
             return renderText({context, literal: `$${latexCode}$`});
         }
 
+        const baseFontSize = StyleSheet.flatten(baseTextStyle)?.fontSize;
         return (
             <Text>
                 <MarkdownLatexInline
                     content={latexCode}
                     maxMathWidth={Dimensions.get('window').width * 0.75}
                     theme={theme}
+                    baseFontSize={baseFontSize}
                 />
             </Text>
         );
-    };
+    }, [baseTextStyle, enableInlineLatex, isUnsafeLinksPost, renderText, theme]);
 
-    const renderLink = ({children, href}: {children: ReactElement; href: string}) => {
-        if (isUnsafeLinksPost) {
+    const renderLink = useCallback(({children, href}: {children: ReactElement; href: string}) => {
+        if (isUnsafeLinksPost || disableLinks) {
             return renderText({context: [], literal: href});
         }
+
+        if (getScheme(href) === 'mmaction') {
+            if (allowInlineActions && postId) {
+                return (
+                    <InlineActionButton
+                        href={href}
+                        postId={postId}
+                        baseTextStyle={baseTextStyle}
+                        mmBlocksActionCookie={mmBlocksActionCookie}
+                        integrationFormat={integrationFormat}
+                    >
+                        {children}
+                    </InlineActionButton>
+                );
+            }
+            return <Text>{children}</Text>;
+        }
+
         return (
             <MarkdownLink
                 href={href}
@@ -415,9 +532,9 @@ const Markdown = ({
                 {children}
             </MarkdownLink>
         );
-    };
+    }, [allowInlineActions, baseTextStyle, disableLinks, integrationFormat, isUnsafeLinksPost, mmBlocksActionCookie, onLinkLongPress, postId, renderText]);
 
-    const renderList = ({children, start, tight, type}: any) => {
+    const renderList = useCallback(({children, start, tight, type}: any) => {
         return (
             <MarkdownList
                 ordered={type !== 'bullet'}
@@ -427,9 +544,9 @@ const Markdown = ({
                 {children}
             </MarkdownList>
         );
-    };
+    }, []);
 
-    const renderListItem = ({children, context, ...otherProps}: any) => {
+    const renderListItem = useCallback(({children, context, ...otherProps}: any) => {
         const level = context.filter((type: string) => type === 'list').length;
 
         return (
@@ -441,9 +558,9 @@ const Markdown = ({
                 {children}
             </MarkdownListItem>
         );
-    };
+    }, [baseTextStyle]);
 
-    const renderParagraph = ({children, first}: {children: ReactElement[]; first: boolean}) => {
+    const renderParagraph = useCallback(({children, first}: {children: ReactElement[]; first: boolean}) => {
         if (!children || children.length === 0) {
             return null;
         }
@@ -463,88 +580,52 @@ const Markdown = ({
                 </Text>
             </View>
         );
-    };
+    }, [baseParagraphStyle, blockStyles?.adjacentParagraph, style.block]);
 
-    const renderTable = ({children, numColumns}: {children: ReactElement; numColumns: number}) => {
+    const renderTable = useCallback(({children, numColumns}: {children: ReactElement; numColumns: number}) => {
         if (disableTables) {
             return null;
         }
         return (
-            <MarkdownTable
-                numColumns={numColumns}
-                theme={theme}
-            >
+            <MarkdownTable numColumns={numColumns}>
                 {children}
             </MarkdownTable>
         );
-    };
+    }, [disableTables]);
 
-    const renderTableCell = (args: MarkdownTableCellProps) => {
-        return <MarkdownTableCell {...args}/>;
-    };
-
-    const renderTableRow = (args: MarkdownTableRowProps) => {
-        return <MarkdownTableRow {...args}/>;
-    };
-
-    const renderText = ({context, literal}: MarkdownBaseRenderer) => {
-        const selectable = (managedConfig.copyAndPasteProtection !== 'true') && context.includes('table_cell');
-        if (context.indexOf('image') !== -1) {
-            // If this text is displayed, it will be styled by the image component
-            return (
-                <Text
-                    testID='markdown_text'
-                    selectable={selectable}
-                >
-                    {literal}
-                </Text>
-            );
-        }
-
-        // Construct the text style based off of the parents of this node since RN's inheritance is limited
-        let styles;
-        if (disableHeading) {
-            styles = computeTextStyle(textStyles, baseTextStyle, context.filter((c) => !c.startsWith('heading')));
-        } else {
-            styles = computeTextStyle(textStyles, baseTextStyle, context);
-        }
-
-        if (context.includes('mention_highlight')) {
-            styles = concatStyles(styles, {backgroundColor: theme.mentionHighlightBg});
-        }
-
+    const renderTableCell = useCallback((args: MarkdownTableCellProps) => {
         return (
-            <Text
-                testID='markdown_text'
-                style={styles}
-                selectable={selectable}
-            >
-                {literal}
-            </Text>
+            <MarkdownTableCell {...args}/>
         );
-    };
+    }, []);
 
-    const renderThematicBreak = () => {
+    const renderTableRow = useCallback((args: MarkdownTableRowProps) => {
+        return (
+            <MarkdownTableRow {...args}/>
+        );
+    }, []);
+
+    const renderThematicBreak = useCallback(() => {
         return (
             <View
                 style={blockStyles?.horizontalRule}
                 testID='markdown_thematic_break'
             />
         );
-    };
+    }, [blockStyles?.horizontalRule]);
 
-    const renderMaxNodesWarning = () => {
+    const renderMaxNodesWarning = useCallback(() => {
         const styles = [baseTextStyle, style.maxNodesWarning];
 
         return (
             <FormattedText
                 id='markdown.max_nodes.error'
-                defaultMessage='This message is too long to by shown fully on a mobile device. Please view it on desktop or contact an admin to increase this limit.'
+                defaultMessage='This message is too long to be shown fully on a mobile device. Please view it on desktop or contact an admin to increase this limit.'
                 style={styles}
                 testID='max_nodes_warning'
             />
         );
-    };
+    }, [baseTextStyle, style.maxNodesWarning]);
 
     const createRenderer = () => {
         const renderers: any = {
@@ -585,6 +666,7 @@ const Markdown = ({
             search_highlight: Renderer.forwardChildren,
             highlight_without_notification: Renderer.forwardChildren,
             checkbox: renderCheckbox,
+            inline_entity_link: renderInlineEntityLink,
 
             editedIndicator: renderEditedIndicator,
             maxNodesWarning: renderMaxNodesWarning,
@@ -599,36 +681,127 @@ const Markdown = ({
         });
     };
 
-    const parser = useRef(new Parser({urlFilter, minimumHashtagLength})).current;
-    const renderer = useMemo(createRenderer, [theme, textStyles]);
-    let ast = parser.parse(value.toString());
+    // Pattern suggested in https://react.dev/reference/react/useRef#avoiding-recreating-the-ref-contents
+    const parserRef = useRef<Parser | null>(null);
+    if (parserRef.current === null) {
+        parserRef.current = new Parser({minimumHashtagLength});
+    }
+    const parser = parserRef.current;
 
-    ast = combineTextNodes(ast);
-    ast = addListItemIndices(ast);
-    ast = pullOutImages(ast);
-    ast = parseTaskLists(ast);
-    if (mentionKeys) {
-        ast = highlightMentions(ast, mentionKeys);
-    }
-    if (highlightKeys) {
-        ast = highlightWithoutNotification(ast, highlightKeys);
-    }
-    if (searchPatterns) {
-        ast = highlightSearchPatterns(ast, searchPatterns);
-    }
-    if (isEdited) {
-        const editIndicatorNode = new Node('edited_indicator');
-        if (ast.lastChild && ['heading', 'paragraph'].includes(ast.lastChild.type)) {
-            ast.appendChild(editIndicatorNode);
-        } else {
-            const node = new Node('paragraph');
-            node.appendChild(editIndicatorNode);
+    const renderer = useMemo(createRenderer, [
+        renderText,
+        renderCodeSpan,
+        renderLink,
+        renderImage,
+        renderAtMention,
+        renderChannelLink,
+        renderEmoji,
+        renderHashtag,
+        renderLatexInline,
+        renderParagraph,
+        renderHeading,
+        renderCodeBlock,
+        renderBlockQuote,
+        renderList,
+        renderListItem,
+        renderThematicBreak,
+        renderHtml,
+        renderTable,
+        renderTableRow,
+        renderTableCell,
+        renderCheckbox,
+        renderInlineEntityLink,
+        renderEditedIndicator,
+        renderMaxNodesWarning,
+        maxNodes,
+    ]);
 
-            ast.appendChild(node);
+    const errorLogged = useRef(false);
+
+    const output = useMemo(() => {
+        const startTime = performance.now();
+        let ast;
+        try {
+            const markdownValue = value.toString().replace(/\uFFFC/g, '');
+            ast = parser.parse(markdownValue);
+
+            ast = combineTextNodes(ast);
+            ast = addListItemIndices(ast);
+            ast = pullOutImages(ast);
+            ast = parseTaskLists(ast);
+            if (!disableLinks && !isUnsafeLinksPost) {
+                ast = autolinkPhoneNumbers(ast);
+            }
+            ast = processInlineEntities(ast, serverUrl);
+            if (mentionKeys) {
+                ast = highlightMentions(ast, mentionKeys);
+            }
+            if (highlightKeys) {
+                ast = highlightWithoutNotification(ast, highlightKeys);
+            }
+            if (searchPatterns) {
+                ast = highlightSearchPatterns(ast, searchPatterns);
+            }
+
+            if (isEdited) {
+                const editIndicatorNode = new Node('edited_indicator');
+                if (ast.lastChild && ['heading', 'paragraph'].includes(ast.lastChild.type)) {
+                    ast.lastChild.appendChild(editIndicatorNode);
+                } else {
+                    const node = new Node('paragraph');
+                    node.appendChild(editIndicatorNode);
+
+                    ast.appendChild(node);
+                }
+            }
+        } catch (e) {
+            if (!errorLogged.current) {
+                logError('An error occurred while parsing Markdown', e);
+
+                errorLogged.current = true;
+            }
+
+            return (
+                <FormattedText
+                    id='markdown.parse_error'
+                    defaultMessage='An error occurred while parsing this text'
+                    style={style.errorMessage}
+                />
+            );
         }
-    }
 
-    return renderer.render(ast) as JSX.Element;
+        try {
+            const generatedOutput = renderer.render(ast);
+            const duration = performance.now() - startTime;
+
+            // Track markdown parsing performance
+            if (channelId && postId && value) {
+                PostListPerformance.trackMarkdownParse(channelId, undefined, postId, value.length, duration);
+            }
+
+            return generatedOutput;
+        } catch (e) {
+            if (!errorLogged.current) {
+                logError('An error occurred while rendering Markdown', e);
+
+                errorLogged.current = true;
+            }
+
+            return (
+                <FormattedText
+                    id='markdown.render_error'
+                    defaultMessage='An error occurred while rendering this text'
+                    style={style.errorMessage}
+                />
+            );
+        }
+    }, [channelId, disableLinks, highlightKeys, isEdited, isUnsafeLinksPost, mentionKeys, parser, postId, renderer, searchPatterns, serverUrl, style.errorMessage, value]);
+
+    return output;
+};
+
+export const testExports = {
+    renderHashtagWithStyles,
 };
 
 export default Markdown;

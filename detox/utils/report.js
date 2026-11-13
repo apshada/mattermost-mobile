@@ -10,9 +10,9 @@ const xml2js = require('xml2js');
 const {ARTIFACTS_DIR} = require('./constants');
 
 const MAX_FAILED_TITLES = 5;
+const TEST_STATUS_PRIORITY = {failed: 3, passed: 2, pending: 1, skipped: 1, todo: 1};
 
-function convertXmlToJson(xml) {
-    const platform = process.env.IOS === 'true' ? 'ios' : 'android';
+function convertXmlToJson(xml, platform) {
     const jsonFile = `${ARTIFACTS_DIR}/${platform}-junit.json`;
 
     // Convert XML to JSON
@@ -27,7 +27,6 @@ function convertXmlToJson(xml) {
         // Save JSON in a file
         fse.writeFileSync(jsonFile, json);
     });
-
     return readJsonFromFile(jsonFile);
 }
 
@@ -40,6 +39,13 @@ function getAllTests(testSuites) {
     let duration = 0;
     let firstTimestamp;
     let incrementalDuration = 0;
+
+    // Guard against empty reports (e.g. all test suites failed to launch)
+    if (!testSuites || !testSuites.testsuite) {
+        const now = new Date().toISOString();
+        return {suites, tests, skipped, failures, errors, duration, start: now, end: now};
+    }
+
     testSuites.testsuite.forEach((testSuite) => {
         skipped += parseInt(testSuite.skipped[0], 10);
         failures += parseInt(testSuite.failures[0], 10);
@@ -104,6 +110,62 @@ function getAllTests(testSuites) {
     };
 }
 
+function getAllTestsFromJestResults(report) {
+    const suites = new Set();
+    const testsByKey = new Map();
+    let startTime;
+
+    for (const suite of report?.testResults || []) {
+        suites.add(suite.testFilePath);
+        if (typeof suite.perfStats?.start === 'number') {
+            startTime = startTime === undefined ? suite.perfStats.start : Math.min(startTime, suite.perfStats.start);
+        }
+
+        for (const test of suite.testResults || []) {
+            const name = test.fullName || test.title;
+            const key = `${suite.testFilePath}\0${name}`;
+            const previous = testsByKey.get(key);
+            if (!previous || (TEST_STATUS_PRIORITY[test.status] || 0) > (TEST_STATUS_PRIORITY[previous.status] || 0)) {
+                testsByKey.set(key, test);
+            }
+        }
+    }
+
+    const tests = [];
+    let skipped = 0;
+    let failures = 0;
+    let duration = 0;
+    for (const test of testsByKey.values()) {
+        const testDuration = test.duration || 0;
+        duration += testDuration;
+        if (test.status === 'failed') {
+            failures++;
+        } else if (test.status !== 'passed') {
+            skipped++;
+        }
+        tests.push({
+            name: test.fullName || test.title,
+            time: testDuration,
+            failure: test.status === 'failed' ? test.failureMessages : '',
+            skipped: test.status === 'passed' || test.status === 'failed' ? '' : test.status,
+        });
+    }
+
+    const startDate = new Date(startTime || Date.now());
+    const start = startDate.toISOString();
+    startDate.setTime(startDate.getTime() + duration);
+    return {
+        suites: [...suites],
+        tests,
+        skipped,
+        failures,
+        errors: 0,
+        duration,
+        start,
+        end: startDate.toISOString(),
+    };
+}
+
 function generateStats(allTests) {
     const suites = allTests.suites.length;
     const tests = allTests.tests.length;
@@ -113,8 +175,8 @@ function generateStats(allTests) {
     const duration = allTests.duration;
     const start = allTests.start;
     const end = allTests.end;
-    const passes = tests - (failures + errors);
-    const passPercent = tests > 0 ? (passes / tests) * 100 : 0;
+    const passes = tests - (failures + errors + skipped);
+    const passPercent = tests > 0 ? ((passes / tests) * 100).toFixed(2) : 0;
 
     return {
         suites,
@@ -134,7 +196,7 @@ function generateStatsFieldValue(stats, failedFullTitles) {
     let statsFieldValue = `
 | Key | Value |
 |:---|:---|
-| Passing Rate | ${stats.passPercent.toFixed(2)}% |
+| Passing Rate | ${stats.passPercent}% |
 | Duration | ${(stats.duration / (60 * 1000)).toFixed(4)} mins |
 | Suites | ${stats.suites} |
 | Tests | ${stats.tests} |
@@ -281,7 +343,7 @@ function generateTestReport(summary, isUploadedToS3, reportLink, environment, te
         };
     }
 
-    let quickSummary = `${stats.passPercent.toFixed(2)}% (${stats.passes}/${stats.tests}) in ${stats.suites} suites`;
+    let quickSummary = `${stats.passPercent}% (${stats.passes}/${stats.tests}) in ${stats.suites} suites`;
     if (isUploadedToS3) {
         quickSummary = `[${quickSummary}](${reportLink})`;
     }
@@ -308,15 +370,15 @@ function generateTestReport(summary, isUploadedToS3, reportLink, environment, te
 function generateTitle() {
     const {
         BRANCH,
-        BUILD_AWS_S3_BUCKET,
-        BUILD_ID,
         COMMIT_HASH,
+        DETOX_AWS_S3_BUCKET,
         IOS,
         PULL_REQUEST,
         RELEASE_BUILD_NUMBER,
         RELEASE_DATE,
         RELEASE_VERSION,
         TYPE,
+        REPORT_PATH,
     } = process.env;
 
     const platform = IOS === 'true' ? 'iOS' : 'Android';
@@ -324,7 +386,7 @@ function generateTitle() {
     const appExtension = IOS === 'true' ? 'ipa' : 'apk';
     const appFileName = `Mattermost_Beta.${appExtension}`;
     const appBuildType = 'mattermost-mobile-beta';
-    const s3Folder = `${platform.toLocaleLowerCase()}/${BUILD_ID}-${COMMIT_HASH}-${BRANCH}`.replace(/\./g, '-');
+    const s3Folder = `${platform.toLocaleLowerCase()}/${REPORT_PATH}`;
     const appFilePath = IOS === 'true' ? 'Mattermost-simulator-x86_64.app.zip' : 'android/app/build/outputs/apk/release/app-release.apk';
     let buildLink = '';
     let releaseDate = '';
@@ -332,7 +394,7 @@ function generateTitle() {
 
     switch (TYPE) {
         case 'PR':
-            buildLink = ` with [${lane}:${COMMIT_HASH}](https://${BUILD_AWS_S3_BUCKET}.s3.amazonaws.com/${s3Folder}/${appFilePath})`;
+            buildLink = ` with [${lane}:${COMMIT_HASH}](https://${DETOX_AWS_S3_BUCKET}.s3.amazonaws.com/${s3Folder}/${appFilePath})`;
             title = `${platform} E2E for Pull Request Build: [${BRANCH}](${PULL_REQUEST})${buildLink}`;
             break;
         case 'RELEASE':
@@ -347,7 +409,8 @@ function generateTitle() {
             title = `${platform} E2E for Release Build${buildLink}${releaseDate}`;
             break;
         case 'MAIN':
-            title = `${platform} E2E for Main Nightly Build (Prod tests)${buildLink}`;
+        case 'MASTER': // Matterwick still dispatches MASTER for main-branch pushes
+            title = `${platform} E2E for Main Build (Prod tests)${buildLink}`;
             break;
         default:
             title = `${platform} E2E for Build${buildLink}`;
@@ -377,6 +440,7 @@ module.exports = {
     generateShortSummary,
     generateTestReport,
     getAllTests,
+    getAllTestsFromJestResults,
     removeOldGeneratedReports,
     sendReport,
     readJsonFromFile,

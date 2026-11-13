@@ -3,7 +3,7 @@
 
 import {DeviceEventEmitter} from 'react-native';
 
-import {General, Navigation as NavigationConstants, Preferences, Screens} from '@constants';
+import {Events, General, Navigation as NavigationConstants, Preferences, Screens} from '@constants';
 import {SYSTEM_IDENTIFIERS} from '@constants/database';
 import DatabaseManager from '@database/manager';
 import {getTeammateNameDisplaySetting} from '@helpers/api/preference';
@@ -12,17 +12,22 @@ import PushNotifications from '@init/push_notifications';
 import {
     prepareDeleteChannel, prepareMyChannelsForTeam, queryAllMyChannel,
     getMyChannel, getChannelById, queryUsersOnChannel, queryUserChannelsByTypes,
+    prepareAllMyChannels,
+    queryMyChannelsWithAutotranslation,
 } from '@queries/servers/channel';
+import {prepareDeletePost, queryPostsInChannel, queryPostsInThread} from '@queries/servers/post';
 import {queryDisplayNamePreferences} from '@queries/servers/preference';
 import {prepareCommonSystemValues, type PrepareCommonSystemValuesArgs, getCommonSystemValues, getCurrentTeamId, setCurrentChannelId, getCurrentUserId, getConfig, getLicense} from '@queries/servers/system';
 import {addChannelToTeamHistory, addTeamToTeamHistory, getTeamById, removeChannelFromTeamHistory} from '@queries/servers/team';
 import {getCurrentUser, queryUsersById} from '@queries/servers/user';
-import {dismissAllModalsAndPopToRoot, dismissAllModalsAndPopToScreen} from '@screens/navigation';
+import {navigateToRoot, dismissAllRoutesAndPopToScreen} from '@screens/navigation';
 import EphemeralStore from '@store/ephemeral_store';
+import {NavigationStore} from '@store/navigation_store';
 import {isTablet} from '@utils/helpers';
-import {logError, logInfo} from '@utils/log';
+import {logDebug, logError, logInfo} from '@utils/log';
 import {displayGroupMessageName, displayUsername, getUserIdFromChannelName} from '@utils/user';
 
+import type ServerDataOperator from '@database/operator/server_data_operator';
 import type {Model} from '@nozbe/watermelondb';
 import type ChannelModel from '@typings/database/models/servers/channel';
 import type UserModel from '@typings/database/models/servers/user';
@@ -86,14 +91,19 @@ export async function switchToChannel(serverUrl: string, channelId: string, team
                 }
 
                 if (isTabletDevice) {
-                    dismissAllModalsAndPopToRoot();
+                    if (NavigationStore.isScreenInStack(Screens.HOME)) {
+                        await navigateToRoot();
+                    }
                     DeviceEventEmitter.emit(NavigationConstants.NAVIGATION_HOME, Screens.CHANNEL);
                 } else {
-                    dismissAllModalsAndPopToScreen(Screens.CHANNEL, '', undefined, {topBar: {visible: false}});
+                    await NavigationStore.waitUntilScreenHasLoaded(Screens.CHANNEL_LIST);
+                    await dismissAllRoutesAndPopToScreen(Screens.CHANNEL);
                 }
 
-                logInfo('channel switch to', channel?.displayName, channelId, (Date.now() - dt), 'ms');
+                logInfo('channel switch to', channelId, 'type', channel?.type, (Date.now() - dt), 'ms');
             }
+        } else {
+            logDebug('failed to navigate to channel because there was no membership, channel id: ', channelId);
         }
 
         return {models};
@@ -114,7 +124,7 @@ export async function removeCurrentUserFromChannel(serverUrl: string, channelId:
             if (!channel) {
                 throw new Error('myChannel present but no channel on the database');
             }
-            models.push(...await prepareDeleteChannel(channel));
+            models.push(...await prepareDeleteChannel(serverUrl, channel));
             let teamId = channel.teamId;
             if (teamId) {
                 teamId = await getCurrentTeamId(database);
@@ -139,15 +149,17 @@ export async function setChannelDeleteAt(serverUrl: string, channelId: string, d
         const {operator, database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const channel = await getChannelById(database, channelId);
         if (!channel) {
-            return;
+            return {error: `channel with id ${channelId} not found`};
         }
 
         const model = channel.prepareUpdate((c) => {
             c.deleteAt = deleteAt;
         });
         await operator.batchRecords([model], 'setChannelDeleteAt');
+        return {models: [model]};
     } catch (error) {
         logError('FAILED TO BATCH CHANGES FOR CHANNEL DELETE AT', error);
+        return {error};
     }
 }
 
@@ -171,6 +183,7 @@ export async function markChannelAsViewed(serverUrl: string, channelId: string, 
         member.prepareUpdate((m) => {
             m.isUnread = false;
             m.mentionsCount = 0;
+            m.urgentMentionCount = 0;
             m.manuallyUnread = false;
             if (!onlyCounts) {
                 m.viewedAt = member.lastViewedAt;
@@ -189,7 +202,16 @@ export async function markChannelAsViewed(serverUrl: string, channelId: string, 
     }
 }
 
-export async function markChannelAsUnread(serverUrl: string, channelId: string, messageCount: number, mentionsCount: number, lastViewed: number, prepareRecordsOnly = false) {
+type MarkChannelAsUnreadArgs = {
+    channelId: string;
+    messageCount: number;
+    mentionsCount: number;
+    urgentMentionCount: number;
+    lastViewed: number;
+};
+
+export async function markChannelAsUnread(serverUrl: string, args: MarkChannelAsUnreadArgs, prepareRecordsOnly = false) {
+    const {channelId, lastViewed, messageCount, mentionsCount, urgentMentionCount} = args;
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const member = await getMyChannel(database, channelId);
@@ -202,6 +224,7 @@ export async function markChannelAsUnread(serverUrl: string, channelId: string, 
             m.lastViewedAt = lastViewed - 1;
             m.messageCount = messageCount;
             m.mentionsCount = mentionsCount;
+            m.urgentMentionCount = urgentMentionCount;
             m.manuallyUnread = true;
             m.isUnread = true;
         });
@@ -235,6 +258,43 @@ export async function resetMessageCount(serverUrl: string, channelId: string) {
     }
 }
 
+const resolveAndFlattenModels = async (
+    operator: ServerDataOperator,
+    modelPromises: Array<Promise<Model[]>>,
+    description: string,
+    prepareRecordsOnly: boolean,
+) => {
+    try {
+        const models = await Promise.all(modelPromises);
+        const flattenedModels = models.flat();
+
+        if (prepareRecordsOnly || !flattenedModels.length) {
+            return {models: flattenedModels, error: undefined};
+        }
+
+        await operator.batchRecords(flattenedModels, description);
+        return {models: flattenedModels, error: undefined};
+    } catch (error) {
+        logError('Failed resolveAndFlattenModels', {error, description});
+        return {models: [], error};
+    }
+};
+
+export async function storeAllMyChannels(serverUrl: string, channels: Channel[], memberships: ChannelMembership[], isCRTEnabled: boolean, prepareRecordsOnly = false) {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const cs = new Set(channels.map((c) => c.id));
+        const modelPromises: Array<Promise<Model[]>> = [
+            ...await prepareAllMyChannels(operator, channels, memberships.filter((m) => cs.has(m.channel_id)), isCRTEnabled),
+        ];
+
+        return resolveAndFlattenModels(operator, modelPromises, 'storeAllMyChannels', prepareRecordsOnly);
+    } catch (error) {
+        logError('Failed storeAllMyChannels', {error, serverUrl, channelsCount: channels.length});
+        return {error, models: undefined};
+    }
+}
+
 export async function storeMyChannelsForTeam(serverUrl: string, teamId: string, channels: Channel[], memberships: ChannelMembership[], prepareRecordsOnly = false, isCRTEnabled?: boolean) {
     try {
         const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
@@ -242,25 +302,10 @@ export async function storeMyChannelsForTeam(serverUrl: string, teamId: string, 
             ...await prepareMyChannelsForTeam(operator, teamId, channels, memberships, isCRTEnabled),
         ];
 
-        const models = await Promise.all(modelPromises);
-        if (!models.length) {
-            return {models: []};
-        }
-
-        const flattenedModels = models.flat();
-
-        if (prepareRecordsOnly) {
-            return {models: flattenedModels};
-        }
-
-        if (flattenedModels.length) {
-            await operator.batchRecords(flattenedModels, 'storeMyChannelsForTeam');
-        }
-
-        return {models: flattenedModels};
+        return resolveAndFlattenModels(operator, modelPromises, 'storeMyChannelsForTeam', prepareRecordsOnly);
     } catch (error) {
         logError('Failed storeMyChannelsForTeam', error);
-        return {error};
+        return {error, models: undefined};
     }
 }
 
@@ -268,12 +313,18 @@ export async function updateMyChannelFromWebsocket(serverUrl: string, channelMem
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const member = await getMyChannel(database, channelMember.channel_id);
+
+        if (member && Boolean(member.autotranslationDisabled) !== Boolean(channelMember.autotranslation_disabled)) {
+            await deletePostsForChannel(serverUrl, channelMember.channel_id);
+        }
+
         if (member) {
             member.prepareUpdate((m) => {
                 m.roles = channelMember.roles;
+                m.autotranslationDisabled = channelMember.autotranslation_disabled ?? false;
             });
             if (!prepareRecordsOnly) {
-                operator.batchRecords([member], 'updateMyChannelFromWebsocket');
+                await operator.batchRecords([member], 'updateMyChannelFromWebsocket');
             }
         }
         return {model: member};
@@ -293,7 +344,7 @@ export async function updateChannelInfoFromChannel(serverUrl: string, channel: C
         }],
         prepareRecordsOnly: true});
         if (!prepareRecordsOnly) {
-            operator.batchRecords(newInfo, 'updateChannelInfoFromChannel');
+            await operator.batchRecords(newInfo, 'updateChannelInfoFromChannel');
         }
         return {model: newInfo};
     } catch (error) {
@@ -457,3 +508,83 @@ export const updateDmGmDisplayName = async (serverUrl: string) => {
         return {error};
     }
 };
+
+export async function deletePostsForChannel(serverUrl: string, channelId: string, prepareRecordsOnly = false): Promise<{models: Model[]; error?: unknown}> {
+    try {
+        const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const channel = await getChannelById(database, channelId);
+
+        if (!channel) {
+            return {models: []};
+        }
+
+        // Note: intervals are cleared even when there are no posts left. A PostsInChannel
+        // row that no longer contains any post still wins postsInChannel[0] and hides the
+        // channel, so returning early here would leave the channel blank.
+        const posts = await channel.posts.fetch();
+
+        const preparedPostsPromises = posts.map((post) => prepareDeletePost(post));
+        const preparedPostsArrays = await Promise.all(preparedPostsPromises);
+        const preparedModels: Model[] = preparedPostsArrays.flat();
+
+        const postsInChannel = await queryPostsInChannel(database, channelId).fetch();
+        for (const postRange of postsInChannel) {
+            preparedModels.push(postRange.prepareDestroyPermanently());
+        }
+
+        const threadPromises = posts.filter((post) => post.rootId === '').map((post) => {
+            return queryPostsInThread(database, post.id).fetch();
+        });
+
+        const threadRanges = (await Promise.all(threadPromises)).flat();
+        for (const threadRange of threadRanges) {
+            const preparedThreadRange = threadRange.prepareDestroyPermanently();
+            preparedModels.push(preparedThreadRange);
+        }
+
+        const myChannel = await getMyChannel(database, channelId);
+        if (myChannel) {
+            myChannel.prepareUpdate((v) => {
+                v.lastFetchedAt = 0;
+            });
+            preparedModels.push(myChannel);
+        }
+
+        if (preparedModels.length && !prepareRecordsOnly) {
+            await operator.batchRecords(preparedModels, 'deletePostsForChannel');
+            DeviceEventEmitter.emit(Events.POST_DELETED_FOR_CHANNEL, {serverUrl, channelId, teamId: channel.teamId});
+        }
+
+        return {error: false, models: preparedModels};
+    } catch (error) {
+        logError('Failed deletePostsForChannel', error);
+        return {error, models: []};
+    }
+}
+
+export async function deletePostsForChannelsWithAutotranslation(serverUrl: string, prepareRecordsOnly = false) {
+    try {
+        const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const myChannels = await queryMyChannelsWithAutotranslation(database).fetch();
+
+        const deleteResults = await Promise.all(
+            myChannels.map((myChannel) => deletePostsForChannel(serverUrl, myChannel.id, prepareRecordsOnly)),
+        );
+
+        const allModels: Model[] = [];
+        for (const result of deleteResults) {
+            if (result.models) {
+                allModels.push(...result.models);
+            }
+        }
+
+        if (allModels.length && !prepareRecordsOnly) {
+            await operator.batchRecords(allModels, 'deletePostsForChannelsWithAutotranslation');
+        }
+
+        return {error: undefined, models: allModels};
+    } catch (error) {
+        logError('Failed deletePostsForChannelsWithAutotranslation', error);
+        return {error, models: []};
+    }
+}

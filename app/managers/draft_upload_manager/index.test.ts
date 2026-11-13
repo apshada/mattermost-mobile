@@ -7,14 +7,15 @@ import {addFilesToDraft} from '@actions/local/draft';
 import {PROGRESS_TIME_TO_STORE} from '@constants/files';
 import DatabaseManager from '@database/manager';
 import {getDraft} from '@queries/servers/drafts';
+import RenderPermissionsStore from '@store/render_permissions_store';
 import TestHelper from '@test/test_helper';
 
-import {exportedForTesting} from '.';
+import {exportedForTesting} from './index';
 
 import type ServerDataOperator from '@database/operator/server_data_operator';
 import type {ClientResponse, ProgressPromise} from '@mattermost/react-native-network-client';
 
-const {DraftUploadManager} = exportedForTesting;
+const {DraftEditPostUploadManagerSingleton} = exportedForTesting;
 
 const url = 'baseHandler.test.com';
 const mockClient = TestHelper.createClient();
@@ -79,7 +80,7 @@ describe('draft upload manager', () => {
     });
 
     it('File is uploaded and stored', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const fileClientId = 'clientId';
@@ -103,7 +104,7 @@ describe('draft upload manager', () => {
     });
 
     it('Progress is not stored on progress, but stored on fail', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const fileClientId = 'clientId';
@@ -158,9 +159,9 @@ describe('draft upload manager', () => {
         const spyNow = jest.spyOn(Date, 'now');
         spyNow.mockImplementation(() => now);
         AppState.currentState = 'active';
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
 
-        const progressFunc: {[fileUrl: string] : ((fractionCompleted: number, bytesRead?: number | null | undefined) => void)} = {};
+        const progressFunc: {[fileUrl: string]: ((fractionCompleted: number, bytesRead?: number | null | undefined) => void)} = {};
         const cancel = jest.fn();
 
         let promise: ProgressPromise<ClientResponse>;
@@ -255,7 +256,7 @@ describe('draft upload manager', () => {
     });
 
     it('Error on complete: Received wrong response code', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const fileClientId = 'clientId';
@@ -280,7 +281,7 @@ describe('draft upload manager', () => {
     });
 
     it('Error on complete: Received no data', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const clientId = 'clientId';
@@ -304,7 +305,7 @@ describe('draft upload manager', () => {
     });
 
     it('Error on complete: Received no file info', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const clientId = 'clientId';
@@ -328,7 +329,7 @@ describe('draft upload manager', () => {
     });
 
     it('Progress handler', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const clientId = 'clientId';
@@ -336,14 +337,14 @@ describe('draft upload manager', () => {
 
         const nullProgressHandler = jest.fn();
         let cancelProgressHandler = manager.registerProgressHandler(clientId, nullProgressHandler);
-        expect(cancelProgressHandler).toBeNull();
+        expect(cancelProgressHandler).toBeUndefined();
 
         manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
         expect(manager.isUploading(clientId)).toBe(true);
 
         const progressHandler = jest.fn();
         cancelProgressHandler = manager.registerProgressHandler(clientId, progressHandler);
-        expect(cancelProgressHandler).not.toBeNull();
+        expect(cancelProgressHandler).not.toBeUndefined();
 
         let bytesRead = 200;
         uploadMocks.progressFunc!(0.1, bytesRead);
@@ -369,7 +370,7 @@ describe('draft upload manager', () => {
     });
 
     it('Error handler: normal error', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const clientId = 'clientId';
@@ -377,21 +378,21 @@ describe('draft upload manager', () => {
 
         const nullErrorHandler = jest.fn();
         let cancelErrorHandler = manager.registerProgressHandler(clientId, nullErrorHandler);
-        expect(cancelErrorHandler).toBeNull();
+        expect(cancelErrorHandler).toBeUndefined();
 
         manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
         expect(manager.isUploading(clientId)).toBe(true);
 
         const errorHandler = jest.fn();
         cancelErrorHandler = manager.registerErrorHandler(clientId, errorHandler);
-        expect(cancelErrorHandler).not.toBeNull();
+        expect(cancelErrorHandler).not.toBeUndefined();
 
         uploadMocks.rejectPromise!({message: 'error'});
 
         // Wait for other promises (on complete write) to finish
         await new Promise(process.nextTick);
 
-        expect(errorHandler).toHaveBeenCalledWith('error');
+        expect(errorHandler).toHaveBeenCalledWith('error', undefined);
 
         // Make sure cancelling after error does not create any problem.
         cancelErrorHandler!();
@@ -405,7 +406,7 @@ describe('draft upload manager', () => {
     });
 
     it('Error handler: complete error', async () => {
-        const manager = new DraftUploadManager();
+        const manager = new DraftEditPostUploadManagerSingleton();
         const uploadMocks = mockUpload();
 
         const clientId = 'clientId';
@@ -413,14 +414,14 @@ describe('draft upload manager', () => {
 
         const nullErrorHandler = jest.fn();
         let cancelErrorHandler = manager.registerProgressHandler(clientId, nullErrorHandler);
-        expect(cancelErrorHandler).toBeNull();
+        expect(cancelErrorHandler).toBeUndefined();
 
         manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
         expect(manager.isUploading(clientId)).toBe(true);
 
         const errorHandler = jest.fn();
         cancelErrorHandler = manager.registerErrorHandler(clientId, errorHandler);
-        expect(cancelErrorHandler).not.toBeNull();
+        expect(cancelErrorHandler).not.toBeUndefined();
 
         uploadMocks.resolvePromise!({ok: true, code: 500});
 
@@ -436,5 +437,76 @@ describe('draft upload manager', () => {
         expect(manager.isUploading(clientId)).toBe(false);
         expect(errorHandler).toHaveBeenCalledTimes(1);
         expect(nullErrorHandler).not.toHaveBeenCalled();
+    });
+
+    it('should pass the server error id to error handlers when the upload is refused', async () => {
+        // HTTP errors resolve rather than reject, so the id is only available on complete.
+        const manager = new DraftEditPostUploadManagerSingleton();
+        const uploadMocks = mockUpload();
+
+        const clientId = 'clientId';
+        await addFilesToDraft(url, channelId, rootId, [{clientId, localPath: 'path1'} as FileInfo]);
+        manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
+
+        const errorHandler = jest.fn();
+        manager.registerErrorHandler(clientId, errorHandler);
+
+        uploadMocks.resolvePromise!({ok: false, code: 403, data: {id: 'api.file.upload_file.abac_denied.app_error', message: 'denied'}});
+        await new Promise(process.nextTick);
+
+        expect(errorHandler).toHaveBeenCalledWith('denied', 'api.file.upload_file.abac_denied.app_error');
+    });
+
+    it('should revalidate the channel upload decision when the server refuses the upload by policy', async () => {
+        // The stored decision allowed an upload the server refused.
+        const expireEntry = jest.spyOn(RenderPermissionsStore, 'expireEntry');
+        const manager = new DraftEditPostUploadManagerSingleton();
+        const uploadMocks = mockUpload();
+
+        const clientId = 'clientId';
+        await addFilesToDraft(url, channelId, rootId, [{clientId, localPath: 'path1'} as FileInfo]);
+        manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
+
+        uploadMocks.resolvePromise!({ok: false, code: 403, data: {id: 'api.file.upload_file.abac_denied.app_error', message: 'denied'}});
+        await new Promise(process.nextTick);
+
+        expect(expireEntry).toHaveBeenCalledTimes(1);
+        expect(expireEntry).toHaveBeenCalledWith(url, channelId);
+        expireEntry.mockRestore();
+    });
+
+    it('should keep the channel upload decision when the upload fails for another reason', async () => {
+        const expireEntry = jest.spyOn(RenderPermissionsStore, 'expireEntry');
+        const manager = new DraftEditPostUploadManagerSingleton();
+        const uploadMocks = mockUpload();
+
+        const clientId = 'clientId';
+        await addFilesToDraft(url, channelId, rootId, [{clientId, localPath: 'path1'} as FileInfo]);
+        manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0);
+
+        uploadMocks.resolvePromise!({ok: false, code: 413, data: {id: 'api.file.upload_file.too_large.app_error', message: 'too large'}});
+        await new Promise(process.nextTick);
+
+        expect(expireEntry).not.toHaveBeenCalled();
+        expireEntry.mockRestore();
+    });
+
+    it('should call updateFileCallback when isEditPost is true', async () => {
+        const manager = new DraftEditPostUploadManagerSingleton();
+        const uploadMocks = mockUpload();
+        const updateFileCallback = jest.fn();
+        const updateDraftFileSpy = jest.spyOn(require('@actions/local/draft'), 'updateDraftFile');
+        const clientId = 'clientId';
+
+        manager.prepareUpload(url, {clientId, localPath: 'path1'} as FileInfo, channelId, rootId, 0, true, updateFileCallback);
+        expect(manager.isUploading(clientId)).toBe(true);
+        uploadMocks.rejectPromise!('Upload failed');
+        await new Promise(process.nextTick);
+
+        expect(updateFileCallback).toHaveBeenCalledWith({clientId, localPath: 'path1', failed: true});
+        expect(updateDraftFileSpy).not.toHaveBeenCalled();
+        expect(manager.isUploading(clientId)).toBe(false);
+
+        updateDraftFileSpy.mockRestore();
     });
 });

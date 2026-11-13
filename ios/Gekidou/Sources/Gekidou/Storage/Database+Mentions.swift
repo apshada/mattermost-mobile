@@ -22,7 +22,7 @@ extension Database {
         INNER JOIN Channel c INDEXED BY sqlite_autoindex_Channel_1 ON c.id=my.id \
         WHERE c.delete_at = 0 AND mys.notify_props NOT LIKE '%"mark_unread":"mention"%'
         """
-        let mentions = try? db.prepare(stmtString).scalar() as? Double
+        let mentions = try? db.scalar(stmtString) as? Double
         return Int(mentions ?? 0)
     }
 
@@ -35,7 +35,7 @@ extension Database {
         INNER JOIN MyChannelSettings mys ON mys.id=c.id \
         WHERE c.delete_at = 0 AND mys.notify_props NOT LIKE '%"mark_unread":"mention"%'
         """
-        let mentions = try? db.prepare(stmtString).scalar() as? Double
+        let mentions = try? db.scalar(stmtString) as? Double
         return Int(mentions ?? 0)
     }
     
@@ -43,15 +43,21 @@ extension Database {
         if let db = try? getDatabaseForServer(serverUrl) {
             let idCol = Expression<String>("id")
             let mentionsCol = Expression<Int>("mentions_count")
+            let urgentMentionsCol = Expression<Int>("urgent_mention_count")
             let msgCol = Expression<Int>("message_count")
             let isUnreadCol = Expression<Bool>("is_unread")
             if hasMyChannel(db, channelId: channelId) {
+                var updateSetters: [Setter] = [
+                    mentionsCol <- 0,
+                    msgCol <- 0,
+                    isUnreadCol <- false,
+                ]
+                if hasMyChannelUrgentMentionCountColumn(db) {
+                    updateSetters.append(urgentMentionsCol <- 0)
+                }
                 let updateQuery = myChannelTable
                     .where(idCol == channelId)
-                    .update(mentionsCol <- 0,
-                            msgCol <- 0,
-                            isUnreadCol <- false
-                    )
+                    .update(updateSetters)
                 let _ = try db.run(updateQuery)
             }
         }

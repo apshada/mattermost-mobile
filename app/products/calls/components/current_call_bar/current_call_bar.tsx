@@ -3,15 +3,18 @@
 
 import React, {useCallback, useMemo} from 'react';
 import {useIntl} from 'react-intl';
-import {View, Text, Pressable, Platform} from 'react-native';
+import {View, Text, Pressable} from 'react-native';
+import Animated from 'react-native-reanimated';
 
-import {leaveCall, muteMyself, unmuteMyself} from '@calls/actions';
+import {muteMyself, unmuteMyself} from '@calls/actions';
+import {leaveCallConfirmation} from '@calls/actions/calls';
 import {recordingAlert, recordingWillBePostedAlert, recordingErrorAlert} from '@calls/alerts';
 import CallAvatar from '@calls/components/call_avatar';
-import CallDuration from '@calls/components/call_duration';
+import {CallStatusText} from '@calls/components/call_status_text';
+import {CallStatusTimer} from '@calls/components/call_status_timer';
 import MessageBar from '@calls/components/message_bar';
 import UnavailableIconWrapper from '@calls/components/unavailable_icon_wrapper';
-import {usePermissionsChecker} from '@calls/hooks';
+import {useCallingPulseAnimationStyle, usePermissionsChecker} from '@calls/hooks';
 import {setCallQualityAlertDismissed, setMicPermissionsErrorDismissed, useCallsConfig} from '@calls/state';
 import {makeCallsTheme} from '@calls/utils';
 import CompassIcon from '@components/compass_icon';
@@ -19,13 +22,12 @@ import {Calls, Screens} from '@constants';
 import {CURRENT_CALL_BAR_HEIGHT} from '@constants/view';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {allOrientations, dismissAllModalsAndPopToScreen} from '@screens/navigation';
+import {navigateToScreen} from '@screens/navigation';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
-import {displayUsername} from '@utils/user';
 
 import type {CallSession, CallsTheme, CurrentCall} from '@calls/types/calls';
-import type {Options} from 'react-native-navigation';
+import type UserModel from '@typings/database/models/servers/user';
 
 type Props = {
     displayName: string;
@@ -33,7 +35,14 @@ type Props = {
     sessionsDict: Dictionary<CallSession>;
     teammateNameDisplay: string;
     micPermissionsGranted: boolean;
-    threadScreen?: boolean;
+    otherParticipants: boolean;
+    isAdmin: boolean;
+    isHost: boolean;
+    isDMCall: boolean;
+    isDMConnecting: boolean;
+    isDMCalling: boolean;
+    dmCallee?: UserModel;
+    dmCalleeAnsweredAt: number;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: CallsTheme) => {
@@ -76,13 +85,6 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: CallsTheme) => {
             flexDirection: 'column',
             paddingLeft: 6,
             gap: 2,
-        },
-        speakingUser: {
-            color: theme.buttonColor,
-            ...typography('Body', 100, 'SemiBold'),
-        },
-        speakingPostfix: {
-            ...typography('Body', 100, 'Regular'),
         },
         channelAndTime: {
             color: changeOpacity(theme.buttonColor, 0.56),
@@ -129,16 +131,26 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: CallsTheme) => {
         hangupIcon: {
             color: theme.buttonColor,
         },
+        disabled: {
+            opacity: 0.5,
+        },
     };
 });
 
-const CurrentCallBar = ({
+export const CurrentCallBar = ({
     displayName,
     currentCall,
     sessionsDict,
     teammateNameDisplay,
     micPermissionsGranted,
-    threadScreen,
+    otherParticipants,
+    isAdmin,
+    isHost,
+    isDMCall,
+    isDMConnecting,
+    isDMCalling,
+    dmCallee,
+    dmCalleeAnsweredAt,
 }: Props) => {
     const theme = useTheme();
     const serverUrl = useServerUrl();
@@ -146,57 +158,30 @@ const CurrentCallBar = ({
     const callsTheme = useMemo(() => makeCallsTheme(theme), [theme]);
     const style = getStyleSheet(callsTheme);
     const intl = useIntl();
-    const {formatMessage} = intl;
     usePermissionsChecker(micPermissionsGranted);
 
     const goToCallScreen = useCallback(async () => {
-        const options: Options = {
-            layout: {
-                backgroundColor: '#000',
-                componentBackgroundColor: '#000',
-                orientation: allOrientations,
-            },
-            topBar: {
-                background: {
-                    color: '#000',
-                },
-                visible: Platform.OS === 'android',
-            },
-        };
-        const title = formatMessage({id: 'mobile.calls_call_screen', defaultMessage: 'Call'});
-        await dismissAllModalsAndPopToScreen(Screens.CALL, title, {fromThreadScreen: threadScreen}, options);
-    }, [formatMessage, threadScreen]);
-
-    const leaveCallHandler = useCallback(() => {
-        leaveCall();
+        navigateToScreen(Screens.CALL);
     }, []);
 
+    const leaveCallHandler = useCallback(() => {
+        leaveCallConfirmation(intl, otherParticipants, isAdmin, isHost, serverUrl, currentCall?.channelId || '');
+    }, [intl, otherParticipants, isAdmin, isHost, serverUrl, currentCall?.channelId]);
+
     const mySession = currentCall?.sessions[currentCall.mySessionId];
+
+    // Placing the call and waiting for it to be answered look the same here; only the status differs.
+    const showCallee = isDMConnecting || isDMCalling;
+    const callingPulseAnimationStyle = useCallingPulseAnimationStyle(showCallee);
+
+    // Muting and hanging up both go through the connection, which doesn't exist while we're still
+    // placing the call. Same predicate as the full-screen view, so the two never disagree.
+    const controlsDisabled = !currentCall?.connected;
 
     // Since we can only see one user talking, it doesn't really matter who we show here (e.g., we can't
     // tell who is speaking louder).
     const talkingUsers = Object.keys(currentCall?.voiceOn || {});
     const speaker = talkingUsers.length > 0 ? talkingUsers[0] : '';
-    let talkingMessage = (
-        <Text style={style.speakingUser}>
-            {formatMessage({
-                id: 'mobile.calls_noone_talking',
-                defaultMessage: 'No one is talking',
-            })}
-        </Text>);
-    if (speaker) {
-        talkingMessage = (
-            <Text style={style.speakingUser}>
-                {displayUsername(sessionsDict[speaker].userModel, intl.locale, teammateNameDisplay)}
-                {' '}
-                <Text style={style.speakingPostfix}>{
-                    formatMessage({
-                        id: 'mobile.calls_name_is_talking_postfix',
-                        defaultMessage: 'is talking...',
-                    })}
-                </Text>
-            </Text>);
-    }
 
     const muteUnmute = () => {
         if (mySession?.muted) {
@@ -210,7 +195,6 @@ const CurrentCallBar = ({
 
     // The user should receive an alert if all of the following conditions apply:
     // - Recording has started and recording has not ended.
-    const isHost = Boolean(currentCall?.hostId === mySession?.userId);
     if (currentCall?.recState?.start_at && !currentCall?.recState?.end_at) {
         recordingAlert(isHost, EnableTranscriptions, intl);
     }
@@ -230,34 +214,61 @@ const CurrentCallBar = ({
         <>
             <View style={style.wrapper}>
                 <Pressable
+                    testID='calls.current_call_bar'
                     style={style.container}
                     onPress={goToCallScreen}
                 >
-                    <View style={[!speaker && style.avatarOutline]}>
-                        <CallAvatar
-                            userModel={sessionsDict[speaker || '']?.userModel}
-                            speaking={Boolean(speaker)}
-                            serverUrl={currentCall?.serverUrl || ''}
-                            size={speaker ? 40 : 24}
-                        />
-                    </View>
-                    <View style={style.text}>
-                        {talkingMessage}
-                        <Text style={style.channelAndTime}>
-                            {`~${displayName}`}
-                            <Text style={style.separator}>{'  •  '}</Text>
-                            <CallDuration
-                                style={style.channelAndTime}
-                                value={currentCall?.startTime || Date.now()}
-                                updateIntervalInSeconds={1}
+                    {showCallee ? (
+                        <Animated.View style={callingPulseAnimationStyle}>
+                            <CallAvatar
+                                userModel={dmCallee}
+                                serverUrl={currentCall?.serverUrl || ''}
+                                size={40}
                             />
+                        </Animated.View>
+                    ) : (
+                        <View style={[!speaker && style.avatarOutline]}>
+                            <CallAvatar
+                                userModel={sessionsDict[speaker || '']?.userModel}
+                                speaking={Boolean(speaker)}
+                                serverUrl={currentCall?.serverUrl || ''}
+                                size={speaker ? 40 : 24}
+                            />
+                        </View>
+                    )}
+                    <View style={style.text}>
+                        <CallStatusText
+                            speaker={speaker}
+                            sessionsDict={sessionsDict}
+                            teammateNameDisplay={teammateNameDisplay}
+                            showCallee={showCallee}
+                            dmCallee={dmCallee}
+                        />
+                        <Text
+                            style={style.channelAndTime}
+                            numberOfLines={1}
+                            ellipsizeMode='middle'
+                        >
+                            <CallStatusTimer
+                                isConnecting={isDMConnecting}
+                                isCalling={isDMCalling}
+                                value={dmCalleeAnsweredAt || currentCall?.startTime || Date.now()}
+                                style={style.channelAndTime}
+                            />
+                            {!isDMCall && (
+                                <>
+                                    <Text style={style.separator}>{'  •  '}</Text>
+                                    {displayName}
+                                </>
+                            )}
                         </Text>
                     </View>
                     <View style={style.buttonContainer}>
                         <Pressable
+                            testID='calls.current_call_bar.mute'
                             onPress={muteUnmute}
-                            style={[style.pressable, style.micIconContainer, mySession?.muted && style.muted]}
-                            disabled={!micPermissionsGranted}
+                            style={[style.pressable, style.micIconContainer, mySession?.muted && style.muted, controlsDisabled && style.disabled]}
+                            disabled={!micPermissionsGranted || controlsDisabled}
                         >
                             <UnavailableIconWrapper
                                 name={mySession?.muted ? 'microphone-off' : 'microphone'}
@@ -268,8 +279,10 @@ const CurrentCallBar = ({
                         </Pressable>
                         <View style={style.verticalLine}/>
                         <Pressable
+                            testID='calls.current_call_bar.leave'
                             onPress={leaveCallHandler}
-                            style={[style.pressable, style.hangupIconContainer]}
+                            style={[style.pressable, style.hangupIconContainer, controlsDisabled && style.disabled]}
+                            disabled={controlsDisabled}
                         >
                             <CompassIcon
                                 name='phone-hangup'
@@ -295,5 +308,3 @@ const CurrentCallBar = ({
         </>
     );
 };
-
-export default CurrentCallBar;

@@ -1,0 +1,97 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React, {useEffect, useState, useCallback} from 'react';
+import {DeviceEventEmitter, View, type LayoutChangeEvent, StyleSheet} from 'react-native';
+
+import Files from '@components/files';
+import {Events} from '@constants';
+import useDidMount from '@hooks/did_mount';
+import EphemeralStore from '@store/ephemeral_store';
+import {emitPostInViewport} from '@utils/post_list/viewport';
+
+import type PostModel from '@typings/database/models/servers/post';
+
+type PermalinkFilesProps = {
+    post: PostModel;
+    location: string;
+    isReplyPost: boolean;
+    failed?: boolean;
+    parentLocation?: string;
+    parentPostId?: string;
+    filesInfo?: FileInfo[];
+};
+
+const styles = StyleSheet.create({
+    container: {
+        marginBottom: 8,
+    },
+});
+
+const EMPTY_FILES_INFO: FileInfo[] = [];
+
+const PermalinkFiles = (props: PermalinkFilesProps) => {
+    const {parentLocation, parentPostId, post, location, isReplyPost, failed, filesInfo = EMPTY_FILES_INFO} = props;
+    const [layoutWidth, setLayoutWidth] = useState(0);
+
+    const listener = useCallback((viewableItemsMap: Record<string, boolean>) => {
+        if (!parentLocation || !parentPostId) {
+            return;
+        }
+
+        const parentKey = `${parentLocation}-${parentPostId}`;
+        if (viewableItemsMap[parentKey]) {
+            // Via the helper so the embedded post also lands in the viewport cache; a bare emit
+            // leaves anything that mounts later unable to seed itself.
+            emitPostInViewport(location, post.id);
+        }
+    }, [parentLocation, parentPostId, location, post.id]);
+
+    useEffect(() => {
+        if (!parentLocation || !parentPostId) {
+            return undefined;
+        }
+
+        const subscription = DeviceEventEmitter.addListener(Events.ITEM_IN_VIEWPORT, listener);
+        return () => subscription.remove();
+    }, [listener, parentLocation, parentPostId]);
+
+    // ITEM_IN_VIEWPORT is fire-and-forget, and this subtree mounts only once its linked post is
+    // hydrated, so the emit for the parent post has usually already happened. Seed from the last
+    // known viewable items instead of waiting for the next scroll.
+    useDidMount(() => {
+        if (!parentLocation || !parentPostId) {
+            return;
+        }
+
+        const parentKey = `${parentLocation}-${parentPostId}`;
+        if (EphemeralStore.isItemInViewPort(parentKey)) {
+            listener({[parentKey]: true});
+        }
+    });
+
+    const onLayout = useCallback((event: LayoutChangeEvent) => {
+        setLayoutWidth(event.nativeEvent.layout.width);
+    }, []);
+
+    return (
+        <View
+            onLayout={onLayout}
+            testID='permalink-files-container'
+            style={styles.container}
+        >
+            <Files
+                postId={post.id}
+                postProps={post.props ?? undefined}
+                filesInfo={filesInfo}
+                location={location}
+                isReplyPost={isReplyPost}
+                failed={failed}
+                layoutWidth={layoutWidth}
+                isPermalinkPreview={true}
+            />
+        </View>
+    );
+};
+
+export default PermalinkFiles;

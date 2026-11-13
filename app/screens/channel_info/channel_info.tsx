@@ -5,15 +5,16 @@ import React, {useCallback} from 'react';
 import {ScrollView, View} from 'react-native';
 import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 
-import ChannelInfoEnableCalls from '@calls/components/channel_info_enable_calls';
 import ChannelActions from '@components/channel_actions';
-import ConvertToChannelLabel from '@components/channel_actions/convert_to_channel/convert_to_channel_label';
-import {General} from '@constants';
+import ChannelBookmarks from '@components/channel_bookmarks';
+import ChannelInfoAttributes from '@components/channel_info_attributes';
+import {General, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {dismissModal} from '@screens/navigation';
+import {useFetchRenderPermissions} from '@hooks/render_permissions';
+import {navigateBack} from '@screens/navigation';
+import {isTypeDMorGM} from '@utils/channel';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
 import ChannelInfoAppBindings from './app_bindings';
@@ -22,20 +23,19 @@ import Extra from './extra';
 import Options from './options';
 import Title from './title';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
 type Props = {
+    canAddBookmarks: boolean;
     channelId: string;
-    closeButtonId: string;
-    componentId: AvailableScreens;
-    type?: ChannelType;
-    canEnableDisableCalls: boolean;
+    isBookmarksEnabled: boolean;
     isCallsEnabledInChannel: boolean;
+    isPlaybooksEnabled: boolean;
+    groupCallsAllowed: boolean;
     canManageMembers: boolean;
     isCRTEnabled: boolean;
-    canManageSettings: boolean;
-    isGuestUser: boolean;
-    isConvertGMFeatureAvailable: boolean;
+    type?: ChannelType;
+    hasChannelSettingsActions: boolean;
+    isAutotranslationEnabledForThisChannel: boolean;
+    channelDisplayName: string;
 }
 
 const edges: Edge[] = ['bottom', 'left', 'right'];
@@ -56,17 +56,18 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
 }));
 
 const ChannelInfo = ({
-    isCRTEnabled,
-    channelId,
-    closeButtonId,
-    componentId,
-    type,
-    canEnableDisableCalls,
-    isCallsEnabledInChannel,
+    canAddBookmarks,
     canManageMembers,
-    canManageSettings,
-    isGuestUser,
-    isConvertGMFeatureAvailable,
+    channelId,
+    isBookmarksEnabled,
+    isCallsEnabledInChannel,
+    isPlaybooksEnabled,
+    groupCallsAllowed,
+    isCRTEnabled,
+    type,
+    hasChannelSettingsActions,
+    isAutotranslationEnabledForThisChannel,
+    channelDisplayName,
 }: Props) => {
     const theme = useTheme();
     const serverUrl = useServerUrl();
@@ -74,78 +75,79 @@ const ChannelInfo = ({
 
     // NOTE: isCallsEnabledInChannel will be true/false (not undefined) based on explicit state + the DefaultEnabled system setting
     //   which comes from observeIsCallsEnabledInChannel
-    const callsAvailable = isCallsEnabledInChannel;
+    let callsAvailable = isCallsEnabledInChannel;
+    if (!groupCallsAllowed && type !== General.DM_CHANNEL) {
+        callsAvailable = false;
+    }
+
+    // Assigning attributes to a conversation is later Smart Markings work, so a
+    // DM or GM has nothing to show here.
+    const isDMorGM = isTypeDMorGM(type);
 
     const onPressed = useCallback(() => {
-        return dismissModal({componentId});
-    }, [componentId]);
+        return navigateBack();
+    }, []);
 
-    useNavButtonPressed(closeButtonId, componentId, onPressed, [onPressed]);
-    useAndroidHardwareBackHandler(componentId, onPressed);
-
-    const convertGMOptionAvailable = isConvertGMFeatureAvailable && type === General.GM_CHANNEL && !isGuestUser;
+    useAndroidHardwareBackHandler(Screens.CHANNEL_INFO, onPressed);
+    useFetchRenderPermissions(channelId);
 
     return (
-        <SafeAreaView
-            edges={edges}
-            style={styles.flex}
-            testID='channel_info.screen'
-        >
-            <ScrollView
-                bounces={true}
-                alwaysBounceVertical={false}
-                contentContainerStyle={styles.content}
-                testID='channel_info.scroll_view'
+        <View style={styles.flex}>
+            <SafeAreaView
+                edges={edges}
+                style={styles.flex}
+                testID='channel_info.screen'
             >
-                <Title
-                    channelId={channelId}
-                    type={type}
-                />
-                <ChannelActions
-                    channelId={channelId}
-                    inModal={true}
-                    dismissChannelInfo={onPressed}
-                    callsEnabled={callsAvailable}
-                    testID='channel_info.channel_actions'
-                />
-                <Extra channelId={channelId}/>
-                <View style={styles.separator}/>
-                <Options
-                    channelId={channelId}
-                    type={type}
-                    callsEnabled={callsAvailable}
-                    canManageMembers={canManageMembers}
-                    isCRTEnabled={isCRTEnabled}
-                    canManageSettings={canManageSettings}
-                />
-                <View style={styles.separator}/>
-                {convertGMOptionAvailable &&
-                <>
-                    <ConvertToChannelLabel channelId={channelId}/>
-                    <View style={styles.separator}/>
-                </>
-                }
-                {canEnableDisableCalls &&
-                    <>
-                        <ChannelInfoEnableCalls
+                <ScrollView
+                    bounces={true}
+                    alwaysBounceVertical={false}
+                    contentContainerStyle={styles.content}
+                    testID='channel_info.scroll_view'
+                >
+                    <Title
+                        channelId={channelId}
+                        type={type}
+                    />
+                    {isBookmarksEnabled &&
+                        <ChannelBookmarks
                             channelId={channelId}
-                            enabled={isCallsEnabledInChannel}
+                            canAddBookmarks={canAddBookmarks}
+                            showInInfo={true}
                         />
-                        <View style={styles.separator}/>
-                    </>
-                }
-                <ChannelInfoAppBindings
-                    channelId={channelId}
-                    serverUrl={serverUrl}
-                    dismissChannelInfo={onPressed}
-                />
-                <DestructiveOptions
-                    channelId={channelId}
-                    componentId={componentId}
-                    type={type}
-                />
-            </ScrollView>
-        </SafeAreaView>
+                    }
+                    <ChannelActions
+                        channelId={channelId}
+                        inModal={true}
+                        dismissChannelInfo={onPressed}
+                        callsEnabled={callsAvailable}
+                        testID='channel_info.channel_actions'
+                    />
+                    {!isDMorGM && <ChannelInfoAttributes channelId={channelId}/>}
+                    <Extra channelId={channelId}/>
+                    <View style={styles.separator}/>
+                    <Options
+                        channelId={channelId}
+                        type={type}
+                        callsEnabled={isCallsEnabledInChannel}
+                        canManageMembers={canManageMembers}
+                        isCRTEnabled={isCRTEnabled}
+                        isPlaybooksEnabled={isPlaybooksEnabled}
+                        hasChannelSettingsActions={hasChannelSettingsActions}
+                        isAutotranslationEnabledForThisChannel={isAutotranslationEnabledForThisChannel}
+                        channelDisplayName={channelDisplayName}
+                    />
+                    <View style={styles.separator}/>
+                    <ChannelInfoAppBindings
+                        channelId={channelId}
+                        serverUrl={serverUrl}
+                        dismissChannelInfo={onPressed}
+                    />
+                    <DestructiveOptions
+                        channelId={channelId}
+                    />
+                </ScrollView>
+            </SafeAreaView>
+        </View>
     );
 };
 

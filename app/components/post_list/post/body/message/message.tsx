@@ -1,14 +1,17 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useState} from 'react';
+import React, {useCallback, useMemo, useState} from 'react';
+import {useIntl} from 'react-intl';
 import {type LayoutChangeEvent, ScrollView, useWindowDimensions, View} from 'react-native';
 import Animated from 'react-native-reanimated';
 
 import Markdown from '@components/markdown';
-import {SEARCH} from '@constants/screens';
+import {isChannelMentions} from '@components/markdown/channel_mention/channel_mention';
+import {Screens} from '@constants';
+import {usePostConfig} from '@context/post_config';
 import {useShowMoreAnimatedStyle} from '@hooks/show_more';
-import {getMarkdownTextStyles, getMarkdownBlockStyles} from '@utils/markdown';
+import {getPostTranslatedMessage, getPostTranslation, isFromBot, isFromPlugin, isFromWebhook, isPostEphemeral} from '@utils/post';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
@@ -16,26 +19,28 @@ import ShowMoreButton from './show_more_button';
 
 import type PostModel from '@typings/database/models/servers/post';
 import type UserModel from '@typings/database/models/servers/user';
-import type {HighlightWithoutNotificationKey, SearchPattern, UserMentionKey} from '@typings/global/markdown';
+import type {HighlightWithoutNotificationKey, SearchPattern} from '@typings/global/markdown';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type MessageProps = {
     currentUser?: UserModel;
-    isHighlightWithoutNotificationLicensed?: boolean;
     highlight: boolean;
     isEdited: boolean;
     isPendingOrFailed: boolean;
     isReplyPost: boolean;
     layoutWidth?: number;
-    location: string;
+    location: AvailableScreens;
     post: PostModel;
     searchPatterns?: SearchPattern[];
     theme: Theme;
+    isChannelAutotranslated: boolean;
 }
 
 const SHOW_MORE_HEIGHT = 54;
 
-const EMPTY_MENTION_KEYS: UserMentionKey[] = [];
 const EMPTY_HIGHLIGHT_KEYS: HighlightWithoutNotificationKey[] = [];
+const EMPTY_CHANNEL_MENTIONS = {};
+const EMPTY_IMAGES_METADATA = undefined;
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     return {
@@ -56,18 +61,66 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     };
 });
 
-const Message = ({currentUser, isHighlightWithoutNotificationLicensed, highlight, isEdited, isPendingOrFailed, isReplyPost, layoutWidth, location, post, searchPatterns, theme}: MessageProps) => {
+const Message = ({
+    currentUser,
+    highlight,
+    isEdited,
+    isPendingOrFailed,
+    isReplyPost,
+    layoutWidth,
+    location,
+    post,
+    searchPatterns,
+    theme,
+    isChannelAutotranslated,
+}: MessageProps) => {
     const [open, setOpen] = useState(false);
     const [height, setHeight] = useState<number|undefined>();
     const dimensions = useWindowDimensions();
     const maxHeight = Math.round((dimensions.height * 0.5) + SHOW_MORE_HEIGHT);
     const animatedStyle = useShowMoreAnimatedStyle(height, maxHeight, open);
     const style = getStyleSheet(theme);
-    const blockStyles = getMarkdownBlockStyles(theme);
-    const textStyles = getMarkdownTextStyles(theme);
+    const postConfig = usePostConfig();
+    const intl = useIntl();
 
-    const onLayout = useCallback((event: LayoutChangeEvent) => setHeight(event.nativeEvent.layout.height), []);
+    // We need to memoize these two values because they are actually getters that return a new list
+    // on every render. We need to trust that changes in the currentUser will trigger the recalculation.
+    const mentionKeys = useMemo(() => currentUser?.mentionKeys ?? undefined, [currentUser]);
+    const highlightKeys = useMemo(() => {
+        if (postConfig.isHighlightWithoutNotificationLicensed) {
+            return currentUser?.highlightKeys ?? EMPTY_HIGHLIGHT_KEYS;
+        }
+        return EMPTY_HIGHLIGHT_KEYS;
+    }, [currentUser, postConfig.isHighlightWithoutNotificationLicensed]);
+
+    const onLayout = useCallback((event: LayoutChangeEvent) => {
+        const h = event.nativeEvent.layout.height;
+        if (h > maxHeight) {
+            setHeight(event.nativeEvent.layout.height);
+        }
+    }, [maxHeight]);
     const onPress = () => setOpen(!open);
+
+    const channelMentions = useMemo(() => {
+        return isChannelMentions(post.props?.channel_mentions) ? post.props.channel_mentions : EMPTY_CHANNEL_MENTIONS;
+    }, [post.props?.channel_mentions]);
+
+    const imagesMetadata = useMemo(() => {
+        return post.metadata?.images ?? EMPTY_IMAGES_METADATA;
+    }, [post.metadata?.images]);
+
+    const allowInlineActions = useMemo(() => {
+        if (isPostEphemeral(post)) {
+            return false;
+        }
+        return isFromBot(post) || isFromWebhook(post) || isFromPlugin(post);
+    }, [post]);
+
+    const translation = getPostTranslation(post, intl.locale);
+    let message = post.message;
+    if (isChannelAutotranslated && post.type === '' && translation?.state === 'ready') {
+        message = getPostTranslatedMessage(post.message, translation);
+    }
 
     return (
         <>
@@ -83,24 +136,23 @@ const Message = ({currentUser, isHighlightWithoutNotificationLicensed, highlight
                         onLayout={onLayout}
                     >
                         <Markdown
+                            allowInlineActions={allowInlineActions}
                             baseTextStyle={style.message}
-                            blockStyles={blockStyles}
                             channelId={post.channelId}
-                            channelMentions={post.props?.channel_mentions}
-                            imagesMetadata={post.metadata?.images}
+                            channelMentions={channelMentions}
+                            imagesMetadata={imagesMetadata}
                             isEdited={isEdited}
                             isReplyPost={isReplyPost}
-                            isSearchResult={location === SEARCH}
+                            isSearchResult={location === Screens.SEARCH}
                             layoutWidth={layoutWidth}
                             location={location}
                             postId={post.id}
-                            textStyles={textStyles}
-                            value={post.message}
-                            mentionKeys={currentUser?.mentionKeys ?? EMPTY_MENTION_KEYS}
-                            highlightKeys={isHighlightWithoutNotificationLicensed ? (currentUser?.highlightKeys ?? EMPTY_HIGHLIGHT_KEYS) : EMPTY_HIGHLIGHT_KEYS}
+                            value={message}
+                            mentionKeys={mentionKeys}
+                            highlightKeys={highlightKeys}
                             searchPatterns={searchPatterns}
                             theme={theme}
-                            isUnsafeLinksPost={post.props.unsafe_links && post.props.unsafe_links !== ''}
+                            isUnsafeLinksPost={Boolean(post.props?.unsafe_links && post.props.unsafe_links !== '')}
                         />
                     </View>
                 </ScrollView>

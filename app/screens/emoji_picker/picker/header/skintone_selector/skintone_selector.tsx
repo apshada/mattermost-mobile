@@ -1,8 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {InteractionManager, Platform, StyleSheet} from 'react-native';
+import React, {useCallback, useMemo, useRef, useState} from 'react';
+import {Platform, StyleSheet} from 'react-native';
 import Animated, {
     type EntryAnimationsValues, type ExitAnimationsValues, FadeIn, FadeOut,
     type SharedValue, useAnimatedStyle, withDelay, withTiming,
@@ -12,6 +12,7 @@ import Tooltip from 'react-native-walkthrough-tooltip';
 import {storeSkinEmojiSelectorTutorial} from '@actions/app/global';
 import TouchableEmoji from '@components/touchable_emoji';
 import {useIsTablet} from '@hooks/device';
+import useDidMount from '@hooks/did_mount';
 import {skinCodes} from '@utils/emoji';
 
 import CloseButton from './close_button';
@@ -44,8 +45,7 @@ const styles = StyleSheet.create({
     },
 });
 
-const skins = Object.keys(skinCodes).reduce<Record<string, string>>((result, value) => {
-    const skin = skinCodes[value];
+const skins = Object.entries(skinCodes).reduce<Record<string, string>>((result, [value, skin]) => {
     if (value === 'default') {
         result[value] = 'hand';
     } else {
@@ -57,6 +57,7 @@ const skins = Object.keys(skinCodes).reduce<Record<string, string>>((result, val
 const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tutorialWatched}: Props) => {
     const [expanded, setExpanded] = useState(false);
     const [tooltipVisible, setTooltipVisible] = useState(false);
+    const tutorialTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const isTablet = useIsTablet();
 
     const tooltipContentStyle = useMemo(() => ({
@@ -65,7 +66,7 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
         padding: 0,
     }), [isTablet]);
 
-    const exiting = useCallback((values: ExitAnimationsValues) => {
+    const exiting = (values: ExitAnimationsValues) => {
         'worklet';
         const animations = {
             originX: withTiming(containerWidth.value, {duration: 250}),
@@ -79,9 +80,9 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
             initialValues,
             animations,
         };
-    }, [containerWidth.value]);
+    };
 
-    const entering = useCallback((values: EntryAnimationsValues) => {
+    const entering = (values: EntryAnimationsValues) => {
         'worklet';
         const animations = {
             originX: withTiming(values.targetOriginX, {duration: 250}),
@@ -95,7 +96,7 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
             initialValues,
             animations,
         };
-    }, [containerWidth.value]);
+    };
 
     const collapse = useCallback(() => {
         setExpanded(false);
@@ -113,7 +114,6 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
     const widthAnimatedStyle = useAnimatedStyle(() => {
         return {
             width: withDelay(isSearching.value ? 0 : 700, withTiming(isSearching.value ? 0 : 32, {duration: isSearching.value ? 50 : 300})),
-            marginLeft: Platform.OS === 'android' ? 10 : undefined,
             height: 34,
         };
     }, []);
@@ -124,20 +124,25 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
         };
     }, []);
 
-    useEffect(() => {
-        InteractionManager.runAfterInteractions(() => {
-            if (!tutorialWatched) {
+    useDidMount(() => {
+        if (!tutorialWatched) {
+            tutorialTimeoutRef.current = setTimeout(() => {
                 setTooltipVisible(true);
+            }, 500); // Give enough time for the transitions
+        }
+
+        return () => {
+            if (tutorialTimeoutRef.current) {
+                clearTimeout(tutorialTimeoutRef.current);
             }
-        });
-    }, []);
+        };
+    });
 
     return (
         <>
             {!expanded &&
             <Tooltip
                 isVisible={tooltipVisible}
-                useInteractionManager={true}
                 contentStyle={tooltipContentStyle}
                 content={<SkinSelectorTooltip onClose={close}/>}
                 placement={isTablet ? 'left' : 'top'}
@@ -146,8 +151,9 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
             >
                 <Animated.View
                     style={widthAnimatedStyle}
-                    exiting={FadeOut}
+                    exiting={Platform.select({ios: FadeOut})} /* https://mattermost.atlassian.net/browse/MM-63814?focusedCommentId=178584 */
                     entering={FadeIn}
+                    collapsable={false}
                 >
                     <Animated.View style={[styles.container, opacityStyle]}>
                         <TouchableEmoji
@@ -163,7 +169,7 @@ const SkinToneSelector = ({skinTone = 'default', containerWidth, isSearching, tu
             <Animated.View
                 style={styles.expanded}
                 entering={entering}
-                exiting={exiting}
+                exiting={Platform.select({ios: exiting})} /* https://mattermost.atlassian.net/browse/MM-63814?focusedCommentId=178584 */
             >
                 {!isTablet && <CloseButton collapse={collapse}/>}
                 <SkinSelector

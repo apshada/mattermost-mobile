@@ -4,7 +4,6 @@
 import React, {useCallback, useMemo} from 'react';
 import {useIntl} from 'react-intl';
 import {TouchableOpacity} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {buildProfileImageUrlFromUser} from '@actions/remote/user';
 import CompassIcon from '@components/compass_icon';
@@ -12,13 +11,12 @@ import FormattedText from '@components/formatted_text';
 import {ITEM_HEIGHT} from '@components/slide_up_panel_item';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {TITLE_HEIGHT} from '@screens/bottom_sheet/content';
 import PanelItem from '@screens/edit_profile/components/panel_item';
 import {bottomSheet} from '@screens/navigation';
 import PickerUtil from '@utils/file/file_picker';
 import {bottomSheetSnapPoint} from '@utils/helpers';
-import {preventDoubleTap} from '@utils/tap';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
@@ -67,25 +65,22 @@ const ProfileImagePicker = ({
     user,
 }: ImagePickerProps) => {
     const theme = useTheme();
-    const intl = useIntl();
-    const {bottom} = useSafeAreaInsets();
     const serverUrl = useServerUrl();
-    const pictureUtils = useMemo(() => new PickerUtil(intl, uploadFiles), [uploadFiles, intl]);
+    const intl = useIntl();
+    const pictureUtils = useMemo(() => new PickerUtil(intl, uploadFiles!), [intl, uploadFiles]);
+
     const canRemovePicture = hasPictureUrl(user, serverUrl);
     const styles = getStyleSheet(theme);
-    const isTablet = useIsTablet();
 
-    const showFileAttachmentOptions = useCallback(preventDoubleTap(() => {
+    const showFileAttachmentOptions = usePreventDoubleTap(useCallback(() => {
         const renderContent = () => {
             return (
                 <>
-                    {!isTablet &&
-                        <FormattedText
-                            id='user.edit_profile.profile_photo.change_photo'
-                            defaultMessage='Change profile photo'
-                            style={styles.title}
-                        />
-                    }
+                    <FormattedText
+                        id='user.edit_profile.profile_photo.change_photo'
+                        defaultMessage='Change profile photo'
+                        style={styles.title}
+                    />
                     <PanelItem
                         pickerAction='takePhoto'
                         pictureUtils={pictureUtils}
@@ -109,22 +104,17 @@ const ProfileImagePicker = ({
             );
         };
 
-        const snapPoint = bottomSheetSnapPoint(4, ITEM_HEIGHT, bottom) + TITLE_HEIGHT;
+        const snapPoint = bottomSheetSnapPoint(4, ITEM_HEIGHT) + TITLE_HEIGHT;
 
-        return bottomSheet({
-            closeButtonId: 'close-edit-profile',
-            renderContent,
-            snapPoints: [1, snapPoint],
-            title: 'Change profile photo',
-            theme,
-        });
-    }), [canRemovePicture, onRemoveProfileImage, bottom, pictureUtils, theme]);
+        return bottomSheet(renderContent, [1, snapPoint]);
+    }, [canRemovePicture, onRemoveProfileImage, pictureUtils, styles.title]));
 
     return (
         <TouchableOpacity
             onPress={showFileAttachmentOptions}
             hitSlop={hitSlop}
             style={styles.touchable}
+            testID={`edit_profile.${user.id}.profile_picture.picker`}
         >
             <CompassIcon
                 name='camera-outline'
@@ -132,7 +122,6 @@ const ProfileImagePicker = ({
                 color={changeOpacity(theme.centerChannelColor, 0.6)}
             />
         </TouchableOpacity>
-
     );
 };
 

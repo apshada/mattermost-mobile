@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {useCallback, useRef, useState} from 'react';
 import {useIntl} from 'react-intl';
 import {View} from 'react-native';
 
@@ -10,22 +10,19 @@ import FormattedText from '@components/formatted_text';
 import Empty from '@components/illustrations/no_team';
 import Loading from '@components/loading';
 import TeamList from '@components/team_list';
+import {Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {dismissModal} from '@screens/navigation';
+import useDidMount from '@hooks/did_mount';
+import {navigateBack} from '@screens/navigation';
 import {logDebug} from '@utils/log';
 import {alertTeamAddError} from '@utils/navigation';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
 type Props = {
     joinedIds: Set<string>;
-    componentId: AvailableScreens;
-    closeButtonId: string;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
@@ -59,8 +56,6 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
 
 export default function JoinTeam({
     joinedIds,
-    componentId,
-    closeButtonId,
 }: Props) {
     const serverUrl = useServerUrl();
     const theme = useTheme();
@@ -100,23 +95,22 @@ export default function JoinTeam({
             setJoining(false);
         } else {
             handleTeamChange(serverUrl, teamId);
-            dismissModal({componentId});
+            navigateBack();
         }
-    }, [serverUrl, componentId, intl]);
+    }, [serverUrl, intl]);
 
-    useEffect(() => {
+    useDidMount(() => {
         loadTeams();
         return () => {
             mounted.current = false;
         };
-    }, []);
+    });
 
     const onClosePressed = useCallback(() => {
-        return dismissModal({componentId});
-    }, [componentId]);
+        navigateBack();
+    }, []);
 
-    useNavButtonPressed(closeButtonId, componentId, onClosePressed, []);
-    useAndroidHardwareBackHandler(componentId, onClosePressed);
+    useAndroidHardwareBackHandler(Screens.JOIN_TEAM, onClosePressed);
 
     const hasOtherTeams = Boolean(otherTeams.length);
 

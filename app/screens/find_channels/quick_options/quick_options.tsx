@@ -3,14 +3,12 @@
 
 import React, {useCallback} from 'react';
 import {useIntl} from 'react-intl';
-import {StyleSheet, View} from 'react-native';
+import {Platform, StyleSheet, View} from 'react-native';
 import Animated, {FadeInDown, FadeOutUp} from 'react-native-reanimated';
 
-import CompassIcon from '@components/compass_icon';
 import OptionBox, {OPTIONS_HEIGHT} from '@components/option_box';
 import {Screens} from '@constants';
-import {useTheme} from '@context/theme';
-import {showModal} from '@screens/navigation';
+import {navigateToScreen} from '@screens/navigation';
 
 type Props = {
     canCreateChannels: boolean;
@@ -33,40 +31,26 @@ const styles = StyleSheet.create({
 });
 
 const QuickOptions = ({canCreateChannels, canJoinChannels, close}: Props) => {
-    const theme = useTheme();
     const intl = useIntl();
 
     const browseChannels = useCallback(async () => {
-        const title = intl.formatMessage({id: 'browse_channels.title', defaultMessage: 'Browse channels'});
-        const closeButton = await CompassIcon.getImageSource('close', 24, theme.sidebarHeaderTextColor);
-
         await close();
-        showModal(Screens.BROWSE_CHANNELS, title, {
-            closeButton,
-        });
-    }, [intl, theme]);
+        navigateToScreen(Screens.BROWSE_CHANNELS);
+    }, [close]);
 
     const createNewChannel = useCallback(async () => {
-        const title = intl.formatMessage({id: 'mobile.create_channel.title', defaultMessage: 'New channel'});
-
         await close();
-        showModal(Screens.CREATE_OR_EDIT_CHANNEL, title);
-    }, [intl]);
+        navigateToScreen(Screens.CREATE_OR_EDIT_CHANNEL);
+    }, [close]);
 
     const openDirectMessage = useCallback(async () => {
-        const title = intl.formatMessage({id: 'create_direct_message.title', defaultMessage: 'Create Direct Message'});
-        const closeButton = await CompassIcon.getImageSource('close', 24, theme.sidebarHeaderTextColor);
-
         await close();
-        showModal(Screens.CREATE_DIRECT_MESSAGE, title, {
-            closeButton,
-        });
-    }, [intl, theme]);
-
+        navigateToScreen(Screens.CREATE_DIRECT_MESSAGE);
+    }, [close]);
     return (
         <Animated.View
             entering={FadeInDown.duration(200)}
-            exiting={FadeOutUp.duration(100)}
+            exiting={Platform.select({ios: FadeOutUp.duration(100)}) /* https://mattermost.atlassian.net/browse/MM-63814?focusedCommentId=178584 */}
             style={styles.container}
         >
             <Animated.View style={styles.wrapper}>

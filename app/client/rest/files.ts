@@ -11,16 +11,18 @@ export interface ClientFilesMix {
     getFileThumbnailUrl: (fileId: string, timestamp: number) => string;
     getFilePreviewUrl: (fileId: string, timestamp: number) => string;
     getFilePublicLink: (fileId: string) => Promise<{link: string}>;
-    uploadPostAttachment: (
-        file: FileInfo,
+    getFileInfo: (fileId: string) => Promise<FileInfo>;
+    uploadAttachment: (
+        file: FileInfo | ExtractedFileInfo,
         channelId: string,
         onProgress: (fractionCompleted: number, bytesRead?: number | null | undefined) => void,
         onComplete: (response: ClientResponse) => void,
         onError: (response: ClientResponseError) => void,
         skipBytes?: number,
+        isBookmark?: boolean,
     ) => () => void;
-    searchFiles: (teamId: string, terms: string) => Promise<FileSearchRequest>;
-    searchFilesWithParams: (teamId: string, FileSearchParams: string) => Promise<FileSearchRequest>;
+    searchFiles: (teamId: string, terms: string, isOrSearch: boolean) => Promise<FileSearchRequest>;
+    searchFilesWithParams: (teamId: string, FileSearchParams: FileSearchParams) => Promise<FileSearchRequest>;
 }
 
 const ClientFiles = <TBase extends Constructor<ClientBase>>(superclass: TBase) => class extends superclass {
@@ -58,15 +60,26 @@ const ClientFiles = <TBase extends Constructor<ClientBase>>(superclass: TBase) =
         );
     };
 
-    uploadPostAttachment = (
-        file: FileInfo,
+    getFileInfo = async (fileId: string) => {
+        return this.doFetch(
+            `${this.getFileRoute(fileId)}/info`,
+            {method: 'get'},
+        );
+    };
+
+    uploadAttachment = (
+        file: FileInfo | ExtractedFileInfo,
         channelId: string,
         onProgress: (fractionCompleted: number, bytesRead?: number | null | undefined) => void,
         onComplete: (response: ClientResponse) => void,
         onError: (response: ClientResponseError) => void,
         skipBytes = 0,
+        isBookmark = false,
     ) => {
-        const url = this.getFilesRoute();
+        let url = this.getFilesRoute();
+        if (isBookmark) {
+            url = `${url}?bookmark=true`;
+        }
         const options: UploadRequestOptions = {
             skipBytes,
             method: 'POST',
@@ -76,6 +89,7 @@ const ClientFiles = <TBase extends Constructor<ClientBase>>(superclass: TBase) =
                 },
             },
             timeoutInterval: toMilliseconds({minutes: 3}),
+            headers: this.getRequestHeaders('POST'),
         };
         if (!file.localPath) {
             throw new Error('file does not have local path defined');
@@ -87,7 +101,6 @@ const ClientFiles = <TBase extends Constructor<ClientBase>>(superclass: TBase) =
     };
 
     searchFilesWithParams = async (teamId: string, params: FileSearchParams) => {
-        this.analytics?.trackAPI('api_files_search');
         const endpoint = teamId ? `${this.getTeamRoute(teamId)}/files/search` : `${this.getFilesRoute()}/search`;
         return this.doFetch(endpoint, {method: 'post', body: params});
     };

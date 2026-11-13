@@ -4,7 +4,6 @@
 import React from 'react';
 import {useIntl} from 'react-intl';
 import {View, Text} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import CompassIcon from '@components/compass_icon';
 import {ITEM_HEIGHT} from '@components/slide_up_panel_item';
@@ -48,7 +47,6 @@ export default function ChannelDropdown({
     sharedChannelsEnabled,
 }: Props) {
     const intl = useIntl();
-    const {bottom} = useSafeAreaInsets();
     const theme = useTheme();
     const style = getStyleFromTheme(theme);
 
@@ -73,14 +71,8 @@ export default function ChannelDropdown({
             items += 1;
         }
 
-        const itemsSnap = bottomSheetSnapPoint(items, ITEM_HEIGHT, bottom) + TITLE_HEIGHT;
-        bottomSheet({
-            title: intl.formatMessage({id: 'browse_channels.dropdownTitle', defaultMessage: 'Show'}),
-            renderContent,
-            snapPoints: [1, itemsSnap],
-            closeButtonId: 'close',
-            theme,
-        });
+        const itemsSnap = bottomSheetSnapPoint(items, ITEM_HEIGHT) + TITLE_HEIGHT;
+        bottomSheet(renderContent, [1, itemsSnap]);
     };
 
     let channelDropdownText = intl.formatMessage({id: 'browse_channels.showPublicChannels', defaultMessage: 'Show: Public Channels'});

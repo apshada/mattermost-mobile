@@ -2,8 +2,8 @@
 // See LICENSE.txt for license information.
 
 import {PostList} from '@support/ui/component';
-import {timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {timeouts, waitForElementToNotExist} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class PermalinkScreen {
     testID = {
@@ -28,17 +28,25 @@ class PermalinkScreen {
     };
 
     toBeVisible = async () => {
-        await wait(timeouts.ONE_SEC);
-        await expect(this.permalinkScreen).toBeVisible();
+        // Use HALF_MIN on both platforms:
+        // - Android: edge-to-edge insets can make toBeVisible() fail; use toExist()
+        // - iOS: after a "Join channel" flow the screen reloads posts via useEffect,
+        //   which can take several seconds on a loaded simulator/CI runner.
+        // toExist() is sufficient — the SafeAreaView with testID='permalink.screen'
+        // is always mounted while the modal is open, regardless of loading state.
+        await waitFor(this.permalinkScreen).toExist().withTimeout(timeouts.HALF_MIN);
 
         return this.permalinkScreen;
     };
 
     jumpToRecentMessages = async () => {
         // # Jump to recent messages
-        await wait(timeouts.ONE_SEC);
+        await waitFor(this.jumpToRecentMessagesButton).toExist().withTimeout(timeouts.TEN_SEC);
         await this.jumpToRecentMessagesButton.tap();
         await expect(this.permalinkScreen).not.toBeVisible();
+
+        // Wait for permalink modal teardown instead of a fixed sleep (iOS liquid-glass overlay).
+        await waitForElementToNotExist(this.permalinkScreen, timeouts.FOUR_SEC);
     };
 
     hasPostMessage = async (postId: string, postMessage: string) => {

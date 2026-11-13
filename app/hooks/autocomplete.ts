@@ -10,10 +10,12 @@ export const useAutocompleteDefaultAnimatedValues = (position: number, available
 
     useEffect(() => {
         animatedPosition.value = position;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [position]);
 
     useEffect(() => {
         animatedAvailableSpace.value = availableSpace;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [availableSpace]);
 
     return [animatedPosition, animatedAvailableSpace];

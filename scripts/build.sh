@@ -44,36 +44,21 @@ function installGemsAndPods() {
     npm run pod-install
 }
 
-function installGemsAndPodsM1() {
-    echo "Installing Gems"
-    npm run ios-gems-m1
-    echo "Getting Cocoapods dependencies"
-    npm run pod-install-m1
-}
-
 function setup() {
     if [[ -z "$SKIP_SETUP" ]]; then
         npm run clean || exit 1
         npm install --ignore-scripts || exit 1
+
+        # postinstall.sh is skipped by --ignore-scripts; copy the font manually
+        cp "node_modules/@mattermost/compass-icons/font/compass-icons.ttf" "assets/fonts/" || exit 1
+        cp "node_modules/@mattermost/compass-icons/font/compass-icons.ttf" "android/app/src/main/assets/fonts/" || exit 1
+
         npx patch-package || exit 1
+
         node node_modules/\@sentry/cli/scripts/install.js || exit 1
 
         if [[ "$1" == "ios"* ]]; then
-          if [[ $(uname -p) == 'arm' ]]; then
-            installGemsAndPodsM1 || exit 1
-          else
-            installGemsAndPods || exit 1
-          fi
-        fi
-
-        COMPASS_ICONS="node_modules/@mattermost/compass-icons/font/compass-icons.ttf"
-        if [ -z "$COMPASS_ICONS" ]; then
-            echo "Compass Icons font not found"
-            exit 1
-        else
-            echo "Configuring Compass Icons font"
-            cp "$COMPASS_ICONS" "assets/fonts/"
-            cp "$COMPASS_ICONS" "android/app/src/main/assets/fonts"
+          installGemsAndPods || exit 1
         fi
 
         ASSETS=$(node scripts/generate-assets.js)
@@ -84,9 +69,25 @@ function setup() {
             echo "Generating app assets"
         fi
 
+        COMPASS_ICONS="node_modules/@mattermost/compass-icons/font/compass-icons.ttf"
+        GENERATE_GLYPH_MAP_SCRIPT="scripts/generate-compass-glyph-map.mjs"
+
+        if [ ! -f "$COMPASS_ICONS" ]; then
+            echo "Compass Icons font not found at: $COMPASS_ICONS"
+            exit 1
+        fi
+
+        if [ ! -f "$GENERATE_GLYPH_MAP_SCRIPT" ]; then
+            echo "Compass glyph map script not found at: $GENERATE_GLYPH_MAP_SCRIPT"
+            exit 1
+        fi
+
+        echo "Generating Compass Icons glyph map"
+        node "$GENERATE_GLYPH_MAP_SCRIPT"
+
         echo "Installing Fastane"
-        if !gem list bundler -i --version 2.3.26 > /dev/null 2>&1; then
-          gem install bundler --versio 2.3.26
+        if !gem list bundler -i --version 2.5.11 > /dev/null 2>&1; then
+          gem install bundler --versio 2.5.11
         fi
         cd fastlane && bundle install && cd .. || exit 1
     fi

@@ -1,39 +1,524 @@
 #!/bin/bash
-
-# Reference: Download Android (AOSP) Emulators - https://github.com/wix/Detox/blob/master/docs/guide/android-dev-env.md#android-aosp-emulators
-# sdkmanager "system-images;android-31;default;arm64-v8a"
-# sdkmanager --licenses
+# Reference: https://wix.github.io/Detox/docs/guide/android-dev-env
 
 set -ex
 set -o pipefail
 
-SDK_VERSION=31
-NAME="detox_pixel_4_xl_api_${SDK_VERSION}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-if emulator -list-avds | grep -q $NAME; then
-    echo "'${NAME}' Android virtual device already exists."
-else
-    CPU_ARCH_FAMILY=''
-    CPU_ARCH=''
+SDK_VERSION=${1:-35}           # First argument is SDK version
+AVD_BASE_NAME=${2:-"detox_pixel_8"}  # Second argument is AVD base name (no api suffix — added below)
+AVD_NAME="${AVD_BASE_NAME}_api_${SDK_VERSION}"
+TEST_FILES=("${@:3}")          # Capture all remaining arguments as Detox test files
+EMULATOR_RAM_MB=${MM_ANDROID_EMULATOR_RAM_MB:-3072}
+
+setup_avd_home() {
+    # ${CI:-} so `set -u` cannot abort the TESTS_ONLY retry path on a local run.
+    if [[ "${CI:-}" == "true" ]]; then
+        export ANDROID_AVD_HOME=$(pwd)/.android/avd
+        mkdir -p "$ANDROID_AVD_HOME"
+    fi
+}
+
+get_cpu_architecture() {
     if [[ $(uname -p) == 'arm' ]]; then
-        CPU_ARCH_FAMILY=arm64-v8a
-        CPU_ARCH=arm64
+        echo "arm64-v8a arm64"
     else
-        CPU_ARCH_FAMILY=x86_64
-        CPU_ARCH=x86_64
+        echo "x86_64 x86_64"
+    fi
+}
+
+create_avd() {
+    local cpu_arch_family cpu_arch
+    read cpu_arch_family cpu_arch < <(get_cpu_architecture)
+
+    avdmanager create avd -n "$AVD_NAME" -k "system-images;android-${SDK_VERSION};google_apis;${cpu_arch_family}" -p "$AVD_NAME" -d 'pixel_4_xl'
+
+    cp -r android_emulator/ "$AVD_NAME/"
+    sed -i -e "s|AvdId = change_avd_id|AvdId = ${AVD_NAME}|g" "$AVD_NAME/config.ini"
+    sed -i -e "s|avd.ini.displayname = change_avd_displayname|avd.ini.displayname = Detox Pixel 8 API ${SDK_VERSION}|g" "$AVD_NAME/config.ini"
+    sed -i -e "s|abi.type = change_type|abi.type = ${cpu_arch_family}|g" "$AVD_NAME/config.ini"
+    sed -i -e "s|hw.cpu.arch = change_cpu_arch|hw.cpu.arch = ${cpu_arch}|g" "$AVD_NAME/config.ini"
+    sed -i -e "s|image.sysdir.1 = change_to_image_sysdir/|image.sysdir.1 = system-images/android-${SDK_VERSION}/google_apis/${cpu_arch_family}/|g" "$AVD_NAME/config.ini"
+    sed -i -e "s|hw.ramSize = .*|hw.ramSize = ${EMULATOR_RAM_MB}|g" "$AVD_NAME/config.ini"
+
+    echo "Android virtual device successfully created: ${AVD_NAME}"
+}
+
+update_existing_avd_memory() {
+    local config_path="${AVD_NAME}/config.ini"
+    if [[ -f "$config_path" ]]; then
+        sed -i -e "s|hw.ramSize = .*|hw.ramSize = ${EMULATOR_RAM_MB}|g" "$config_path"
+    fi
+}
+
+prepare_avd_for_boot() {
+    # Cached AVDs may include snapshot/userdata state that causes
+    # "snapshot operation is pending and timeout has expired" on boot.
+    rm -rf "${AVD_NAME}/snapshots" 2>/dev/null || true
+    rm -f "${AVD_NAME}"/userdata*.img* "${AVD_NAME}"/cache.img* 2>/dev/null || true
+
+    if [[ "$CI" == "true" ]]; then
+        # Restored AVD caches can retain lock files from a crashed prior boot, which
+        # makes the emulator exit with "Running multiple emulators with the same AVD".
+        rm -f "${AVD_NAME}"/*.lock "${AVD_NAME}"/multiinstance.lock 2>/dev/null || true
+        # grep exits 1 when no emulators are listed; pipefail would abort bootstrap.
+        while read -r serial; do
+            [[ -z "$serial" ]] && continue
+            adb -s "$serial" emu kill 2>/dev/null || true
+        done < <( (adb devices 2>/dev/null | grep -E '^emulator-' | cut -f1) || true)
+        sleep 2
+    fi
+}
+
+start_adb_server() {
+    echo "Restarting ADB server..."
+    adb kill-server
+    adb start-server
+}
+
+# Give the emulator explicit resolvers instead of inheriting the host's systemd-resolved stub:
+# the runner's upstream servers plus public fallbacks (the emulator takes at most 4).
+emulator_dns_servers() {
+    {
+        local host_resolv=/etc/resolv.conf
+        [[ -r /run/systemd/resolve/resolv.conf ]] && host_resolv=/run/systemd/resolve/resolv.conf
+        # Loopback stubs are unreachable from inside the emulator.
+        awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" {print $2}' "$host_resolv" 2>/dev/null
+        echo 1.1.1.1
+        echo 8.8.8.8
+    } | awk 'NF && !seen[$0]++' | head -4 | paste -sd, -
+}
+
+start_emulator() {
+    echo "Starting the emulator..."
+    local emulator_opts="-avd $AVD_NAME -no-snapshot -no-snapshot-load -no-snapshot-save -no-boot-anim -no-audio -gpu off -no-window"
+
+    if [[ "$CI" == "true" || "$(uname -s)" == "Linux" ]]; then
+        local dns_servers
+        dns_servers=$(emulator_dns_servers)
+        echo "Emulator DNS servers: ${dns_servers}"
+        emulator $emulator_opts -dns-server "$dns_servers" -gpu swiftshader_indirect -accel on -qemu -m "$EMULATOR_RAM_MB" &
+    else
+        emulator $emulator_opts -gpu guest -verbose -qemu -vnc :0
+    fi
+}
+
+emulator_process_running() {
+    pgrep -f "emulator.*${AVD_NAME}" >/dev/null 2>&1 || pgrep -f 'qemu-system-x86_64' >/dev/null 2>&1
+}
+
+wait_for_emulator() {
+    if [[ "$CI" != "true" ]]; then return; fi
+
+    echo "Waiting for emulator to boot..."
+    local device_timeout=120
+    local device_elapsed=0
+    until adb devices | grep -qE '^emulator-[0-9]+\s+device'; do
+        if [[ $device_elapsed -ge $device_timeout ]]; then
+            echo "Emulator device did not appear within ${device_timeout}s"
+            adb devices -l || true
+            exit 1
+        fi
+        if ! emulator_process_running; then
+            echo "Emulator process exited before device appeared (check snapshot/cache state)"
+            exit 1
+        fi
+        sleep 5
+        device_elapsed=$((device_elapsed + 5))
+    done
+
+    local boot_timeout=300  # 5 minutes max
+    local boot_elapsed=0
+    until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; do
+        if [[ $boot_elapsed -ge $boot_timeout ]]; then
+            echo "Emulator failed to boot within 5 minutes"
+            exit 1
+        fi
+        if ! emulator_process_running; then
+            echo "Emulator process exited during boot"
+            exit 1
+        fi
+        echo "Waiting for emulator to fully boot..."
+        sleep 10
+        boot_elapsed=$((boot_elapsed + 10))
+    done
+    echo "Emulator is fully booted."
+
+    # API 35 emulators take longer to stabilize the instrumentation layer after
+    # sys.boot_completed — 15s was insufficient, causing the first Detox app
+    # launch to fail with "No activities in stage RESUMED".
+    sleep 30
+    adb shell pm list packages > /dev/null 2>&1
+    echo "Emulator is fully ready."
+}
+
+# Host of SITE_1_URL; empty when unset (local runs), which skips the network check.
+server_host() {
+    local url="${SITE_1_URL:-}"
+    url="${url#*://}"
+    echo "${url%%[/:]*}"
+}
+
+# ping prints "PING <host> (<ip>)" once the name resolves, even if ICMP gets no reply.
+emulator_resolves_host() {
+    local host="$1" timeout="$2" elapsed=0 out
+    while (( elapsed < timeout )); do
+        out=$(adb shell "ping -c 1 -W 3 ${host}" 2>&1 | tr -d '\r' | head -1 || true)
+        if [[ "$out" == "PING ${host} ("* ]]; then
+            echo "Emulator resolves ${host}: ${out}"
+            return 0
+        fi
+        echo "Emulator cannot resolve ${host} yet (${elapsed}s): ${out:-<no output>}"
+        sleep 5
+        elapsed=$(( elapsed + 5 ))
+    done
+    return 1
+}
+
+stop_emulator() {
+    adb emu kill 2>/dev/null || true
+    local elapsed=0
+    while emulator_process_running && (( elapsed < 30 )); do
+        sleep 2
+        elapsed=$(( elapsed + 2 ))
+    done
+    pkill -9 -f qemu-system 2>/dev/null || true
+}
+
+# An emulator can boot without working DNS, and then every connect to the server fails.
+# Cold-boot once; if it still can't resolve the server, stop before running any spec.
+ensure_emulator_network() {
+    local host
+    host=$(server_host)
+    if [[ -z "$host" ]]; then
+        return 0
+    fi
+    if [[ ! "$host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "::error::SITE_1_URL host '${host}' is not a hostname"
+        exit 1
+    fi
+    if emulator_resolves_host "$host" 60; then
+        return 0
+    fi
+    echo "::warning::Emulator cannot resolve ${host}; cold-booting it once"
+    stop_emulator
+    prepare_avd_for_boot
+    start_emulator
+    wait_for_emulator
+    if emulator_resolves_host "$host" 60; then
+        return 0
+    fi
+    echo "::error::Emulator still cannot resolve ${host} after a cold boot: this runner's emulator has no working DNS"
+    exit 1
+}
+
+resolve_app_apk() {
+    if [[ "${MAESTRO_ANDROID:-}" == "true" ]]; then
+        local release_apk="../android/app/build/outputs/apk/release/app-release.apk"
+        if [[ -f "$release_apk" ]]; then
+            echo "$release_apk"
+            return 0
+        fi
+        echo "Maestro release APK not found at $release_apk" >&2
+        ls -la ../android/app/build/outputs/apk/release/ 2>/dev/null || true
+        exit 1
+    fi
+    echo "../android/app/build/outputs/apk/debug/app-debug.apk"
+}
+
+install_app() {
+    local app_apk
+    app_apk=$(resolve_app_apk)
+    echo "Installing the app from $app_apk..."
+    adb install -r "$app_apk"
+    if [[ "${MAESTRO_ANDROID:-}" != "true" && "${BOOTSTRAP_ONLY:-}" != "true" ]]; then
+        # Install the test/instrumentation APK — required by Detox (reinstallApp: false assumes
+        # both the main APK and the test APK are already present on the device).
+        adb install -r ../android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+    fi
+    adb shell pm list packages | grep "com.mattermost.rnbeta" && echo "App is installed." || echo "App is not installed."
+}
+
+grant_android_runtime_permissions() {
+    local bundle_id="com.mattermost.rnbeta"
+    adb shell pm grant "$bundle_id" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+    adb shell pm grant "$bundle_id" android.permission.RECORD_AUDIO 2>/dev/null || true
+    adb shell pm grant "$bundle_id" android.permission.CAMERA 2>/dev/null || true
+    adb shell settings put secure show_ime_with_hard_keyboard 0 2>/dev/null || true
+    adb shell settings put secure spell_checker_enabled 0 2>/dev/null || true
+    adb shell settings put secure auto_text_enabled 0 2>/dev/null || true
+    # google_apis images ship Google Autofill; overlays on the server form hide
+    # FloatingTextInput testIDs from Maestro (same class of issue as iOS autofill).
+    adb shell settings put secure autofill_service null 2>/dev/null || true
+}
+
+configure_emulator_for_tests() {
+    adb shell settings put global window_animation_scale 0
+    adb shell settings put global transition_animation_scale 0
+    adb shell settings put global animator_duration_scale 0
+    adb shell input keyevent 82 2>/dev/null || true
+    adb root 2>/dev/null || true
+    adb shell setprop persist.sys.timezone "America/New_York" 2>/dev/null || true
+    adb shell setprop sys.timezone "America/New_York" 2>/dev/null || true
+    adb shell am broadcast -a android.intent.action.TIMEZONE_CHANGED \
+        --ez bypassUserRestrictions true 2>/dev/null || true
+    keep_display_awake
+    configure_chrome_for_ci
+}
+
+# Espresso resolves its root view by asking for the window that currently has
+# focus. If the display sleeps or the keyguard comes back, every window reports
+# has-window-focus=false and each launch fails with "Waited for the root of the
+# view hierarchy to have window focus and not request layout for 10 seconds"
+# before the app is ever given a chance to render.
+keep_display_awake() {
+    adb shell svc power stayon true 2>/dev/null || true
+    adb shell settings put system screen_off_timeout 2147483647 2>/dev/null || true
+    adb shell input keyevent KEYCODE_WAKEUP 2>/dev/null || true
+    adb shell wm dismiss-keyguard 2>/dev/null || true
+    adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS 2>/dev/null || true
+}
+
+configure_chrome_for_ci() {
+    adb shell 'mkdir -p /data/local/tmp' 2>/dev/null || true
+    adb shell 'echo "chrome --disable-fre --no-first-run --no-default-browser-check" > /data/local/tmp/chrome-command-line' 2>/dev/null || true
+    # Chrome only reads /data/local/tmp/chrome-command-line at process start, so it
+    # has to be started once for the flags to stick.
+    adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null || true
+    sleep 3
+    # A single BACK is not enough to get rid of Chrome: on swiftshader it is often
+    # still on its splash 3s in, so the keyevent lands on a window that ignores it
+    # and Chrome stays foregrounded holding window focus. Force-stop it instead and
+    # go back to the launcher, so the next window to take focus is the app Detox
+    # launches.
+    adb shell am force-stop com.android.chrome 2>/dev/null || true
+    adb shell input keyevent KEYCODE_HOME 2>/dev/null || true
+}
+
+# Fail fast and loudly here rather than 10s at a time inside every beforeAll.
+wait_for_focused_window() {
+    local timeout=60 elapsed=0 focus=""
+    while (( elapsed < timeout )); do
+        focus=$(adb shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 -E 'mCurrentFocus=' || true)
+        if [[ -n "$focus" && "$focus" != *"mCurrentFocus=null"* ]]; then
+            echo "Emulator has a focused window: ${focus}"
+            return 0
+        fi
+        echo "No focused window yet (${elapsed}s): ${focus:-<none>}"
+        keep_display_awake
+        sleep 5
+        elapsed=$(( elapsed + 5 ))
+    done
+    echo "ERROR: no focused window after ${timeout}s — Espresso root matching is expected to fail"
+    adb shell dumpsys window 2>/dev/null | tr -d '\r' | grep -E 'mCurrentFocus|mFocusedApp' || true
+    return 1
+}
+
+push_e2e_fixtures() {
+    local fixture="${SCRIPT_DIR}/e2e/support/fixtures/image.png"
+    if [[ -f "$fixture" ]]; then
+        adb push "$fixture" /sdcard/Download/test_bookmark.png
+        echo "Pushed test fixture to /sdcard/Download/test_bookmark.png"
+        adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
+            -d file:///sdcard/Download/test_bookmark.png 2>/dev/null || true
+    fi
+}
+
+start_server() {
+    echo "Starting the server..."
+    cd "$REPO_ROOT"
+    RUNNING_E2E=true npm run start &
+    local timeout=120 interval=5 elapsed=0
+
+    until nc -z localhost 8081; do
+        if [[ $elapsed -ge $timeout ]]; then
+            echo "Server did not start within 3 minutes."
+            exit 1
+        fi
+        echo "Waiting for server to be ready..."
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    echo "Server is ready."
+
+    echo "Pre-warming Metro Android bundle before Detox launchApp..."
+    local bundle_url="http://127.0.0.1:8081/index.bundle?platform=android&dev=true&minify=false"
+    local metro_status_url="http://127.0.0.1:8081/status"
+    local status_timeout=120 status_elapsed=0 status_interval=2
+
+    # Wait for Metro HTTP — does not trigger a bundle build.
+    until curl -sf "$metro_status_url" 2>/dev/null | grep -q "packager-status:running"; do
+        if [[ $status_elapsed -ge $status_timeout ]]; then
+            echo "ERROR: Metro packager did not report running within ${status_timeout}s"
+            exit 1
+        fi
+        echo "Waiting for Metro packager status... (${status_elapsed}s)"
+        sleep $status_interval
+        status_elapsed=$((status_elapsed + status_interval))
+    done
+
+    # One bundle request only. Polling the bundle URL in a loop starts a fresh Metro
+    # build on every curl (CI log: 94% → 0% repeatedly) and never finishes.
+    echo "Compiling Android bundle (single request, up to 300s)..."
+    local bundle_timeout=300
+    local bundle_file
+    bundle_file=$(mktemp)
+    if ! curl -sf --max-time "$bundle_timeout" "$bundle_url" -o "$bundle_file"; then
+        echo "ERROR: failed to download Metro Android bundle within ${bundle_timeout}s"
+        rm -f "$bundle_file"
+        exit 1
     fi
 
-    # Create virtual device in a relative "detox_pixel_4_xl_api_${SDK_VERSION}" folder
-    avdmanager create avd -n $NAME -k "system-images;android-${SDK_VERSION};default;${CPU_ARCH_FAMILY}" -p $NAME -d 'pixel'
+    local bundle_bytes
+    bundle_bytes=$(wc -c < "$bundle_file" | tr -d ' ')
+    if [[ "$bundle_bytes" -lt 500000 ]]; then
+        echo "ERROR: Metro Android bundle too small (${bundle_bytes} bytes)"
+        head -c 500 "$bundle_file" || true
+        rm -f "$bundle_file"
+        exit 1
+    fi
+    if ! grep -q '__d' "$bundle_file"; then
+        echo "ERROR: Metro Android bundle missing __d module marker"
+        rm -f "$bundle_file"
+        exit 1
+    fi
+    rm -f "$bundle_file"
+    echo "Metro Android bundle is ready (${bundle_bytes} bytes)."
+}
 
-    # Copy predefined config and skin
-    cp -r android_emulator/ $NAME/
-    sed -i -e "s|AvdId = change_avd_id|AvdId = ${NAME}|g" $NAME/config.ini
-    sed -i -e "s|avd.ini.displayname = change_avd_displayname|avd.ini.displayname = Detox Pixel 4 XL API ${SDK_VERSION}|g" $NAME/config.ini
-    sed -i -e "s|abi.type = change_type|abi.type = ${CPU_ARCH_FAMILY}|g" $NAME/config.ini
-    sed -i -e "s|hw.cpu.arch = change_cpu_arch|hw.cpu.arch = ${CPU_ARCH}|g" $NAME/config.ini
-    sed -i -e "s|image.sysdir.1 = change_to_image_sysdir/|image.sysdir.1 = system-images/android-${SDK_VERSION}/default/${CPU_ARCH_FAMILY}/|g" $NAME/config.ini
-    sed -i -e "s|skin.path = change_to_absolute_path/pixel_4_xl_skin|skin.path = $(pwd)/${NAME}/pixel_4_xl_skin|g" $NAME/config.ini
+setup_adb_reverse() {
+    echo "Setting up ADB reverse port forwarding..."
+    # adb root (in configure_emulator_for_tests) restarts adbd and drops prior reverse mappings.
+    adb reverse --remove-all 2>/dev/null || true
+    adb reverse tcp:8081 tcp:8081
+    if ! adb reverse --list | grep -q 'tcp:8081'; then
+        echo "ERROR: adb reverse tcp:8081 is not active after setup"
+        adb reverse --list || true
+        exit 1
+    fi
+    echo "adb reverse verified: $(adb reverse --list)"
 
-    echo "Android virtual device successfully created: ${NAME}"
-fi
+    # On an emulator React Native loads the bundle from 10.0.2.2 (the emulator's NAT alias for
+    # the host) unless metro.host is set, so the tunnel above went unused and a broken NAT path
+    # left every launch on "Unable to load script". Point it at the tunnel.
+    adb shell setprop metro.host localhost 2>/dev/null || true
+    if [[ "$(adb shell getprop metro.host | tr -d '\r')" == "localhost" ]]; then
+        echo "metro.host set to localhost"
+    else
+        echo "WARNING: metro.host did not stick (adbd not root?); the app falls back to 10.0.2.2:8081"
+    fi
+}
+
+run_detox_tests() {
+    echo "Running Detox tests... $@"
+
+    cd "$SCRIPT_DIR"
+    AVD_NAME="$AVD_NAME" npm run detox:config-gen
+    mkdir -p artifacts
+    npm run e2e:android-test -- "$@" -- --json --outputFile=artifacts/jest-results.json
+}
+
+emulator_is_ready() {
+    adb devices 2>/dev/null | grep -qE '^emulator-[0-9]+\s+device' || return 1
+    [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]] || return 1
+    adb shell pm list packages 2>/dev/null | grep -q 'com.mattermost.rnbeta' || return 1
+}
+
+reset_app_for_retry() {
+    local bundle_id="com.mattermost.rnbeta"
+    echo "Resetting app state for failed-spec retry..."
+    adb shell input keyevent KEYCODE_HOME 2>/dev/null || true
+    adb shell am force-stop "$bundle_id" 2>/dev/null || true
+    adb shell pm clear "$bundle_id" 2>/dev/null || true
+    if ! adb shell pm list packages 2>/dev/null | grep -q "$bundle_id"; then
+        echo "App missing after pm clear — reinstalling"
+        install_app
+    fi
+}
+
+run_tests_only() {
+    # The AVD lives under ANDROID_AVD_HOME (detox/.android/avd), not the default
+    # ~/.android/avd. main() only exports it on the cold-boot path, so the retry
+    # used to reach Detox with it unset: AVDValidator ran `emulator -list-avds`
+    setup_avd_home
+
+    if ! emulator_is_ready; then
+        echo "TESTS_ONLY: emulator is not ready"
+        exit 2
+    fi
+
+    # Exit 2 is the caller's "retry the cold-boot way" signal. Falling back beats
+    # failing the shard outright if the AVD is somehow still not visible.
+    if ! emulator -list-avds | grep -q "$AVD_NAME"; then
+        echo "TESTS_ONLY: '${AVD_NAME}' not listed under ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-<unset>} — falling back to cold boot"
+        exit 2
+    fi
+
+    # Booted is not enough: an emulator that lost DNS fails every spec again.
+    local host
+    host=$(server_host)
+    if [[ -n "$host" ]] && ! emulator_resolves_host "$host" 30; then
+        echo "TESTS_ONLY: emulator cannot resolve ${host} — falling back to cold boot"
+        exit 2
+    fi
+    reset_app_for_retry
+    grant_android_runtime_permissions
+    configure_emulator_for_tests
+    setup_adb_reverse
+    if ! nc -z localhost 8081 2>/dev/null; then
+        echo "Metro is down — restarting"
+        start_server
+    fi
+    push_e2e_fixtures
+    run_detox_tests "$@"
+}
+
+main() {
+    cd "$SCRIPT_DIR"
+
+    if [[ "${TESTS_ONLY:-}" == "true" ]]; then
+        run_tests_only "${TEST_FILES[@]}"
+        return
+    fi
+
+    setup_avd_home
+
+    if ! emulator -list-avds | grep -q "$AVD_NAME"; then
+        create_avd
+    else
+        echo "'${AVD_NAME}' Android virtual device already exists."
+        update_existing_avd_memory
+    fi
+
+    prepare_avd_for_boot
+    start_adb_server
+    start_emulator
+    wait_for_emulator
+
+    if [[ "$CI" == "true" ]]; then
+        ensure_emulator_network
+        install_app
+        # Maestro uses a release APK with an embedded bundle (mirrors iOS simulator builds).
+        if [[ "${MAESTRO_ANDROID:-}" != "true" ]]; then
+            start_server
+        fi
+        grant_android_runtime_permissions
+        configure_emulator_for_tests
+        if [[ "${MAESTRO_ANDROID:-}" != "true" ]]; then
+            setup_adb_reverse
+        fi
+        push_e2e_fixtures
+        wait_for_focused_window
+    fi
+
+    if [[ "${BOOTSTRAP_ONLY:-}" == "true" ]]; then
+        echo "Bootstrap complete (BOOTSTRAP_ONLY=true) — skipping Detox tests"
+        exit 0
+    fi
+
+    run_detox_tests "${TEST_FILES[@]}"
+}
+
+main

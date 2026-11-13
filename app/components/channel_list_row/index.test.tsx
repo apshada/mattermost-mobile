@@ -6,7 +6,7 @@ import React from 'react';
 import {renderWithEverything} from '@test/intl-test-helper';
 import TestHelper from '@test/test_helper';
 
-import ChannelListRow from '.';
+import ChannelListRow from './index';
 
 import type Database from '@nozbe/watermelondb/Database';
 
@@ -31,6 +31,7 @@ describe('components/channel_list_row', () => {
         group_constrained: null,
         shared: true,
     };
+
     beforeAll(async () => {
         const server = await TestHelper.setupServerDatabase();
         database = server.database;

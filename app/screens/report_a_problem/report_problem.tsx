@@ -1,0 +1,220 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+import React, {useCallback, useEffect, useState} from 'react';
+import {useIntl} from 'react-intl';
+import {View, Text, ScrollView, Platform} from 'react-native';
+import {SafeAreaView} from 'react-native-safe-area-context';
+
+import {savePreference} from '@actions/remote/preference';
+import Button from '@components/button';
+import MenuDivider from '@components/menu_divider';
+import SettingOption from '@components/settings/option';
+import {Preferences, Screens} from '@constants';
+import {DEFAULT_REPORT_A_PROBLEM_EMAIL} from '@constants/report_a_problem';
+import {useServerUrl} from '@context/server';
+import {useTheme} from '@context/theme';
+import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
+import {navigateBack} from '@screens/navigation';
+import {logDebug} from '@utils/log';
+import {emailLogs, getDefaultReportAProblemLink, shareLogs} from '@utils/share_logs';
+import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
+import {typography} from '@utils/typography';
+import {tryOpenURL} from '@utils/url';
+
+import AppLogs from './app_logs';
+import CopyMetadata from './copy_metadata';
+import {getCommonStyleSheet} from './styles';
+
+import type {ReportAProblemMetadata} from '@typings/screens/report_a_problem';
+
+type Props = {
+    reportAProblemMail?: string;
+    reportAProblemLink?: string;
+    siteName?: string;
+    allowDownloadLogs: boolean;
+    attachLogsEnabled: boolean;
+    currentUserId: string;
+    reportAProblemType?: string;
+    isFreeEdition: boolean;
+    metadata: ReportAProblemMetadata;
+}
+
+const getStyleSheet = makeStyleSheetFromTheme((theme) => ({
+    ...getCommonStyleSheet(theme),
+    container: {
+        flex: 1,
+        backgroundColor: theme.centerChannelBg,
+        paddingVertical: Platform.select({ios: 20, default: 0}),
+        gap: 20,
+    },
+    body: {
+        flex: 1,
+    },
+    content: {
+        gap: 16,
+        paddingHorizontal: 20,
+    },
+    detailsTitle: {
+        ...typography('Heading', 200, 'SemiBold'),
+        color: theme.centerChannelColor,
+    },
+    detailsSection: {
+        gap: 8,
+    },
+    buttonContainer: {
+        paddingHorizontal: 20,
+        marginTop: 'auto',
+        borderTopWidth: 1,
+        borderColor: changeOpacity(theme.centerChannelColor, 0.08),
+        width: '100%',
+        paddingTop: 20,
+        marginBottom: Platform.select({ios: 20, default: 0}),
+    },
+}));
+
+const ReportProblem = ({
+    reportAProblemMail,
+    reportAProblemLink,
+    siteName,
+    allowDownloadLogs,
+    attachLogsEnabled,
+    currentUserId,
+    reportAProblemType,
+    isFreeEdition,
+    metadata,
+}: Props) => {
+    const theme = useTheme();
+    const styles = getStyleSheet(theme);
+    const intl = useIntl();
+    const serverUrl = useServerUrl();
+    const [attachLogsToggle, setAttachLogsToggle] = useState(attachLogsEnabled);
+
+    useEffect(() => {
+        setAttachLogsToggle(attachLogsEnabled);
+    }, [attachLogsEnabled]);
+
+    const handleToggleAttachLogs = useCallback(async (value: boolean) => {
+        setAttachLogsToggle(value);
+        const {error} = await savePreference(serverUrl, [{
+            user_id: currentUserId,
+            category: Preferences.CATEGORIES.ADVANCED_SETTINGS,
+            name: Preferences.ATTACH_APP_LOGS,
+            value: String(value),
+        }]);
+        if (error) {
+            setAttachLogsToggle(!value);
+        }
+    }, [serverUrl, currentUserId]);
+
+    const handleReport = useCallback(async () => {
+        switch (reportAProblemType) {
+            case 'email':
+                await emailLogs(metadata, siteName, reportAProblemMail, !allowDownloadLogs);
+                return;
+            case 'link': {
+                let linkToUse = reportAProblemLink;
+                if (!linkToUse) {
+                    logDebug('Report a problem link is not set');
+                    linkToUse = getDefaultReportAProblemLink(!isFreeEdition);
+                }
+                tryOpenURL(linkToUse);
+                return;
+            }
+            case 'default': {
+                if (isFreeEdition) {
+                    tryOpenURL(getDefaultReportAProblemLink(false));
+                } else {
+                    await emailLogs(metadata, siteName, DEFAULT_REPORT_A_PROBLEM_EMAIL, !allowDownloadLogs);
+                }
+                return;
+            }
+            case 'hidden':
+                return;
+        }
+
+        // Old servers where reportAProblemType is not defined
+        if (!reportAProblemLink) {
+            await shareLogs(metadata, siteName, undefined, false);
+            return;
+        }
+
+        tryOpenURL(reportAProblemLink);
+    }, [reportAProblemType, reportAProblemLink, reportAProblemMail, metadata, siteName, allowDownloadLogs, isFreeEdition]);
+
+    useAndroidHardwareBackHandler(Screens.REPORT_PROBLEM, navigateBack);
+
+    const descriptionText = allowDownloadLogs ? intl.formatMessage({
+        id: 'screen.report_problem.details.description',
+        defaultMessage: 'When reporting a problem, share the metadata and app logs given below to help troubleshoot your problem faster',
+    }) : intl.formatMessage({
+        id: 'screen.report_problem.details.description_without_logs',
+        defaultMessage: 'When reporting a problem, share the metadata given below to help troubleshoot your problem faster',
+    });
+
+    return (
+        <SafeAreaView
+            style={styles.container}
+            testID='report_problem.screen'
+        >
+            <View style={styles.body}>
+                <ScrollView contentContainerStyle={styles.content}>
+                    <View style={styles.detailsSection}>
+                        <Text style={styles.detailsTitle}>
+                            {intl.formatMessage({
+                                id: 'screen.report_problem.details.title',
+                                defaultMessage: 'Troubleshooting details',
+                            })}
+                        </Text>
+                        <Text style={styles.bodyText}>
+                            {descriptionText}
+                        </Text>
+                    </View>
+                    <MenuDivider/>
+                    <CopyMetadata
+                        metadata={metadata}
+                        componentId={Screens.REPORT_PROBLEM}
+                    />
+                    {allowDownloadLogs && (
+                        <>
+                            <MenuDivider/>
+                            <SettingOption
+                                label={intl.formatMessage({
+                                    id: 'screen.report_problem.enable_log_attachments',
+                                    defaultMessage: 'Enable app log attachments',
+                                })}
+                                description={intl.formatMessage({
+                                    id: 'screen.report_problem.enable_log_attachments.description',
+                                    defaultMessage: 'Show an option to attach app logs in the file attachment menu',
+                                })}
+                                selected={attachLogsToggle}
+                                type='toggle'
+                                action={handleToggleAttachLogs}
+                                testID='report_problem.enable_log_attachments'
+                            />
+                            <MenuDivider/>
+                            <AppLogs/>
+                        </>
+                    )}
+                </ScrollView>
+            </View>
+            {reportAProblemType !== 'hidden' && (
+                <View style={styles.buttonContainer}>
+                    <Button
+                        theme={theme}
+                        text={intl.formatMessage({
+                            id: 'screen.report_problem.button',
+                            defaultMessage: 'Report a problem',
+                        })}
+                        onPress={handleReport}
+                        iconName='open-in-new'
+                        size='lg'
+                        isIconOnTheRight={true}
+                        testID='report_problem.report.button'
+                    />
+                </View>
+            )}
+        </SafeAreaView>
+    );
+};
+
+export default ReportProblem;

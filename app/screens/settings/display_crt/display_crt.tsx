@@ -2,43 +2,35 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback, useState} from 'react';
-import {useIntl} from 'react-intl';
+import {defineMessage, useIntl} from 'react-intl';
 
 import {handleCRTToggled, savePreference} from '@actions/remote/preference';
 import SettingBlock from '@components/settings/block';
 import SettingContainer from '@components/settings/container';
 import SettingOption from '@components/settings/option';
 import SettingSeparator from '@components/settings/separator';
-import {Preferences} from '@constants';
+import {Preferences, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
 import useBackNavigation from '@hooks/navigate_back';
-import {t} from '@i18n';
-import {popTopScreen} from '@screens/navigation';
 import EphemeralStore from '@store/ephemeral_store';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
-const crtDescription = {
-    id: t('settings_display.crt.desc'),
+const crtDescription = defineMessage({
+    id: 'settings_display.crt.desc',
     defaultMessage: 'When enabled, reply messages are not shown in the channel and you\'ll be notified about threads you\'re following in the "Threads" view.',
-};
+});
 
 type Props = {
-    componentId: AvailableScreens;
     currentUserId: string;
     isCRTEnabled: boolean;
 }
 
-const DisplayCRT = ({componentId, currentUserId, isCRTEnabled}: Props) => {
+const DisplayCRT = ({currentUserId, isCRTEnabled}: Props) => {
     const [isEnabled, setIsEnabled] = useState(isCRTEnabled);
     const serverUrl = useServerUrl();
     const intl = useIntl();
 
-    const close = () => popTopScreen(componentId);
-
     const saveCRTPreference = useCallback(async () => {
-        close();
         if (isCRTEnabled !== isEnabled) {
             const crtPreference: PreferenceType = {
                 category: Preferences.CATEGORIES.DISPLAY_SETTINGS,
@@ -53,10 +45,10 @@ const DisplayCRT = ({componentId, currentUserId, isCRTEnabled}: Props) => {
                 handleCRTToggled(serverUrl);
             }
         }
-    }, [isEnabled, isCRTEnabled, serverUrl]);
+    }, [isCRTEnabled, isEnabled, currentUserId, serverUrl]);
 
     useBackNavigation(saveCRTPreference);
-    useAndroidHardwareBackHandler(componentId, saveCRTPreference);
+    useAndroidHardwareBackHandler(Screens.SETTINGS_DISPLAY_CRT, saveCRTPreference);
 
     return (
         <SettingContainer testID='crt_display_settings'>

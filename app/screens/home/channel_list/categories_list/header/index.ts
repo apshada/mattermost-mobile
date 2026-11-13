@@ -3,28 +3,32 @@
 
 import {withDatabase, withObservables} from '@nozbe/watermelondb/react';
 import {combineLatest, of as of$} from 'rxjs';
-import {distinctUntilChanged, switchMap} from 'rxjs/operators';
+import {distinctUntilChanged, map, switchMap} from 'rxjs/operators';
 
 import {Permissions} from '@constants';
+import {withServerUrl} from '@context/server';
 import {observePermissionForTeam} from '@queries/servers/role';
-import {observeConfigBooleanValue, observePushVerificationStatus} from '@queries/servers/system';
-import {observeCurrentTeam} from '@queries/servers/team';
+import {observeConfig, observeConfigBooleanValue, observePushVerificationStatus} from '@queries/servers/system';
+import {observeCurrentTeam, queryMyTeams} from '@queries/servers/team';
 import {observeCurrentUser} from '@queries/servers/user';
+import EphemeralStore from '@store/ephemeral_store';
+import {isZeroPersistenceConfig, parseNonNegativeConfigNumber} from '@utils/config';
 
 import ChannelListHeader from './header';
 
 import type {WithDatabaseArgs} from '@typings/database/database';
 
-const enhanced = withObservables([], ({database}: WithDatabaseArgs) => {
+type EnhanceProps = WithDatabaseArgs & {
+    serverUrl: string;
+};
+
+const enhanced = withObservables([], ({database, serverUrl}: EnhanceProps) => {
     const team = observeCurrentTeam(database);
 
     const currentUser = observeCurrentUser(database);
 
-    const enableOpenServer = observeConfigBooleanValue(database, 'EnableOpenServer');
-
     const canJoinChannels = combineLatest([currentUser, team]).pipe(
         switchMap(([u, t]) => observePermissionForTeam(database, t, u, Permissions.JOIN_PUBLIC_CHANNELS, true)),
-        distinctUntilChanged(),
     );
 
     const canCreatePublicChannels = combineLatest([currentUser, team]).pipe(
@@ -44,19 +48,62 @@ const enhanced = withObservables([], ({database}: WithDatabaseArgs) => {
         switchMap(([u, t]) => observePermissionForTeam(database, t, u, Permissions.ADD_USER_TO_TEAM, false)),
     );
 
+    const guestAccountsEnabled = observeConfigBooleanValue(database, 'EnableGuestAccounts');
+
+    const canInviteGuests = combineLatest([guestAccountsEnabled, currentUser, team]).pipe(
+        switchMap(([enabled, u, t]) => {
+            if (!enabled) {
+                return of$(false);
+            }
+            return observePermissionForTeam(database, t, u, Permissions.INVITE_GUEST, false);
+        }),
+        distinctUntilChanged(),
+    );
+
+    const canInvitePeople = combineLatest([canAddUserToTeam, canInviteGuests]).pipe(
+        switchMap(([add, invite]) => of$(add || invite)),
+        distinctUntilChanged(),
+    );
+
+    const teamsCount = queryMyTeams(database).observeCount(false);
+
+    const config = observeConfig(database);
+
     return {
         canCreateChannels,
         canJoinChannels,
-        canInvitePeople: combineLatest([enableOpenServer, canAddUserToTeam]).pipe(
-            switchMap(([openServer, addUser]) => of$(openServer && addUser)),
+        canInvitePeople,
+        canJoinOtherTeams: EphemeralStore.observeCanJoinOtherTeams(serverUrl),
+        currentTeamId: team.pipe(
+            switchMap((t) => of$(t?.id ?? '')),
             distinctUntilChanged(),
         ),
         displayName: team.pipe(
             switchMap((t) => of$(t?.displayName)),
             distinctUntilChanged(),
         ),
+        ephemeralModeEnabled: config.pipe(
+            map((c) => c?.MobileEphemeralModeEnabled === 'true'),
+            distinctUntilChanged(),
+        ),
+        ephemeralModePurgeHours: config.pipe(
+            map((c) => parseNonNegativeConfigNumber(c?.MobileEphemeralModeOfflinePersistenceTimerHours)),
+            distinctUntilChanged(),
+        ),
+        ephemeralModeCleanupDays: config.pipe(
+            map((c) => parseNonNegativeConfigNumber(c?.MobileEphemeralModeAutoCacheCleanupDays)),
+            distinctUntilChanged(),
+        ),
+        isZeroPersistenceMode: config.pipe(
+            map((c) => isZeroPersistenceConfig(c)),
+            distinctUntilChanged(),
+        ),
+        hasMoreThanOneTeam: teamsCount.pipe(
+            switchMap((v) => of$(v > 1)),
+            distinctUntilChanged(),
+        ),
         pushProxyStatus: observePushVerificationStatus(database),
     };
 });
 
-export default withDatabase(enhanced(ChannelListHeader));
+export default withDatabase(withServerUrl(enhanced(ChannelListHeader)));

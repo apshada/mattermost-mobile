@@ -2,14 +2,12 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {useIntl} from 'react-intl';
 import {
     Text,
     TouchableOpacity,
     View,
 } from 'react-native';
 import Animated, {useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {dismissAnnouncement} from '@actions/local/systems';
 import CompassIcon from '@components/compass_icon';
@@ -19,7 +17,6 @@ import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import {bottomSheet} from '@screens/navigation';
 import {bottomSheetSnapPoint} from '@utils/helpers';
-import {getMarkdownTextStyles} from '@utils/markdown';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
@@ -64,8 +61,6 @@ const getStyle = makeStyleSheetFromTheme((theme: Theme) => ({
     },
 }));
 
-const CLOSE_BUTTON_ID = 'announcement-close';
-
 const BUTTON_HEIGHT = 48; // From /app/utils/buttonStyles.ts, lg button
 const TITLE_HEIGHT = 30 + 12; // typography 600 line height
 const MARGINS = 12 + 24 + 10; // (after title + after text + after content) from ./expanded_announcement_banner.tsx
@@ -82,14 +77,11 @@ const AnnouncementBanner = ({
     bannerTextColor = '#000',
     allowDismissal,
 }: Props) => {
-    const intl = useIntl();
     const serverUrl = useServerUrl();
     const height = useSharedValue(0);
-    const {bottom} = useSafeAreaInsets();
     const theme = useTheme();
     const [visible, setVisible] = useState(false);
     const style = getStyle(theme);
-    const markdownTextStyles = getMarkdownTextStyles(theme);
 
     const renderContent = useCallback(() => (
         <ExpandedAnnouncementBanner
@@ -99,25 +91,13 @@ const AnnouncementBanner = ({
     ), [allowDismissal, bannerText]);
 
     const handlePress = useCallback(() => {
-        const title = intl.formatMessage({
-            id: 'mobile.announcement_banner.title',
-            defaultMessage: 'Announcement',
-        });
-
         const snapPoint = bottomSheetSnapPoint(
             1,
             SNAP_POINT_WITHOUT_DISMISS + (allowDismissal ? DISMISS_BUTTON_HEIGHT : 0),
-            bottom,
         );
 
-        bottomSheet({
-            closeButtonId: CLOSE_BUTTON_ID,
-            title,
-            renderContent,
-            snapPoints: [1, snapPoint],
-            theme,
-        });
-    }, [theme.sidebarHeaderTextColor, intl.locale, renderContent, allowDismissal, bottom]);
+        bottomSheet(renderContent, [1, snapPoint]);
+    }, [allowDismissal, renderContent]);
 
     const handleDismiss = useCallback(() => {
         dismissAnnouncement(serverUrl, bannerText);
@@ -132,7 +112,7 @@ const AnnouncementBanner = ({
         height.value = withTiming(visible ? ANNOUNCEMENT_BAR_HEIGHT : 0, {
             duration: 200,
         });
-    }, [visible]);
+    }, [height, visible]);
 
     const bannerStyle = useAnimatedStyle(() => ({
         height: height.value,
@@ -168,7 +148,6 @@ const AnnouncementBanner = ({
                                 {'  '}
                                 <RemoveMarkdown
                                     value={bannerText}
-                                    textStyle={markdownTextStyles}
                                     baseStyle={style.bannerText}
                                 />
                             </Text>

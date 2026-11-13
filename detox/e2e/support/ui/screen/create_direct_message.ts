@@ -2,12 +2,14 @@
 // See LICENSE.txt for license information.
 
 import {ProfilePicture} from '@support/ui/component';
+import {dismissKnownModals} from '@support/ui/modal_dismiss';
 import {ChannelListScreen} from '@support/ui/screen';
-import {isIos, timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {isAndroid, isIos, timeouts, wait, waitForElementToBeVisible, waitForElementToNotExist} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class CreateDirectMessageScreen {
     testID = {
+        selectedDMUserPrefix: 'create_direct_message.',
         selectedUserPrefix: 'create_direct_message.selected_user.',
         userItemPrefix: 'create_direct_message.user_list.user_item.',
         createDirectMessageScreen: 'create_direct_message.screen',
@@ -20,8 +22,10 @@ class CreateDirectMessageScreen {
         sectionUserList: 'create_direct_message.user_list.section_list',
         tutorialHighlight: 'tutorial_highlight',
         tutorialSwipeLeft: 'tutorial_swipe_left',
+        scheduledPostTooltipCloseButton: 'scheduled_post.tooltip.close.button',
     };
 
+    scheduledPostTooltipCloseButton = element(by.id(this.testID.scheduledPostTooltipCloseButton));
     createDirectMessageScreen = element(by.id(this.testID.createDirectMessageScreen));
     closeButton = element(by.id(this.testID.closeButton));
     startButton = element(by.id(this.testID.startButton));
@@ -41,37 +45,141 @@ class CreateDirectMessageScreen {
         return element(by.id(`${this.testID.selectedUserPrefix}${userId}.display_name`));
     };
 
+    getSelectedDMUserDisplayName = (userId: string) => {
+        return element(by.id(`${this.testID.selectedDMUserPrefix}${userId}.display_name`));
+    };
+
     getSelectedUserRemoveButton = (userId: string) => {
         return element(by.id(`${this.testID.selectedUserPrefix}${userId}.remove.button`));
     };
 
+    // App builds user_item.{id}.{userId} (UserListRow + UserItem). Prefer display_name —
+    // the row container can fail Detox visibility/hittest while the text child is unique.
     getUserItem = (userId: string) => {
-        return element(by.id(`${this.testID.userItemPrefix}${userId}`));
+        return element(by.id(`${this.testID.userItemPrefix}${userId}.${userId}`));
     };
 
     getUserItemProfilePicture = (userId: string) => {
-        return element(ProfilePicture.getProfilePictureItemMatcher(this.testID.userItemPrefix, userId));
+        return element(ProfilePicture.getProfilePictureItemMatcher(this.testID.userItemPrefix, `${userId}.${userId}`));
     };
 
     getUserItemDisplayName = (userId: string) => {
-        return element(by.id(`${this.testID.userItemPrefix}${userId}.display_name`));
+        return element(by.id(`${this.testID.userItemPrefix}${userId}.${userId}.display_name`));
+    };
+
+    // Wait for search spinner to settle on the per-userId display_name, then tap it.
+    selectUser = async (userId: string) => {
+        const displayName = this.getUserItemDisplayName(userId);
+        await waitFor(displayName).toBeVisible(isAndroid() ? 40 : 75).withTimeout(timeouts.HALF_MIN);
+
+        // Corner-tap on Android: row center can sit under keyboard/insets.
+        if (isAndroid()) {
+            await displayName.tap({x: 1, y: 1});
+        } else {
+            await displayName.tap();
+        }
+    };
+
+    searchAndSelectUser = async (username: string, userId: string) => {
+        await this.searchInput.replaceText(username);
+        try {
+            await this.searchInput.tapReturnKey();
+        } catch {
+            // Keyboard may already be dismissed.
+        }
+        await this.selectUser(userId);
+    };
+
+    longPressProfileTutorialText = element(by.text("Long-press on an item to view a user's profile"));
+
+    dismissLongPressProfileTutorial = async () => {
+        // The long-press profile tutorial is a RN Modal with pointerEvents='none'; only hardware
+        // Back dismisses it. Press Back exactly once, and only while the tutorial is present.
+        try {
+            await waitFor(this.longPressProfileTutorialText).toBeVisible().withTimeout(timeouts.THREE_SEC);
+            await device.pressBack();
+            await waitFor(this.longPressProfileTutorialText).not.toExist().withTimeout(timeouts.FIVE_SEC);
+        } catch {
+            // Tutorial not shown or already dismissed.
+        }
     };
 
     toBeVisible = async () => {
-        if (isIos()) {
-            await waitFor(this.createDirectMessageScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        if (isAndroid()) {
+            await this.dismissLongPressProfileTutorial();
+            await waitFor(this.createDirectMessageScreen).toExist().withTimeout(timeouts.ONE_MIN);
+        } else {
+            await waitFor(this.createDirectMessageScreen).toExist().withTimeout(timeouts.ONE_MIN);
         }
+        try {
+            await waitFor(this.searchInput).toBeVisible().withTimeout(timeouts.TEN_SEC);
+        } catch {
+            await waitFor(this.searchInput).toExist().withTimeout(timeouts.TEN_SEC);
+        }
+        await wait(timeouts.HALF_SEC);
 
         return this.createDirectMessageScreen;
     };
 
-    open = async () => {
-        // # Open create direct message screen
-        await ChannelListScreen.headerPlusButton.tap();
-        await wait(timeouts.ONE_SEC);
-        await ChannelListScreen.openDirectMessageItem.tap();
+    dismissScheduledPostTooltip = async () => {
+        try {
+            await waitFor(this.scheduledPostTooltipCloseButton).toBeVisible().withTimeout(timeouts.TWO_SEC);
+            await this.scheduledPostTooltipCloseButton.tap();
+        } catch {
+            // Tooltip is optional on first open
+        }
+    };
 
-        return this.toBeVisible();
+    open = async () => {
+        try {
+            await waitFor(this.createDirectMessageScreen).toExist().withTimeout(timeouts.TWO_SEC);
+            await this.closeButton.tap();
+            await waitForElementToNotExist(this.createDirectMessageScreen, timeouts.TEN_SEC);
+        } catch {
+            // DM screen is not already open
+        }
+
+        await dismissKnownModals(2);
+
+        // Android: the menu-item tap runs inside openPlusMenu's sync-off window, so sync is not turned back on
+        // between the plus tap and this tap and off again. Sync comes back on before waiting for the screen —
+        // navigation must settle while the bridge is tracked (machine-9 log: 60s toExist timeout with sync off).
+        await ChannelListScreen.openPlusMenu(async () => {
+            await waitForElementToBeVisible(ChannelListScreen.openDirectMessageItem, timeouts.TEN_SEC);
+            await wait(timeouts.HALF_SEC);
+
+            /* eslint-disable no-await-in-loop -- retry menu item tap while plus-menu animation settles */
+            for (let i = 0; i < 3; i++) {
+                try {
+                    await ChannelListScreen.openDirectMessageItem.tap();
+                    break;
+                } catch (err) {
+                    if (i === 2) {
+                        throw err;
+                    }
+                    await wait(timeouts.ONE_SEC);
+                }
+            }
+            /* eslint-enable no-await-in-loop */
+        });
+
+        if (isAndroid()) {
+            // A long-press tutorial Modal holds the Dialog window focus, so Espresso cannot see
+            // create_direct_message.screen until the tutorial is dismissed.
+            await wait(timeouts.ONE_SEC);
+            await this.dismissLongPressProfileTutorial();
+            await waitFor(this.createDirectMessageScreen).toExist().withTimeout(timeouts.TWENTY_SEC);
+            await this.dismissScheduledPostTooltip();
+        }
+
+        await this.toBeVisible();
+
+        // Wait for any SVG animation overlay to clear before proceeding.
+        await wait(timeouts.ONE_SEC);
+        await this.closeTutorial();
+        await this.dismissScheduledPostTooltip();
+
+        return this.createDirectMessageScreen;
     };
 
     close = async () => {
@@ -80,14 +188,18 @@ class CreateDirectMessageScreen {
     };
 
     closeTutorial = async () => {
-        if (isIos()) {
-            await waitFor(this.tutorialHighlight).toExist().withTimeout(timeouts.TEN_SEC);
-            await this.tutorialSwipeLeft.tap();
-            await expect(this.tutorialHighlight).not.toExist();
-        } else {
-            await wait(timeouts.ONE_SEC);
-            await device.pressBack();
-            await wait(timeouts.ONE_SEC);
+        try {
+            if (isIos()) {
+                await waitFor(this.tutorialHighlight).toExist().withTimeout(timeouts.TEN_SEC);
+                await this.tutorialSwipeLeft.tap();
+                await waitFor(this.tutorialHighlight).not.toExist().withTimeout(timeouts.TEN_SEC);
+            } else {
+                // dismissLongPressProfileTutorial() handles the single guarded pressBack — a blind
+                // pressBack here dismisses create_direct_message.screen underneath the tutorial.
+                await this.dismissLongPressProfileTutorial();
+            }
+        } catch {
+            // Tutorial may not appear if already dismissed in a previous run
         }
     };
 }

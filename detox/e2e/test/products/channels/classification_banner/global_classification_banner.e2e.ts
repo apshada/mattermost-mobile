@@ -1,0 +1,250 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {enableClassificationMarkings} from '@support/classification_test_helper';
+import {Properties, Setup, System} from '@support/server_api';
+import {canMutateServer, requireMutationServer} from '@support/server_role';
+import {serverOneUrl, siteOneUrl} from '@support/test_config';
+import {GlobalClassificationBanner} from '@support/ui/component';
+import {ChannelListScreen, ChannelScreen, GlobalThreadsScreen, HomeScreen, LoginScreen, ServerScreen} from '@support/ui/screen';
+import {reloadApp, timeouts, wait} from '@support/utils';
+import {by, element, expect, waitFor} from 'detox';
+
+jest.setTimeout(timeouts.ONE_MIN * 30);
+
+describe('Classification Banner - Global Classification Banner', () => {
+    const serverOneDisplayName = 'Server 1';
+    let testUser: any;
+
+    // Runs alone on the mutation server (detox/e2e/server_mutation_specs.json), so no lock is needed.
+    beforeAll(async () => {
+        requireMutationServer('global_classification_banner');
+
+        // Enable once for the whole suite. Individual tests must not re-enable or unset it.
+        await enableClassificationMarkings(siteOneUrl);
+
+        const {user} = await Setup.apiInit(siteOneUrl);
+        testUser = user;
+
+        await Properties.apiCleanupClassification(siteOneUrl);
+
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(testUser);
+    });
+
+    afterAll(async () => {
+        if (!canMutateServer) {
+            await HomeScreen.logout();
+            return;
+        }
+
+        try {
+            // Clean up the classification config but leave the feature flag enabled.
+            await Properties.apiCleanupClassification(siteOneUrl);
+        } finally {
+            await HomeScreen.logout();
+        }
+    });
+
+    afterEach(async () => {
+        if (canMutateServer) {
+            await Properties.apiCleanupClassification(siteOneUrl);
+        }
+    });
+
+    it('MM-T6197_1 - should render the banner on the channel list screen when classification is configured', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+    });
+
+    it('MM-T6198_1 - should render the banner on the channel screen when classification is configured', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+        await waitFor(element(by.id('channel_list_header.team_display_name'))).toExist().withTimeout(timeouts.TEN_SEC * 3);
+        await wait(timeouts.TWO_SEC);
+        await ChannelScreen.open('channels', 'town-square');
+
+        await GlobalClassificationBanner.toBeVisible();
+
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await ChannelScreen.back();
+    });
+
+    it('MM-T6199_1 - should render the banner on the global threads screen when classification is configured', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+        await GlobalThreadsScreen.open();
+
+        await GlobalClassificationBanner.toBeVisible();
+
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await GlobalThreadsScreen.back();
+    });
+
+    it('MM-T6200_1 - should not render the banner when no classification value is set', async () => {
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toNotBeVisible();
+    });
+
+    it('MM-T6201_1 - should persist the banner across channel navigation', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await waitFor(element(by.id('channel_list_header.team_display_name'))).toExist().withTimeout(timeouts.TEN_SEC * 3);
+        await wait(timeouts.TWO_SEC);
+        await ChannelScreen.open('channels', 'town-square');
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await ChannelScreen.back();
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+    });
+
+    it('MM-T6202_1 - should update the banner when classification level changes', async () => {
+        const {linkedFieldId, optionIdsByName} = await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        const secretOptionId = optionIdsByName.SECRET;
+        if (!secretOptionId) {
+            throw new Error(`SECRET option id missing from setup. Available: ${Object.keys(optionIdsByName).join(', ')}`);
+        }
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await Properties.apiPatchSystemPropertyValues(siteOneUrl, 'access_control', [
+            {field_id: linkedFieldId, value: secretOptionId},
+        ]);
+
+        await reloadApp();
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('SECRET'))).toBeVisible();
+        await waitFor(element(by.text('TOP SECRET'))).not.toBeVisible().withTimeout(timeouts.FOUR_SEC);
+    });
+
+    it('MM-T6203_1 - should remove the banner when classification configuration is deleted', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await Properties.apiCleanupClassification(siteOneUrl);
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toNotBeVisible();
+    });
+
+    it('MM-T6205_1 - should not render the banner on the channel screen when classification is removed while on channel list', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+        await GlobalClassificationBanner.toBeVisible();
+
+        await Properties.apiCleanupClassification(siteOneUrl);
+        await reloadApp();
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toNotBeVisible();
+
+        await waitFor(element(by.id('channel_list_header.team_display_name'))).toExist().withTimeout(timeouts.TEN_SEC * 3);
+        await wait(timeouts.TWO_SEC);
+        await ChannelScreen.open('channels', 'town-square');
+
+        await GlobalClassificationBanner.toNotBeVisible();
+
+        await ChannelScreen.back();
+    });
+
+    it('MM-T6204_1 - should remove the banner when the feature flag is toggled off', async () => {
+        await Properties.apiSetupClassificationWithBanner(siteOneUrl, {
+            levelId: 'lvltopsecret00000000000000',
+            user: testUser,
+        });
+        await reloadApp();
+
+        await ChannelListScreen.toBeVisible();
+
+        await GlobalClassificationBanner.toBeVisible();
+        await expect(element(by.text('TOP SECRET'))).toBeVisible();
+
+        await Properties.apiCleanupClassification(siteOneUrl);
+
+        try {
+            // Inside the try so the finally below restores the flag even if the patch throws.
+            const {error: flagError} = await System.apiPatchFeatureFlags(siteOneUrl, {
+                ClassificationMarkings: false,
+            });
+            if (flagError) {
+                throw new Error(`Failed to turn ClassificationMarkings off: ${JSON.stringify(flagError)}`);
+            }
+
+            await reloadApp();
+
+            await ChannelListScreen.toBeVisible();
+
+            await waitFor(element(by.id('global_classification_banner'))).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
+        } finally {
+            // Restore even when reload/assert fail so later specs on this server see the flag on.
+            await enableClassificationMarkings(siteOneUrl);
+        }
+    });
+});

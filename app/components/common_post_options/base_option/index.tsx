@@ -2,22 +2,22 @@
 // See LICENSE.txt for license information.
 
 import React from 'react';
-import {useIntl} from 'react-intl';
+import {useIntl, type MessageDescriptor} from 'react-intl';
 
 import OptionItem from '@components/option_item';
 
+import type {CompassIconName} from '@components/compass_icon';
+
 type BaseOptionType = {
-    defaultMessage: string;
-    i18nId: string;
-    iconName: string;
+    message: MessageDescriptor;
+    iconName: CompassIconName;
     isDestructive?: boolean;
     onPress: () => void;
     testID: string;
 }
 
 const BaseOption = ({
-    defaultMessage,
-    i18nId,
+    message,
     iconName,
     isDestructive = false,
     onPress,
@@ -30,7 +30,8 @@ const BaseOption = ({
             action={onPress}
             destructive={isDestructive}
             icon={iconName}
-            label={intl.formatMessage({id: i18nId, defaultMessage})}
+            label={intl.formatMessage(message)}
+            labelNumberOfLines={1}
             testID={testID}
             type='default'
         />

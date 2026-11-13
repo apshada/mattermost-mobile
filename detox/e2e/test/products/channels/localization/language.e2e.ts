@@ -1,0 +1,110 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {Setup, User} from '@support/server_api';
+import {
+    serverOneUrl,
+    siteOneUrl,
+} from '@support/test_config';
+import {
+    AccountScreen,
+    DisplaySettingsScreen,
+    HomeScreen,
+    LoginScreen,
+    ServerScreen,
+    SettingsScreen,
+} from '@support/ui/screen';
+import {reloadApp, timeouts, wait, waitForElementToBeVisible} from '@support/utils';
+import {expect} from 'detox';
+
+describe('Localization', () => {
+    const serverOneDisplayName = 'Server 1';
+    let testUser: any;
+
+    beforeAll(async () => {
+        const {user} = await Setup.apiInit(siteOneUrl);
+        testUser = user;
+
+        // # Patch user locale to Spanish
+        await User.apiPatchUser(siteOneUrl, testUser.id, {locale: 'es'});
+
+        // # Log in to server
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(testUser);
+        await waitForElementToBeVisible(element(by.text('Hilos')), timeouts.ONE_MIN);
+    });
+
+    afterAll(async () => {
+        // # Restore the user's locale to English so subsequent tests are not affected
+        await User.apiPatchUser(siteOneUrl, testUser.id, {locale: 'en'});
+        await HomeScreen.logout();
+    });
+
+    it('MM-T303 - Text looks correct when viewed in a non-English language', async () => {
+        // * Verify Home screen elements are in Spanish
+        await waitForElementToBeVisible(element(by.text('Hilos')), timeouts.TEN_SEC);
+        await expect(element(by.text('CANALES'))).toBeVisible();
+        await expect(element(by.text('MENSAJES DIRECTOS'))).toBeVisible();
+        await expect(element(by.text('Encontrar canales...'))).toBeVisible();
+
+        // # Go to Account screen
+        await AccountScreen.open();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify Account screen elements are in Spanish
+        await expect(element(by.text('Establecer un estado personalizado'))).toBeVisible();
+        await expect(element(by.text('Tu Perfil'))).toBeVisible();
+        await expect(element(by.text('Ajustes'))).toBeVisible();
+        await expect(element(by.text('Salir'))).toBeVisible();
+
+        // # Go to Settings screen
+        await AccountScreen.settingsOption.tap();
+
+        // * Verify Settings screen title or elements
+        await SettingsScreen.toBeVisible();
+
+        // "Pantalla" instead of "Display"
+        await expect(element(by.text('Pantalla'))).toBeVisible();
+
+        // # Go to Display Settings
+        await DisplaySettingsScreen.open();
+        await DisplaySettingsScreen.toBeVisible();
+
+        // * Verify Display Settings elements
+        // "Tema" instead of "Theme"
+        await expect(element(by.text('Tema'))).toBeVisible();
+
+        // # Navigate back
+        await DisplaySettingsScreen.back();
+        await SettingsScreen.close();
+    });
+
+    it('MM-T304 - RN: No crash when setting language to zh-TW (Chinese Traditional)', async () => {
+        // # Change language to zh-TW via API
+        await User.apiPatchUser(siteOneUrl, testUser.id, {locale: 'zh-TW'});
+
+        // # Reload the app so it picks up the new locale from the server DB.
+        // Language changes via API are not picked up in real-time without a reload.
+        await reloadApp();
+
+        // # Wait for channel list to become visible without requiring bridge idle.
+        // After reloadReactNative network sync keeps the bridge busy; poll without idle check.
+        await waitForElementToBeVisible(element(by.id('channel_list.screen')), timeouts.ONE_MIN);
+
+        // # Wait for network sync to settle so subsequent bridge-idle actions don't timeout
+        await wait(timeouts.FIVE_SEC);
+
+        // * Verify app is still running and not crashed (check for Home screen visibility)
+        await HomeScreen.channelListTab.tap();
+        await HomeScreen.toBeVisible();
+
+        // * Verify text update — "頻道" is Traditional Chinese for "Channels"
+        await expect(element(by.text('頻道'))).toBeVisible();
+    });
+});

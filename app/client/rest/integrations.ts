@@ -14,6 +14,8 @@ export interface ClientIntegrationsMix {
     executeCommand: (command: string, commandArgs?: CommandArgs) => Promise<CommandResponse>;
     addCommand: (command: Command) => Promise<Command>;
     submitInteractiveDialog: (data: DialogSubmission) => Promise<any>;
+    lookupInteractiveDialog: (data: DialogSubmission) => Promise<any>;
+    executeDialogAction: (data: ExecuteDialogActionRequest) => Promise<ExecuteDialogActionResponse>;
 }
 
 const ClientIntegrations = <TBase extends Constructor<ClientBase>>(superclass: TBase) => class extends superclass {
@@ -39,8 +41,6 @@ const ClientIntegrations = <TBase extends Constructor<ClientBase>>(superclass: T
     };
 
     executeCommand = async (command: string, commandArgs = {}) => {
-        this.analytics?.trackAPI('api_integrations_used');
-
         return this.doFetch(
             `${this.getCommandsRoute()}/execute`,
             {method: 'post', body: {command, ...commandArgs}},
@@ -48,8 +48,6 @@ const ClientIntegrations = <TBase extends Constructor<ClientBase>>(superclass: T
     };
 
     addCommand = async (command: Command) => {
-        this.analytics?.trackAPI('api_integrations_created');
-
         return this.doFetch(
             `${this.getCommandsRoute()}`,
             {method: 'post', body: command},
@@ -57,9 +55,22 @@ const ClientIntegrations = <TBase extends Constructor<ClientBase>>(superclass: T
     };
 
     submitInteractiveDialog = async (data: DialogSubmission) => {
-        this.analytics?.trackAPI('api_interactive_messages_dialog_submitted');
         return this.doFetch(
             `${this.urlVersion}/actions/dialogs/submit`,
+            {method: 'post', body: data},
+        );
+    };
+
+    lookupInteractiveDialog = async (data: DialogSubmission) => {
+        return this.doFetch(
+            `${this.urlVersion}/actions/dialogs/lookup`,
+            {method: 'post', body: data},
+        );
+    };
+
+    executeDialogAction = async (data: ExecuteDialogActionRequest) => {
+        return this.doFetch(
+            `${this.urlVersion}/actions/dialogs/execute`,
             {method: 'post', body: data},
         );
     };

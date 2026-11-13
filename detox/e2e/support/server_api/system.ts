@@ -3,6 +3,8 @@
 
 import path from 'path';
 
+import {timeouts, wait} from '@support/utils';
+import {withTransportRetry} from '@support/utils/transport_retry';
 import jestExpect from 'expect';
 
 import client from './client';
@@ -12,6 +14,8 @@ import {apiUploadFile, getResponseFromError} from './common';
 // System
 // See https://api.mattermost.com/#tag/system
 //
+
+/* eslint-disable no-console */
 // Exported API function should have the following:
 // - documented using JSDoc
 // - meaningful description
@@ -20,14 +24,23 @@ import {apiUploadFile, getResponseFromError} from './common';
 // - return value defined by `@return`
 // ****************************************************************
 
-/* eslint-disable no-console */
-
 /**
  * Check system health.
  * @param {string} baseUrl - the base server URL
  */
 export const apiCheckSystemHealth = async (baseUrl: string): Promise<any> => {
-    const {data} = await apiPingServerStatus(baseUrl);
+    const result = await apiPingServerStatus(baseUrl);
+
+    // apiPingServerStatus returns {data} on success, {error, status} on failure.
+    // Guard against the error path so callers get a descriptive error, not a TypeError.
+    if (!result || result.error || !result.data) {
+        const detail = result?.error
+            ? JSON.stringify(result.error)
+            : 'No response from server';
+        throw new Error(`apiCheckSystemHealth: server at "${baseUrl}" is not healthy. ${detail}`);
+    }
+
+    const {data} = result;
     jestExpect(data.status).toEqual('OK');
     jestExpect(data.database_status).toEqual('OK');
     jestExpect(data.filestore_status).toEqual('OK');
@@ -64,6 +77,83 @@ export const apiGetClientLicense = async (baseUrl: string): Promise<any> => {
 };
 
 /**
+ * Get client config (old format), same shape as the mobile app uses for About.
+ * @param {string} baseUrl - the base server URL
+ * @return {Object} returns {config} on success or {error, status} on failure
+ */
+export const apiGetClientConfigOld = async (baseUrl: string): Promise<any> => {
+    try {
+        const response = await client.get(`${baseUrl}/api/v4/config/client?format=old`);
+
+        return {config: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Max post length in runes. Computed by the server and published only in the client config —
+ * `ServiceSettings.MaxPostSize` does not exist, so never read it from the admin config.
+ * @param {string} baseUrl - the base server URL
+ * @return {number} the server's MaxPostSize
+ */
+export const apiGetMaxPostSize = async (baseUrl: string): Promise<number> => {
+    const {config, error} = await apiGetClientConfigOld(baseUrl);
+    if (error) {
+        throw new Error(`apiGetMaxPostSize: could not read client config: ${JSON.stringify(error)}`);
+    }
+    const maxPostSize = Number(config?.MaxPostSize);
+    if (!Number.isInteger(maxPostSize) || maxPostSize <= 0) {
+        throw new Error(`apiGetMaxPostSize: client config MaxPostSize is ${JSON.stringify(config?.MaxPostSize)}`);
+    }
+    return maxPostSize;
+};
+
+/**
+ * Wait for a client configuration flag to reach the expected value.
+ * @param {string} baseUrl - the base server URL
+ * @param {string} flagKey - client configuration key
+ * @param {string} expectedValue - expected client configuration value
+ * @param {Object} options - polling attempts and interval
+ * @return {boolean} true when the expected value is observed
+ */
+export const waitForClientConfigFlag = async (
+    baseUrl: string,
+    flagKey: string,
+    expectedValue: string,
+    options: {maxAttempts?: number; pollMs?: number; acceptAbsentAsEnabled?: boolean} = {},
+): Promise<boolean> => {
+    const maxAttempts = options.maxAttempts ?? 60;
+    const pollMs = options.pollMs ?? timeouts.ONE_SEC;
+    const acceptAbsentAsEnabled = options.acceptAbsentAsEnabled === true && expectedValue === 'true';
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // eslint-disable-next-line no-await-in-loop -- client config propagation is asynchronous
+        const {config, error} = await apiGetClientConfigOld(baseUrl);
+        if (!error && config) {
+            const value = config[flagKey];
+            if (String(value) === expectedValue) {
+                return true;
+            }
+
+            // Mobile treats a missing ExperimentalViewArchivedChannels as enabled
+            // (only explicit 'false' turns the feature off). Failed fetches are
+            // not "absent" — keep polling until a successful payload arrives.
+            if (acceptAbsentAsEnabled && (value === undefined || value === null || value === '')) {
+                return true;
+            }
+        }
+
+        if (attempt < maxAttempts - 1) {
+            // eslint-disable-next-line no-await-in-loop
+            await wait(pollMs);
+        }
+    }
+
+    return false;
+};
+
+/**
  * Get configuration.
  * See https://api.mattermost.com/#operation/GetConfig
  * @param {string} baseUrl - the base server URL
@@ -77,6 +167,276 @@ export const apiGetConfig = async (baseUrl: string): Promise<any> => {
     } catch (err) {
         return getResponseFromError(err);
     }
+};
+
+/**
+ * Update server configuration.
+ * See https://api.mattermost.com/#operation/UpdateConfig
+ * @param {string} baseUrl - the base server URL
+ * @param {Object} newConfig - partial configuration object to merge with current config
+ * @return {Object} returns {config} on success or {error, status} on error
+ */
+export const apiUpdateConfig = async (baseUrl: string, newConfig: any): Promise<any> => {
+    // A config patch is idempotent: replaying the same partial config converges on
+    // the same server state.
+    return withTransportRetry(async () => {
+        try {
+            const response = await client.put(`${baseUrl}/api/v4/config/patch`, newConfig);
+            return {config: response.data};
+        } catch (err) {
+            return getResponseFromError(err);
+        }
+    }, {idempotent: true, label: 'apiUpdateConfig'});
+};
+
+const patchConfigOnce = async (baseUrl: string, patch: any): Promise<any> => {
+    try {
+        const response = await client.put(`${baseUrl}/api/v4/config/patch`, patch);
+        return {config: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Replace server configuration with a complete config object.
+ *
+ * Do not use this against a shared test server: it reverts every setting another
+ * shard changed since the config was read. Use apiPatchConfig instead.
+ * @param {string} baseUrl - the base server URL
+ * @param {Object} config - complete server configuration
+ * @return {Object} returns {config} on success or {error, status} on error
+ */
+export const apiReplaceConfig = async (baseUrl: string, config: any): Promise<any> => {
+    try {
+        const response = await client.put(`${baseUrl}/api/v4/config`, config);
+        return {config: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Patch server configuration (partial update; server merges with current config).
+ * See https://api.mattermost.com/#operation/PatchConfig
+ * @param {string} baseUrl - the base server URL
+ * @param {Object} patchConfig - partial configuration object (same struct keys as server Config)
+ * @return {Object} returns {config} on success or {error, status} on error
+ */
+export const apiPatchConfig = async (baseUrl: string, patchConfig: any): Promise<any> => {
+    // Idempotent for the same reason as apiUpdateConfig above.
+    return withTransportRetry(() => patchConfigOnce(baseUrl, patchConfig), {idempotent: true, label: 'apiPatchConfig'});
+};
+
+const getFeatureFlags = (baseUrl: string): Promise<any> => {
+    return withTransportRetry(async () => {
+        const {config, error, status} = await apiGetConfig(baseUrl);
+        if (error || !config) {
+            return {error: error ?? {message: 'getFeatureFlags: empty config response'}, status};
+        }
+        return {config, flags: config.FeatureFlags ?? {}};
+    }, {idempotent: true, label: 'getFeatureFlags'});
+};
+
+/**
+ * Patch feature flags without resetting flags omitted from the requested changes.
+ * @param {string} baseUrl - the base server URL
+ * @param {Record<string, boolean>} flags - feature flags to update
+ * @return {Object} returns {config} on success or {error, status} on error
+ */
+export const apiPatchFeatureFlags = async (baseUrl: string, flags: Record<string, boolean>): Promise<any> => {
+    return withTransportRetry(async () => {
+        const {flags: current, error, status} = await getFeatureFlags(baseUrl);
+        if (error) {
+            return {error, status};
+        }
+
+        return patchConfigOnce(baseUrl, {FeatureFlags: {...current, ...flags}});
+    }, {idempotent: true, label: 'apiPatchFeatureFlags'});
+};
+
+/**
+ * Turn feature flags on without touching the others, and only where needed.
+ *
+ * FeatureFlags fields are plain bools, so the server cannot tell an omitted flag from a
+ * false one: patching {FeatureFlags: {A: true}} sets every other flag to false. (Only servers
+ * with a Split key accept flag writes at all, as the cloud test servers do; elsewhere the
+ * server ignores them.) This reads the current flags and patches them back in full, and
+ * skips the write when every named flag is already on or absent from this server version.
+ * @param {string} baseUrl - the base server URL
+ * @param {string[]} names - the flags to turn on, e.g. ['PermissionPolicies']
+ * @return {Object} returns {config} on success or {error, status} on error
+ */
+export const apiEnableFeatureFlags = async (baseUrl: string, names: string[]): Promise<any> => {
+    const {config, flags: current, error, status} = await getFeatureFlags(baseUrl);
+    if (error) {
+        return {error, status};
+    }
+
+    const toEnable = names.filter((name) => name in current && current[name] !== true);
+    if (!toEnable.length) {
+        return {config};
+    }
+
+    const enabled = Object.fromEntries(toEnable.map((name) => [name, true]));
+    return apiPatchConfig(baseUrl, {
+        FeatureFlags: {...current, ...enabled},
+    });
+};
+
+/**
+ * Get remote clusters (connected workspaces).
+ * See https://api.mattermost.com/#tag/remote_cluster
+ * Requires system admin. Use before tests that need "no connected workspaces" (e.g. TC-MOB-03).
+ * @param {string} baseUrl - the base server URL
+ * @param {Object} options - optional query (only_confirmed, etc.)
+ * @return {Object} returns {remotes: Array<{remote_id: string, ...}>} on success or {error, status} on error
+ */
+export const apiGetRemoteClusters = async (
+    baseUrl: string,
+    options: {onlyConfirmed?: boolean; excludePlugins?: boolean} = {},
+): Promise<{remotes?: Array<{remote_id: string}>; error?: {message: string}; status?: number}> => {
+    try {
+        const params = new URLSearchParams();
+        if (options.onlyConfirmed !== undefined) {
+            params.set('only_confirmed', String(options.onlyConfirmed));
+        }
+        if (options.excludePlugins !== undefined) {
+            params.set('exclude_plugins', String(options.excludePlugins));
+        }
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        const response = await client.get(`${baseUrl}/api/v4/remotecluster${qs}`);
+        return {remotes: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Delete a remote cluster.
+ * See https://api.mattermost.com/#tag/remote_cluster
+ * Requires system admin.
+ * @param {string} baseUrl - the base server URL
+ * @param {string} remoteId - the remote cluster id
+ * @return {Object} returns on success or {error, status} on error
+ */
+export const apiDeleteRemoteCluster = async (
+    baseUrl: string,
+    remoteId: string,
+): Promise<{error?: {message: string}; status?: number}> => {
+    try {
+        await client.delete(`${baseUrl}/api/v4/remotecluster/${encodeURIComponent(remoteId)}`);
+        return {};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Delete all remote clusters on the server.
+ * Call as admin (e.g. after User.apiAdminLogin) so tests can assert "No connected workspaces" (e.g. TC-MOB-03).
+ * @param {string} baseUrl - the base server URL
+ */
+export const apiDeleteAllRemoteClusters = async (baseUrl: string): Promise<void> => {
+    const result = await apiGetRemoteClusters(baseUrl, {});
+    if (result.error || !result.remotes) {
+        return;
+    }
+    for (const r of result.remotes) {
+        // eslint-disable-next-line no-await-in-loop
+        await apiDeleteRemoteCluster(baseUrl, r.remote_id);
+    }
+};
+
+/**
+ * Create a remote cluster (connected workspace). Requires system admin.
+ * See https://api.mattermost.com/#tag/remote_cluster
+ */
+export const apiCreateRemoteCluster = async (
+    baseUrl: string,
+    payload: {
+        name: string;
+        display_name: string;
+        default_team_id: string;
+        password: string;
+    },
+): Promise<Record<string, unknown> & {error?: {message: string}; status?: number}> => {
+    try {
+        const response = await client.post(`${baseUrl}/api/v4/remotecluster`, payload);
+        return response.data ?? {};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Ensures at least one confirmed remote cluster exists (matches web e2e ensureConfirmedRemote).
+ * Enables remote cluster service when creating. Call as admin after EnableSharedChannels is on.
+ */
+export const apiEnsureAtLeastOneConfirmedRemoteCluster = async (baseUrl: string, teamId: string): Promise<void> => {
+    const confirmed = await apiGetRemoteClusters(baseUrl, {
+        onlyConfirmed: true,
+        excludePlugins: true,
+    });
+    const list = Array.isArray(confirmed.remotes) ? confirmed.remotes : [];
+    if (list.length > 0) {
+        return;
+    }
+    await apiPatchConfig(baseUrl, {
+        ConnectedWorkspacesSettings: {
+            EnableRemoteClusterService: true,
+        },
+    });
+    const suffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const result = await apiCreateRemoteCluster(baseUrl, {
+        name: `e2e-remote-${suffix}`,
+        display_name: `E2E Remote ${suffix}`,
+        default_team_id: teamId,
+        password: `e2e-remote-pwd-${suffix}`,
+    });
+    if (result.error) {
+        throw new Error(`apiCreateRemoteCluster failed: ${result.error.message ?? 'unknown error'}`);
+    }
+};
+
+/**
+ * Deletes all remotes then creates exactly one (known name/display_name for e2e taps by text or id).
+ * Requires admin session.
+ */
+export const apiEnsureSingleRemoteCluster = async (
+    baseUrl: string,
+    teamId: string,
+    remote: {name: string; display_name: string; password: string},
+): Promise<void> => {
+    await apiDeleteAllRemoteClusters(baseUrl);
+    await apiPatchConfig(baseUrl, {
+        ConnectedWorkspacesSettings: {
+            EnableRemoteClusterService: true,
+        },
+    });
+    const result = await apiCreateRemoteCluster(baseUrl, {
+        name: remote.name,
+        display_name: remote.display_name,
+        default_team_id: teamId,
+        password: remote.password,
+    });
+    if (result.error) {
+        throw new Error(`apiEnsureSingleRemoteCluster failed: ${result.error.message ?? 'unknown error'}`);
+    }
+};
+
+/**
+ * Check that plugin uploads are enabled, fail if not.
+ * @param {string} baseUrl - the base server URL
+ * @return {Promise<void>} throws error if plugin uploads are disabled
+ */
+export const shouldHavePluginUploadEnabled = async (baseUrl: string): Promise<void> => {
+    const {config} = await apiGetConfig(baseUrl);
+    const isUploadEnabled = config.PluginSettings.EnableUploads;
+    if (!isUploadEnabled) {
+        throw new Error('Plugin uploads must be enabled for this test to run. Set PluginSettings.EnableUploads=true');
+    }
+    jestExpect(isUploadEnabled).toEqual(true);
 };
 
 /**
@@ -160,40 +520,91 @@ export const apiUploadLicense = async (baseUrl: string): Promise<any> => {
     return apiUploadFile('license', absFilePath, {url: `${baseUrl}/api/v4/license`, method: 'POST'});
 };
 
+// DISABLED: Do not request trial license in tests — tests should run with Free edition only.
+// Keeping code commented out as reference; remove this function if trial licensing is never needed.
+// /**
+//  * Request a trial Enterprise license from the Mattermost license server.
+//  * See https://api.mattermost.com/#operation/RequestTrialLicense
+//  * @param {string} baseUrl - the base server URL
+//  * @return {Object} returns response on success or {error, status} on error
+//  */
+// export const apiRequestTrialLicense = async (baseUrl: string): Promise<any> => {
+//     try {
+//         const response = await client.post(`${baseUrl}/api/v4/trial-license`, {
+//             users: 1000,
+//             terms_accepted: true,
+//             receive_emails_accepted: true,
+//             contact_name: 'E2E Test',
+//             contact_email: 'admin@example.mattermost.com',
+//             company_name: 'Mattermost E2E',
+//             company_country: 'US',
+//             company_size: 'ONE_TO_50',
+//         });
+//         return {data: response.data};
+//     } catch (err) {
+//         return getResponseFromError(err);
+//     }
+// };
+
 /**
  * Get client license.
- * If no license, try to upload if license file is available at "/support/fixtures/mattermost-license.txt".
- * @return {Object} returns {license} on success or upload when no license or get updated license.
+ * If no license, try to upload a license file first.
+ * Does NOT request trial license — tests run with Free edition features only.
+ * @param {string} baseUrl - the base server URL
+ * @return {Object} returns {license} on success or the unlicensed state
  */
 export const getClientLicense = async (baseUrl: string): Promise<any> => {
-    const {license} = await apiGetClientLicense(baseUrl);
-    if (license.IsLicensed === 'true') {
+    const licenseResponse = await apiGetClientLicense(baseUrl);
+    if (licenseResponse.error) {
+        return licenseResponse;
+    }
+
+    const {license} = licenseResponse;
+    if (license?.IsLicensed === 'true') {
         return {license};
     }
 
-    // Upload a license if server is currently not loaded with license
-    const response = await apiUploadLicense(baseUrl);
-    if (response.error) {
-        console.warn(response.error.message);
-        return {license};
+    // Try uploading a license file first (e.g. from fixtures)
+    const uploadResponse = await apiUploadLicense(baseUrl);
+    if (!uploadResponse.error) {
+        const out = await apiGetClientLicense(baseUrl);
+        if (out.license?.IsLicensed === 'true') {
+            return {license: out.license};
+        }
     }
 
-    // Get an updated client license
-    const out = await apiGetClientLicense(baseUrl);
-    return {license: out.license};
+    // Do not request trial license — tests should work with Free edition only
+    return {license};
 };
 
 export const System = {
     apiCheckSystemHealth,
+    apiCreateRemoteCluster,
+    apiDeleteAllRemoteClusters,
+    apiEnsureSingleRemoteCluster,
+    apiDeleteRemoteCluster,
+    apiEnsureAtLeastOneConfirmedRemoteCluster,
     apiEmailTest,
+    apiGetClientConfigOld,
+    apiGetMaxPostSize,
     apiGetClientLicense,
     apiGetConfig,
+    apiGetRemoteClusters,
+    apiEnableFeatureFlags,
+    apiPatchConfig,
+    apiPatchFeatureFlags,
     apiPingServerStatus,
+    apiReplaceConfig,
+    waitForClientConfigFlag,
+
+    // apiRequestTrialLicense, // DISABLED: Do not request trial license in tests
     apiRequireLicense,
     apiRequireLicenseForFeature,
     apiRequireSMTPServer,
+    apiUpdateConfig,
     apiUploadLicense,
     getClientLicense,
+    shouldHavePluginUploadEnabled,
 };
 
 export default System;

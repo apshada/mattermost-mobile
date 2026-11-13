@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import Animated, {useSharedValue} from 'react-native-reanimated';
+import {useSharedValue, type SharedValue} from 'react-native-reanimated';
 
 type SharedValueType = number;
 
@@ -21,8 +21,8 @@ export type Vector<T extends SharedValueType> = {
 };
 
 export type SharedVector<T extends SharedValueType> = {
-    x: Animated.SharedValue<T>;
-    y: Animated.SharedValue<T>;
+    x: SharedValue<T>;
+    y: SharedValue<T>;
 };
 
 const isVector = (value: any): value is Vector<any> => {
@@ -33,13 +33,13 @@ const isVector = (value: any): value is Vector<any> => {
 
 const isSharedValue = (
     value: any,
-): value is Animated.SharedValue<any> => {
+): value is SharedValue<any> => {
     'worklet';
 
     return typeof value.value !== 'undefined';
 };
 
-const get = <T extends Animated.SharedValue<SharedValueType> | SharedValueType>(
+const get = <T extends SharedValue<SharedValueType> | SharedValueType>(
     value: T,
 ) => {
     'worklet';
@@ -89,14 +89,19 @@ const reduce = (
     return res;
 };
 
-export const useSharedVector = <T>(x: T, y = x) => {
+export type ShareVectorType<T> = {
+    x: SharedValue<T>;
+    y: SharedValue<T>;
+}
+
+export const useSharedVector = <T>(x: T, y = x): ShareVectorType<T> => {
     return {
         x: useSharedValue(x),
         y: useSharedValue(y),
     };
 };
 
-export const create = <T extends SharedValueType>(x: T, y: T) => {
+export const create = <T extends SharedValueType>(x: T, y: T): Vector<T> => {
     'worklet';
 
     return {
@@ -160,6 +165,7 @@ export const set = <T extends VectorType>(
     if (typeof value === 'function') {
         vector.x.value = value();
         vector.y.value = value();
+        return;
     }
 
     const x = get(isVector(value) ? value.x : value);

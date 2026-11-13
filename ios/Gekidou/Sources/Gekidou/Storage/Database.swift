@@ -9,6 +9,8 @@ import Foundation
 import SQLite3
 import SQLite
 
+typealias Expression = SQLite.Expression
+
 enum DatabaseError: Error {
     case OpenFailure(_ dbPath: String)
     case MultipleServers
@@ -16,6 +18,14 @@ enum DatabaseError: Error {
     case NoDatabase(_ serverUrl: String)
     case InsertError(_ statement: String)
 }
+
+/// Default busy timeout (in seconds) for SQLite connections.
+/// When the main app and NotificationService extension access the shared
+/// database concurrently, SQLite may return SQLITE_BUSY ("database is locked").
+/// Setting a busy timeout tells SQLite to retry internally for up to this many
+/// seconds before returning an error, preventing transient lock contention from
+/// becoming a fatal crash (via SQLite.swift's `try!` in FailableIterator.next).
+private let defaultBusyTimeout: Double = 5.0
 
 extension DatabaseError: LocalizedError {
     var errorDescription: String? {
@@ -70,13 +80,34 @@ public class Database: NSObject {
     @objc public static let `default` = Database()
     
     override private init() {
-        let appGroupId = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as! String
-        let sharedDirectory = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId)!
+        guard let appGroupId = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String else {
+            GekidouLogger.shared.log(.error, "Gekidou Database: AppGroupIdentifier missing from Info.plist - database operations will fail")
+            DEFAULT_DB_PATH = ""
+            super.init()
+            return
+        }
+
+        guard let sharedDirectory = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) else {
+            GekidouLogger.shared.log(.error, "Gekidou Database: Failed to get shared container for app group %{public}@ - database operations will fail", appGroupId)
+            DEFAULT_DB_PATH = ""
+            super.init()
+            return
+        }
+
         let databaseUrl = sharedDirectory.appendingPathComponent("databases/\(DEFAULT_DB_NAME)")
-        
         DEFAULT_DB_PATH = databaseUrl.path
+        super.init()
     }
     
+    /// Creates a new SQLite Connection with WAL journal mode and a busy timeout,
+    /// so concurrent readers/writers (main app + notification extension) don't
+    /// immediately fail with SQLITE_BUSY.
+    internal func openConnection(_ path: String, readonly: Bool = false) throws -> Connection {
+        let db = try Connection(path, readonly: readonly)
+        db.busyTimeout = defaultBusyTimeout
+        return db
+    }
+
     @objc public func getOnlyServerUrlObjc() -> String {
         do {
             return try getOnlyServerUrl()
@@ -87,70 +118,106 @@ public class Database: NSObject {
     }
     
     public func generateId() -> String {
-        let alphabet = Array("0123456789abcdefghijklmnopqrstuvwxyz")
-        let alphabetLenght = alphabet.count
-        let idLenght = 16
-        var id = ""
-
-        for _ in 1...(idLenght / 2) {
-            let random = floor(Double.random(in: 0..<1) * Double(alphabetLenght) * Double(alphabetLenght))
-            let firstIndex = Int(floor(random / Double(alphabetLenght)))
-            let lastIndex = Int(random) % alphabetLenght
-            id += String(alphabet[firstIndex])
-            id += String(alphabet[lastIndex])
-        }
-        
-        return id
+        return UUID().uuidString.lowercased()
     }
     
     public func getOnlyServerUrl() throws -> String {
-        let db = try Connection(DEFAULT_DB_PATH)
-        let url = Expression<String>("url")
-        let identifier = Expression<String>("identifier")
-        let lastActiveAt = Expression<Int64>("last_active_at")
-        let query = serversTable.select(url).filter(lastActiveAt > 0 && identifier != "")
-        
-        var serverUrl: String?
-        for result in try db.prepare(query) {
-            if (serverUrl != nil) {
-                throw DatabaseError.MultipleServers
+        do {
+            let db = try openConnection(DEFAULT_DB_PATH)
+            let url = Expression<String>("url")
+            let identifier = Expression<String>("identifier")
+            let lastActiveAt = Expression<Int64>("last_active_at")
+            let query = serversTable.select(url).filter(lastActiveAt > 0 && identifier != "")
+
+            var serverUrl: String?
+            let iterator = try db.prepareRowIterator(query)
+            while let result = try iterator.failableNext() {
+                if (serverUrl != nil) {
+                    throw DatabaseError.MultipleServers
+                }
+
+                serverUrl = try result.get(url)
             }
-            
-            serverUrl = try result.get(url)
+
+            if let serverUrl = serverUrl {
+                return serverUrl
+            }
+
+            throw DatabaseError.NoResults(query.expression.description)
+        } catch {
+            GekidouLogger.shared.log(.error, "Gekidou Database: Failed to get only server URL from %{public}@ - %{public}@", DEFAULT_DB_PATH, String(describing: error))
+            throw error
         }
-        
-        if (serverUrl != nil) {
-            return serverUrl!
-        }
-    
-        throw DatabaseError.NoResults(query.expression.description)
     }
-    
+
     public func getServerUrlForServer(_ id: String) throws -> String {
-        let db = try Connection(DEFAULT_DB_PATH)
-        let url = Expression<String>("url")
-        let identifier = Expression<String>("identifier")
-        let query = serversTable.select(url).filter(identifier == id)
-        
-        if let server = try db.pluck(query) {
-            let serverUrl: String? = try server.get(url)
-            if (serverUrl != nil) {
-                return serverUrl!
+        do {
+            let db = try openConnection(DEFAULT_DB_PATH)
+            let url = Expression<String>("url")
+            let identifier = Expression<String>("identifier")
+            let query = serversTable.select(url).filter(identifier == id)
+
+            if let server = try db.pluck(query),
+               let serverUrl = try? server.get(url) {
+                return serverUrl
             }
+
+            throw DatabaseError.NoResults(query.expression.description)
+        } catch {
+            GekidouLogger.shared.log(.error, "Gekidou Database: Failed to get server URL for server %{public}@ from %{public}@ - %{public}@", id, DEFAULT_DB_PATH, String(describing: error))
+            throw error
         }
-    
-        throw DatabaseError.NoResults(query.expression.description)
     }
     
+    public func isZeroPersistenceServer(_ serverUrl: String) -> Bool {
+        guard !DEFAULT_DB_PATH.isEmpty,
+              let db = try? openConnection(DEFAULT_DB_PATH) else { return false }
+        let url = Expression<String>("url")
+        let persistenceFlag = Expression<String?>("persistence_flag")
+        let query = serversTable.select(persistenceFlag).filter(url == serverUrl)
+        do {
+            if let result = try db.pluck(query) {
+                return (try result.get(persistenceFlag)) == "zero-persistence"
+            }
+        } catch {
+            GekidouLogger.shared.log(.error, "Gekidou Database: failed to query zero persistence mode for server %{public}@ - %{public}@", serverUrl, String(describing: error))
+            return false
+        }
+        return false
+    }
+
+    public func getZeroPersistenceSigningKey(_ serverUrl: String) -> String? {
+        guard !DEFAULT_DB_PATH.isEmpty,
+              let db = try? openConnection(DEFAULT_DB_PATH) else { return nil }
+        let idCol = Expression<String>("id")
+        let valueCol = Expression<String>("value")
+        let query = globalTable.select(valueCol).filter(idCol == "pushSigningKey\(serverUrl)")
+        do {
+            if let result = try db.pluck(query) {
+                let rawValue = try result.get(valueCol)
+                guard let data = rawValue.data(using: .utf8),
+                      let decoded = try? JSONDecoder().decode(String.self, from: data)
+                else {
+                    return rawValue
+                }
+                return decoded
+            }
+        } catch {
+            GekidouLogger.shared.log(.error, "Gekidou Database: failed to get push signing key for server %{public}@ - %{public}@", serverUrl, String(describing: error))
+        }
+        return nil
+    }
+
     public func getAllActiveDatabases<T: Codable>() -> [T] {
-        guard let db = try? Connection(DEFAULT_DB_PATH) else {return []}
+        guard let db = try? openConnection(DEFAULT_DB_PATH) else {return []}
         let lastActiveAt = Expression<Int64>("last_active_at")
         let identifier = Expression<String>("identifier")
         let query = serversTable.filter(lastActiveAt > 0 && identifier != "").order(lastActiveAt.desc)
         do {
-            let rows = try db.prepare(query)
-            let servers: [T] = try rows.map { row in
-                return try row.decode()
+            let iterator = try db.prepareRowIterator(query)
+            var servers = [T]()
+            while let row = try iterator.failableNext() {
+                servers.append(try row.decode())
             }
 
             return servers
@@ -160,15 +227,16 @@ public class Database: NSObject {
     }
     
     public func getAllActiveServerUrls() -> [String] {
-        guard let db = try? Connection(DEFAULT_DB_PATH) else {return []}
+        guard let db = try? openConnection(DEFAULT_DB_PATH) else {return []}
         let lastActiveAt = Expression<Int64>("last_active_at")
         let identifier = Expression<String>("identifier")
         let url = Expression<String>("url")
         let query = serversTable.filter(lastActiveAt > 0 && identifier != "").order(lastActiveAt.desc)
         do {
-            let rows = try db.prepare(query)
-            let servers: [String] = try rows.map { row in
-                return try row.get(url)
+            let iterator = try db.prepareRowIterator(query)
+            var servers = [String]()
+            while let row = try iterator.failableNext() {
+                servers.append(try row.get(url))
             }
 
             return servers
@@ -178,11 +246,12 @@ public class Database: NSObject {
     }
     
     public func getCurrentServerDatabase<T: Codable>() -> T? {
-        guard let db = try? Connection(DEFAULT_DB_PATH) else {return nil}
+        guard let db = try? openConnection(DEFAULT_DB_PATH) else {return nil}
         do {
             let lastActiveAt = Expression<Int64>("last_active_at")
             let identifier = Expression<String>("identifier")
-            let query = serversTable.filter(lastActiveAt > 0 && identifier != "").order(lastActiveAt.desc)
+            let persistenceFlag = Expression<String>("persistence_flag")
+            let query = serversTable.filter(lastActiveAt > 0 && identifier != "" && persistenceFlag !== "zero-persistence").order(lastActiveAt.desc)
             
             if let result = try db.pluck(query) {
                 let server: T = try result.decode()
@@ -196,14 +265,14 @@ public class Database: NSObject {
     }
     
     internal func getDatabaseForServer(_ serverUrl: String) throws -> Connection {
-        let db = try Connection(DEFAULT_DB_PATH)
+        let db = try openConnection(DEFAULT_DB_PATH)
         let url = Expression<String>("url")
         let dbPath = Expression<String>("db_path")
         let query = serversTable.select(dbPath).where(url == serverUrl)
         
         if let result = try db.pluck(query) {
             let path = try result.get(dbPath)
-            return try Connection(path)
+            return try openConnection(path)
         }
         
         throw DatabaseError.NoResults(query.expression.description)

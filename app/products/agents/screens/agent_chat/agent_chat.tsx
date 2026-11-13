@@ -1,0 +1,289 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {PortalHost} from '@gorhom/portal';
+import {useIsFocused} from '@react-navigation/native';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {useIntl} from 'react-intl';
+import {type LayoutChangeEvent, StyleSheet} from 'react-native';
+import {SafeAreaView, useSafeAreaInsets, type Edge} from 'react-native-safe-area-context';
+
+import {createDirectChannel} from '@actions/remote/channel';
+import {buildAbsoluteUrl} from '@actions/remote/file';
+import {buildProfileImageUrl} from '@actions/remote/user';
+import {fetchAIBots} from '@agents/actions/remote/bots';
+import {saveSelectedAgent} from '@agents/actions/remote/preference';
+import AgentChatPostList from '@agents/screens/agent_chat/agent_chat_post_list';
+import BotSelectorItem from '@agents/screens/agent_chat/bot_selector_item';
+import {goToAgentThreadsList} from '@agents/screens/navigation';
+import {resolveSelectedAgent} from '@agents/utils';
+import {KeyboardAwarePostDraftContainer} from '@components/keyboard_aware_post_draft_container';
+import PostDraft from '@components/post_draft';
+import {ITEM_HEIGHT} from '@components/slide_up_panel_item';
+import {Screens} from '@constants';
+import {BOTTOM_TAB_HEIGHT} from '@constants/view';
+import {KeyboardStateProvider} from '@context/keyboard_state';
+import {useServerUrl} from '@context/server';
+import {useTheme} from '@context/theme';
+import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
+import {useIsTablet} from '@hooks/device';
+import {useDefaultHeaderHeight} from '@hooks/header';
+import {usePreventDoubleTap} from '@hooks/utils';
+import {TITLE_HEIGHT} from '@screens/bottom_sheet/content';
+import {bottomSheet, dismissBottomSheet, navigateBack} from '@screens/navigation';
+import {getFullErrorMessage} from '@utils/errors';
+import {bottomSheetSnapPoint} from '@utils/helpers';
+import {logError} from '@utils/log';
+
+import AgentChatContent from './agent_chat_content';
+import AgentChatHeader from './header';
+
+import type AiBotModel from '@agents/types/database/models/ai_bot';
+
+type Props = {
+    bots: AiBotModel[];
+    selectedAgentId: string;
+};
+
+const styles = StyleSheet.create({
+    flex: {
+        flex: 1,
+    },
+});
+
+const AGENT_CHAT_TESTID = 'agent_chat.post_draft';
+
+// This follows the same pattern as draft_input.tsx: `${testID}.post.input`
+const AGENT_CHAT_INPUT_NATIVE_ID = `${AGENT_CHAT_TESTID}.post.input`;
+
+const PORTAL_NAME = 'agent_chat_autocomplete';
+
+const AgentChat = ({bots, selectedAgentId}: Props) => {
+    const intl = useIntl();
+    const theme = useTheme();
+    const serverUrl = useServerUrl();
+    const insets = useSafeAreaInsets();
+    const isTablet = useIsTablet();
+    const isFocused = useIsFocused();
+    const defaultHeight = useDefaultHeaderHeight();
+
+    // Track if this is the first load
+    const initialLoadDone = useRef(false);
+    const [selectedBot, setSelectedBot] = useState<AiBotModel | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [channelId, setChannelId] = useState<string | null>(null);
+    const [containerHeight, setContainerHeight] = useState(0);
+
+    // Root post id of the in-context conversation. Null until the user sends
+    // the first message, which becomes the conversation root; subsequent
+    // messages thread under it and render inline. Mirrors web's ephemeral
+    // selectedPostId on the RHS.
+    const [rootId, setRootId] = useState<string | null>(null);
+
+    const tabBarHeight = isTablet ? BOTTOM_TAB_HEIGHT : 0;
+    const marginTop = defaultHeight + (isTablet ? 0 : -insets.top);
+
+    const safeAreaViewEdges: Edge[] = useMemo(() => {
+        if (isTablet) {
+            return ['left', 'right'];
+        }
+        return ['left', 'right', 'bottom'];
+    }, [isTablet]);
+
+    // Auto-resolve the selected bot (saved pref -> default -> first) without persisting.
+    useEffect(() => {
+        if (bots.length > 0 && !selectedBot) {
+            setSelectedBot(resolveSelectedAgent(bots, selectedAgentId));
+        }
+    }, [bots, selectedBot, selectedAgentId]);
+
+    // Refresh bots from network on mount
+    useEffect(() => {
+        const refreshBots = async () => {
+            // If we have cached data, don't show loading spinner
+            if (bots.length > 0) {
+                initialLoadDone.current = true;
+                setLoading(false);
+            }
+
+            const {error: fetchError} = await fetchAIBots(serverUrl);
+
+            // Mark initial load as done
+            if (!initialLoadDone.current) {
+                initialLoadDone.current = true;
+                setLoading(false);
+            }
+
+            // Only show error if fetch failed AND we have no cached data
+            if (fetchError && bots.length === 0) {
+                setError(intl.formatMessage({
+                    id: 'agents.chat.error_loading_bots',
+                    defaultMessage: 'Failed to load agents. Please try again.',
+                }));
+            }
+        };
+
+        refreshBots();
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps -- only run on mount
+
+    // Show error if no bots after loading
+    useEffect(() => {
+        if (!loading && bots.length === 0 && !error) {
+            setError(intl.formatMessage({
+                id: 'agents.chat.no_bots',
+                defaultMessage: 'No agents available.',
+            }));
+        } else if (bots.length > 0 && error) {
+            // Clear error if we now have bots
+            setError(null);
+        }
+    }, [loading, bots.length, error, intl]);
+
+    // Get or create DM channel when bot is selected
+    useEffect(() => {
+        const getChannel = async () => {
+            if (!selectedBot) {
+                setChannelId(null);
+                return;
+            }
+
+            const {data, error: channelError} = await createDirectChannel(
+                serverUrl,
+                selectedBot.id,
+            );
+
+            if (channelError || !data) {
+                setError(intl.formatMessage({
+                    id: 'agents.chat.error_creating_channel',
+                    defaultMessage: 'Failed to start conversation. Please try again.',
+                }));
+                return;
+            }
+
+            setChannelId(data.id);
+        };
+
+        getChannel();
+    }, [selectedBot, serverUrl, intl]);
+
+    const exit = useCallback(() => {
+        navigateBack();
+    }, []);
+
+    useAndroidHardwareBackHandler(Screens.AGENT_CHAT, exit);
+
+    const handleHistoryPress = useCallback(() => {
+        goToAgentThreadsList();
+    }, []);
+
+    const handleBotSelect = useCallback(async (bot: AiBotModel) => {
+        setSelectedBot(bot);
+
+        // Switching bots starts a fresh conversation against the new bot's DM.
+        // Clear the channel immediately too, so a fast send can't post into the
+        // previous bot's DM before the new channel resolves.
+        setRootId(null);
+        setChannelId(null);
+        dismissBottomSheet();
+        const {error: saveError} = await saveSelectedAgent(serverUrl, bot.id);
+        if (saveError) {
+            logError('Failed to persist agent selection', getFullErrorMessage(saveError));
+        }
+    }, [serverUrl]);
+
+    const handleBotSelectorPress = usePreventDoubleTap(useCallback(() => {
+        if (bots.length <= 1) {
+            return;
+        }
+
+        const renderContent = () => {
+            return (
+                <>
+                    {bots.map((bot) => {
+                        const avatarUrl = buildAbsoluteUrl(
+                            serverUrl,
+                            buildProfileImageUrl(serverUrl, bot.id, bot.lastIconUpdate),
+                        );
+
+                        return (
+                            <BotSelectorItem
+                                key={bot.id}
+                                bot={bot}
+                                avatarUrl={avatarUrl}
+                                isSelected={selectedBot?.id === bot.id}
+                                onSelect={handleBotSelect}
+                                theme={theme}
+                            />
+                        );
+                    })}
+                </>
+            );
+        };
+
+        const snapPoint = bottomSheetSnapPoint(bots.length, ITEM_HEIGHT);
+        bottomSheet(renderContent, [1, (snapPoint + TITLE_HEIGHT)]);
+    }, [bots, serverUrl, selectedBot?.id, handleBotSelect, theme]));
+
+    const onLayout = useCallback((e: LayoutChangeEvent) => {
+        setContainerHeight(e.nativeEvent.layout.height);
+    }, []);
+
+    const handlePostCreated = useCallback((postId: string) => {
+        // The first message becomes the conversation root and the inline list
+        // begins rendering it; later messages are already replies (PostDraft
+        // gets rootId), so keep the existing root rather than navigating away.
+        setRootId((current) => current ?? postId);
+    }, []);
+
+    return (
+        <SafeAreaView
+            edges={safeAreaViewEdges}
+            style={styles.flex}
+            testID='agents_chat.screen'
+            onLayout={onLayout}
+        >
+            <AgentChatHeader
+                title={intl.formatMessage({id: 'agents.chat.title', defaultMessage: 'Agents'})}
+                subtitle={selectedBot ? selectedBot.displayName : intl.formatMessage({id: 'agents.chat.select_agent', defaultMessage: 'Select an agent'})}
+                showSubtitleCompanion={bots.length > 1}
+                onPress={handleBotSelectorPress}
+                onHistoryPress={handleHistoryPress}
+            />
+
+            <KeyboardStateProvider
+                tabBarHeight={tabBarHeight}
+                enabled={isFocused}
+            >
+                <KeyboardAwarePostDraftContainer
+                    textInputNativeID={AGENT_CHAT_INPUT_NATIVE_ID}
+                    containerStyle={[styles.flex, {marginTop}]}
+                    renderList={() => (rootId ? (
+                        <AgentChatPostList rootId={rootId}/>
+                    ) : (
+                        <AgentChatContent
+                            loading={loading && bots.length === 0}
+                            error={error}
+                        />
+                    ))}
+                >
+                    {channelId ? (
+                        <PostDraft
+                            channelId={channelId}
+                            rootId={rootId ?? undefined}
+                            testID={AGENT_CHAT_TESTID}
+                            containerHeight={containerHeight}
+                            isChannelScreen={false}
+                            location={Screens.AGENT_CHAT}
+                            onPostCreated={handlePostCreated}
+                            portalName={PORTAL_NAME}
+                        />
+                    ) : null}
+                </KeyboardAwarePostDraftContainer>
+                <PortalHost name={PORTAL_NAME}/>
+            </KeyboardStateProvider>
+        </SafeAreaView>
+    );
+};
+
+export default AgentChat;

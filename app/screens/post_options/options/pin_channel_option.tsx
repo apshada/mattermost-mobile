@@ -2,47 +2,51 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
+import {defineMessages} from 'react-intl';
 
 import {togglePinPost} from '@actions/remote/post';
 import {BaseOption} from '@components/common_post_options';
 import {useServerUrl} from '@context/server';
-import {t} from '@i18n';
 import {dismissBottomSheet} from '@screens/navigation';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
 type PinChannelProps = {
-    bottomSheetId: AvailableScreens;
     isPostPinned: boolean;
     postId: string;
 }
 
-const PinChannelOption = ({bottomSheetId, isPostPinned, postId}: PinChannelProps) => {
+const messages = defineMessages({
+    pin: {
+        id: 'mobile.post_info.pin',
+        defaultMessage: 'Pin to Channel',
+    },
+    unpin: {
+        id: 'mobile.post_info.unpin',
+        defaultMessage: 'Unpin from Channel',
+    },
+});
+
+const PinChannelOption = ({isPostPinned, postId}: PinChannelProps) => {
     const serverUrl = useServerUrl();
 
     const onPress = useCallback(async () => {
-        await dismissBottomSheet(bottomSheetId);
+        await dismissBottomSheet();
         togglePinPost(serverUrl, postId);
-    }, [bottomSheetId, postId, serverUrl]);
+    }, [postId, serverUrl]);
 
-    let defaultMessage;
-    let id;
+    let message;
     let key;
 
     if (isPostPinned) {
-        defaultMessage = 'Unpin from Channel';
-        id = t('mobile.post_info.unpin');
+        message = messages.unpin;
         key = 'unpin';
     } else {
-        defaultMessage = 'Pin to Channel';
-        id = t('mobile.post_info.pin');
+        message = messages.pin;
         key = 'pin';
     }
 
     return (
         <BaseOption
-            i18nId={id}
-            defaultMessage={defaultMessage}
+            message={message}
             iconName='pin-outline'
             onPress={onPress}
             testID={`post_options.${key}_post.option`}

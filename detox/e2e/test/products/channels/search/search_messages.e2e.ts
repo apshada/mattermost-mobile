@@ -1,0 +1,399 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {
+    Channel,
+    Post,
+    Setup,
+    Team,
+} from '@support/server_api';
+import {assertServerBaseline} from '@support/server_baseline';
+import {
+    serverOneUrl,
+    siteOneUrl,
+} from '@support/test_config';
+import {Autocomplete} from '@support/ui/component';
+import {
+    ChannelListScreen,
+    ChannelScreen,
+    HomeScreen,
+    LoginScreen,
+    SearchMessagesScreen,
+    ServerScreen,
+    TeamDropdownMenuScreen,
+} from '@support/ui/screen';
+import {getRandomId, reloadApp, timeouts, wait, waitForElementToBeVisible, waitForElementToExist} from '@support/utils';
+import {expect} from 'detox';
+
+describe('Search - Search Messages', () => {
+    const serverOneDisplayName = 'Server 1';
+    const channelsCategory = 'channels';
+    let testChannel: any;
+    let testTeam: any;
+    let testUser: any;
+
+    beforeAll(async () => {
+        const {channel, team, user} = await Setup.apiInit(siteOneUrl);
+        testChannel = channel;
+        testTeam = team;
+        testUser = user;
+
+        // # Assert server baseline (CRT always_on, ThreadAutoFollow) for thread UI.
+        await assertServerBaseline(siteOneUrl, [
+            'ServiceSettings.CollapsedThreads',
+            'ServiceSettings.ThreadAutoFollow',
+        ]);
+
+        // # Log in to server
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(testUser);
+    });
+
+    beforeEach(async () => {
+        try {
+            await waitForElementToExist(SearchMessagesScreen.searchClearButton, timeouts.TWO_SEC);
+            await SearchMessagesScreen.searchClearButton.tap();
+        } catch {
+            // Search screen not open, or the input is already empty — nothing to clear.
+        }
+
+        try {
+            await SearchMessagesScreen.close();
+        } catch {
+            // channel-list tab not reachable (modal/channel screen) — back out first.
+            try {
+                await ChannelScreen.back();
+            } catch {
+                // ignore — fall through to the assertion below.
+            }
+        }
+        await ChannelListScreen.toBeVisible();
+    });
+
+    afterAll(async () => {
+        // # Log out
+        await HomeScreen.logout();
+    });
+
+    it('MM-T5294_1 - should match elements on search messages screen', async () => {
+        // # Open search messages screen
+        await SearchMessagesScreen.open();
+
+        // * Verify basic elements on search messages screen
+        await expect(SearchMessagesScreen.largeHeaderTitle).toHaveText('Search');
+        await expect(SearchMessagesScreen.searchInput).toBeVisible();
+        await expect(SearchMessagesScreen.searchModifierHeader).toHaveText('Search options');
+        await expect(SearchMessagesScreen.searchModifierFrom).toBeVisible();
+        await expect(SearchMessagesScreen.searchModifierIn).toBeVisible();
+        await expect(SearchMessagesScreen.searchModifierExclude).toBeVisible();
+        await expect(SearchMessagesScreen.searchModifierPhrases).toBeVisible();
+
+        // # Go back to channel list screen
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_2 - should be able to search messages from a specific user', async () => {
+        // # Open a channel screen, post a message, go back to channel list screen, and open search messages screen
+        const message = `Message ${getRandomId()}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Tap on from-search-modifier, type in username, tap on user at-mention autocomplete, and tap on search key
+        // Corner-tap: same 100%-visibility clip as searchModifierIn/Phrases below.
+        await SearchMessagesScreen.searchModifierFrom.tap({x: 1, y: 1});
+        await SearchMessagesScreen.searchInput.typeText(testUser.username);
+        const {atMentionItem} = Autocomplete.getAtMentionItem(testUser.id);
+        await waitForElementToBeVisible(atMentionItem, timeouts.TWO_SEC);
+        await atMentionItem.tap();
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify search results contain messages from user
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(post.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(`from: ${testUser.username}`);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_3 - should be able to search messages in a specific channel', async () => {
+        // # Open a channel screen, post a message, go back to channel list screen, and open search messages screen
+        const message = `Message ${getRandomId()}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Tap on in-search-modifier, type in channel name, tap on channel mention autocomplete, and tap on search key
+        // Corner-tap: the search modifier row's center is obscured by the search
+        // modal's UITransitionView (same workaround as PostOptionsScreen.deletePost).
+        await SearchMessagesScreen.searchModifierIn.tap({x: 1, y: 1});
+        await SearchMessagesScreen.searchInput.typeText(testChannel.name);
+        const {
+            channelMentionItem,
+            channelMentionItemChannelDisplayName,
+        } = Autocomplete.getChannelMentionItem(testChannel.name);
+        await Autocomplete.tapSuggestion(channelMentionItem, channelMentionItemChannelDisplayName);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify search results contain messages in channel. A one-shot expect races the
+        // search request: on Android CI the results loader was still up 1.25s after the
+        // return key (run 34084253311, failing on every attempt), so poll instead.
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(post.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(`channel: ${testChannel.name}`);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_4 - should be able to search messages excluding search terms', async () => {
+        // # Open a channel screen, post a message prefix plus non-excluded term, post another message prefix plus excluded term, go back to channel list screen, and open search messages screen
+        const excludedTerm = getRandomId();
+        const messagePrefix = 'Message';
+        const messageWithNonExcludedTerm = `${messagePrefix} ${getRandomId()}`;
+        const messageWithExcludedTerm = `${messagePrefix} ${excludedTerm}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post: nonExcludedPost} = await ChannelScreen.postMessageAndVerify(messageWithNonExcludedTerm, testChannel.id, siteOneUrl);
+        const {postListPostItem: nonExcludedPostListPostItem} = SearchMessagesScreen.getPostListPostItem(nonExcludedPost.id, messageWithNonExcludedTerm);
+        const {post: excludedPost} = await ChannelScreen.postMessageAndVerify(messageWithExcludedTerm, testChannel.id, siteOneUrl);
+        const {postListPostItem: excludedPostListPostItem} = SearchMessagesScreen.getPostListPostItem(excludedPost.id, messageWithExcludedTerm);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Type in the message prefix, tap on excluded-search modifier, type in the excluded term, and tap on search key
+        await SearchMessagesScreen.searchInput.typeText(messagePrefix);
+
+        // Corner-tap: a centre tap here landed without inserting the "-" modifier, so the
+        // query became "Message<term>" instead of "Message -<term>" and returned 0 results
+        await SearchMessagesScreen.searchModifierExclude.tap({x: 1, y: 1});
+        await SearchMessagesScreen.searchInput.typeText(excludedTerm);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+
+        // * Verify search results do not contain messages with excluded term
+        await wait(timeouts.TWO_SEC);
+        await expect(nonExcludedPostListPostItem).toBeVisible();
+        await expect(excludedPostListPostItem).not.toBeVisible();
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(`${messagePrefix} -${excludedTerm}`);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_5 - should be able to search messages with phrases', async () => {
+        // # Open a channel screen, post a message prefix plus non-included term, post another message prefix plus included term, go back to channel list screen, and open search messages screen
+        const includedTerm = getRandomId();
+        const messagePrefix = 'How are';
+        const messageWithNonIncludedTerm = `${messagePrefix} ${getRandomId()}`;
+        const messageWithIncludedTerm = `${messagePrefix} ${includedTerm}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post: nonIncludedPost} = await ChannelScreen.postMessageAndVerify(messageWithNonIncludedTerm, testChannel.id, siteOneUrl);
+        const {postListPostItem: nonIncludedPostListPostItem} = SearchMessagesScreen.getPostListPostItem(nonIncludedPost.id, messageWithNonIncludedTerm);
+        const {post: includedPost} = await ChannelScreen.postMessageAndVerify(messageWithIncludedTerm, testChannel.id, siteOneUrl);
+        const {postListPostItem: includedPostListPostItem} = SearchMessagesScreen.getPostListPostItem(includedPost.id, messageWithIncludedTerm);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Type in the message prefix plus included term inside double quotes and tap on search key
+        // Corner-tap: searchModifierPhrases is 1.3px clipped at this state too (same
+        // 100% threshold failure as at :214 below). Apply the same workaround.
+        await SearchMessagesScreen.searchModifierPhrases.tap({x: 1, y: 1});
+        await SearchMessagesScreen.searchInput.tapBackspaceKey();
+        await SearchMessagesScreen.searchInput.typeText(messageWithIncludedTerm);
+
+        // # Collapse the keyboard
+        await element(by.id('search.modifier.header')).tap();
+
+        // Corner-tap: searchModifierPhrases is 1.3px clipped and fails the 100% visibility
+        // threshold, same as searchModifierIn above.
+        await SearchMessagesScreen.searchModifierPhrases.tap({x: 1, y: 1});
+        await SearchMessagesScreen.searchInput.tapBackspaceKey();
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+
+        // * Verify search results only contain messages with included term
+        await wait(timeouts.TWO_SEC);
+        await expect(nonIncludedPostListPostItem).not.toBeVisible();
+        await expect(includedPostListPostItem).toBeVisible();
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(`"${messageWithIncludedTerm} "`);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_6 - should be able to search messages using combination of modifiers', async () => {
+        // # Open a channel screen, post a message, go back to channel list screen, and open search messages screen
+        const message = `Message ${getRandomId()}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Tap on from-search-modifier, type in username
+        await SearchMessagesScreen.searchInput.typeText(`from: ${testUser.username} channel: ${testChannel.name}`);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify search results only contain messages from user in channel
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(post.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(`from: ${testUser.username} channel: ${testChannel.name}`);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_7 - should be able to search messages using recent searches', async () => {
+        // # Open a channel screen, post a message, go back to channel list screen, and open search messages screen
+        const searchTerm = getRandomId();
+        const message = `Message ${searchTerm}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Type in a search term that will yield results and tap on search key
+        await SearchMessagesScreen.searchInput.typeText(searchTerm);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TEN_SEC);
+
+        // * Verify search results contain searched message
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(post.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Clear search input and tap on recent search item
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.getRecentSearchItem(searchTerm).tap();
+
+        // * Verify search results contain searched message
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchInput.tap();
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(searchTerm);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_8 - should be able to search messages on a another joined team', async () => {
+        // # As admin, create a second team, add user to the second team, create a new channel on second team, and add user to new channel; as user, terminate app and relaunch app
+        const {team: testTeamTwo} = await Team.apiCreateTeam(siteOneUrl, {prefix: 'a'});
+        await Team.apiAddUserToTeam(siteOneUrl, testUser.id, testTeamTwo.id);
+        const {channel: testChannelTwo} = await Channel.apiCreateChannel(siteOneUrl, {teamId: testTeamTwo.id});
+        await Channel.apiAddUserToChannel(siteOneUrl, testUser.id, testChannelTwo.id);
+        await reloadApp();
+        await ChannelListScreen.toBeVisible();
+
+        // * Verify on first team
+        await expect(ChannelListScreen.headerTeamDisplayName).toHaveText(testTeam.display_name);
+
+        // # Post a message to the new channel on second team and open search messages screen
+        const searchTerm = getRandomId();
+        const message = `Message ${searchTerm}`;
+        const {post} = await Post.apiCreatePost(siteOneUrl, {
+            channelId: testChannelTwo.id,
+            message,
+        });
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Tap on team picker button and tap on second team option
+        await SearchMessagesScreen.teamPickerButton.tap();
+        await TeamDropdownMenuScreen.getTeamIcon(testTeamTwo.id).tap();
+
+        // * Verify team picker button displays second team name
+        await expect(element(by.text(testTeamTwo.display_name))).toBeVisible();
+
+        // # Type in a search term that will yield results for second team and tap on search key
+        await SearchMessagesScreen.searchInput.typeText(searchTerm);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify search results contain searched message
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(post.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.TEN_SEC);
+
+        // # Tap on team picker button and tap on first team option
+        await SearchMessagesScreen.teamPickerButton.tap();
+        await wait(timeouts.TWO_SEC);
+        await TeamDropdownMenuScreen.getTeamIcon(testTeam.id).tap();
+
+        // * Verify search results do not contain searched message
+        await expect(postListPostItem).not.toBeVisible();
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(searchTerm);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+
+    it('MM-T5294_9 - should show empty search results screen when search result is empty', async () => {
+        // # Open a channel screen, post a message, go back to channel list screen, and open search messages screen
+        const message = `Message ${getRandomId()}`;
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await ChannelScreen.postMessage(message);
+        await ChannelScreen.back();
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Type in a search term that will yield no results and tap on search key
+        const searchTerm = getRandomId();
+        await SearchMessagesScreen.searchInput.typeText(searchTerm);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify empty search state for search messages
+        await expect(element(by.text(`No matches found for “${searchTerm}”`))).toBeVisible();
+        await expect(element(by.text('Check the spelling or try another search.'))).toExist();
+
+        // # Clear search input, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.removeRecentSearchItem(searchTerm);
+        await SearchMessagesScreen.close();
+        await ChannelListScreen.toBeVisible();
+    });
+});

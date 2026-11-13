@@ -12,13 +12,6 @@ const RequiredServer = {
     PATCH_VERSION: 0,
 };
 
-const MultiSessionCallsVersion = {
-    FULL_VERSION: '0.21.0',
-    MAJOR_VERSION: 0,
-    MIN_VERSION: 21,
-    PATCH_VERSION: 0,
-};
-
 const HostControlsCallsVersion = {
     FULL_VERSION: '0.27.0',
     MAJOR_VERSION: 0,
@@ -26,12 +19,35 @@ const HostControlsCallsVersion = {
     PATCH_VERSION: 0,
 };
 
+// The calls plugin version that replaced the rtcd media transport with LiveKit.
+const LiveKitCallsVersion = {
+    FULL_VERSION: '2.0.0',
+    MAJOR_VERSION: 2,
+    MIN_VERSION: 0,
+    PATCH_VERSION: 0,
+};
+
 const PluginId = 'com.mattermost.calls';
 
 const REACTION_TIMEOUT = 10000;
 const REACTION_LIMIT = 20;
+const REACTION_MIN_INTERVAL_MS = 200;
 const CALL_QUALITY_RESET_MS = toMilliseconds({minutes: 1});
 const CAPTION_TIMEOUT = 5000;
+const RING_LENGTH = 30000;
+
+// How long the caller hears the outbound ringback tone before it auto-stops.
+// The same window the callee's phone rings for, so both ends give up together.
+const RINGBACK_TONE_TIMEOUT = RING_LENGTH;
+
+export enum Ringtone {
+    Calm = 'Calm',
+    Dynamic = 'Dynamic',
+    Urgent = 'Urgent',
+    Cheerful = 'Cheerful',
+}
+
+const RINGTONE_DEFAULT = Ringtone.Calm;
 
 export enum MessageBarType {
     Microphone,
@@ -46,15 +62,19 @@ const JOB_TYPE_CAPTIONING = 'captioning';
 export default {
     RefreshConfigMillis,
     RequiredServer,
-    MultiSessionCallsVersion,
     HostControlsCallsVersion,
+    LiveKitCallsVersion,
     PluginId,
     REACTION_TIMEOUT,
     REACTION_LIMIT,
+    REACTION_MIN_INTERVAL_MS,
     MessageBarType,
     CALL_QUALITY_RESET_MS,
     CAPTION_TIMEOUT,
     JOB_TYPE_RECORDING,
     JOB_TYPE_TRANSCRIBING,
     JOB_TYPE_CAPTIONING,
+    RING_LENGTH,
+    RINGBACK_TONE_TIMEOUT,
+    RINGTONE_DEFAULT,
 };

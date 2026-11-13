@@ -2,13 +2,13 @@
 // See LICENSE.txt for license information.
 
 import {NotificationSettingsScreen} from '@support/ui/screen';
-import {timeouts} from '@support/utils';
+import {isIos, tapNativeBackButton, timeouts} from '@support/utils';
 import {expect} from 'detox';
 
 class PushNotificationSettingsScreen {
     testID = {
         pushNotificationSettingsScreen: 'push_notification_settings.screen',
-        backButton: 'screen.back.button',
+        backButton: 'navigation.header.back',
         scrollView: 'push_notification_settings.scroll_view',
         allNewMessagesOption: 'push_notification_settings.all_new_messages.option',
         allNewMessagesOptionSelected: 'push_notification_settings.all_new_messages.option.selected',
@@ -16,8 +16,8 @@ class PushNotificationSettingsScreen {
         mentionsOnlyOptionSelected: 'push_notification_settings.mentions_only.option.selected',
         nothingOption: 'push_notification_settings.nothing.option',
         nothingOptionSelected: 'push_notification_settings.nothing.option.selected',
-        pushThreadsFollowingOptionToggledOff: 'push_notification_settings.push_threads_following.option.toggled.false',
-        pushThreadsFollowingOptionToggledOn: 'push_notification_settings.push_threads_following.option.toggled.true',
+        pushThreadsFollowingOptionToggledOff: 'push_notification_settings.push_threads_following.option.toggled.false.button',
+        pushThreadsFollowingOptionToggledOn: 'push_notification_settings.push_threads_following.option.toggled.true.button',
         mobileOnlineOption: 'push_notification_settings.mobile_online.option',
         mobileOnlineOptionSelected: 'push_notification_settings.mobile_online.option.selected',
         mobileAwayOption: 'push_notification_settings.mobile_away.option',
@@ -27,7 +27,14 @@ class PushNotificationSettingsScreen {
     };
 
     pushNotificationSettingsScreen = element(by.id(this.testID.pushNotificationSettingsScreen));
-    backButton = element(by.id(this.testID.backButton));
+
+    // Native-stack back chevron via accessibility label.
+    get backButton(): Detox.NativeElement {
+        return isIos()
+            ? element(by.label('Back')).atIndex(0)
+            : element(by.label('Navigate up')).atIndex(0);
+    }
+
     scrollView = element(by.id(this.testID.scrollView));
     allNewMessagesOption = element(by.id(this.testID.allNewMessagesOption));
     allNewMessagesOptionSelected = element(by.id(this.testID.allNewMessagesOptionSelected));
@@ -58,8 +65,9 @@ class PushNotificationSettingsScreen {
     };
 
     back = async () => {
-        await this.backButton.tap();
-        await expect(this.pushNotificationSettingsScreen).not.toBeVisible();
+        // Native-stack back chevron.
+        await tapNativeBackButton();
+        await waitFor(this.pushNotificationSettingsScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
     togglePushThreadsFollowingOptionOn = async () => {

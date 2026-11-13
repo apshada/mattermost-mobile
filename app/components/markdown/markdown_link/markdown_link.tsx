@@ -3,20 +3,18 @@
 
 import {useManagedConfig} from '@mattermost/react-native-emm';
 import Clipboard from '@react-native-clipboard/clipboard';
-import React, {Children, type ReactElement, useCallback} from 'react';
-import {useIntl} from 'react-intl';
-import {Alert, StyleSheet, Text, View} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import React, {Children, type ReactElement, useCallback, useMemo} from 'react';
+import {useIntl, defineMessages} from 'react-intl';
+import {StyleSheet, Text, View} from 'react-native';
 import urlParse from 'url-parse';
 
 import SlideUpPanelItem, {ITEM_HEIGHT} from '@components/slide_up_panel_item';
 import {useServerUrl} from '@context/server';
-import {useTheme} from '@context/theme';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {bottomSheet, dismissBottomSheet} from '@screens/navigation';
-import {handleDeepLink, matchDeepLink} from '@utils/deep_link';
-import {bottomSheetSnapPoint} from '@utils/helpers';
-import {preventDoubleTap} from '@utils/tap';
-import {normalizeProtocol, tryOpenURL} from '@utils/url';
+import {bottomSheetSnapPoint, isEmail} from '@utils/helpers';
+import {isTelHref} from '@utils/phone_number';
+import {openLink} from '@utils/url/links';
 
 type MarkdownLinkProps = {
     children: ReactElement;
@@ -25,6 +23,21 @@ type MarkdownLinkProps = {
     siteURL: string;
     onLinkLongPress?: (url?: string) => void;
 }
+
+const messages = defineMessages({
+    copyEmail: {
+        id: 'mobile.markdown.link.copy_email',
+        defaultMessage: 'Copy Email Address',
+    },
+    copyPhone: {
+        id: 'mobile.markdown.link.copy_phone',
+        defaultMessage: 'Copy Phone Number',
+    },
+    copyURL: {
+        id: 'mobile.markdown.link.copy_url',
+        defaultMessage: 'Copy URL',
+    },
+});
 
 const style = StyleSheet.create({
     bottomSheet: {
@@ -45,68 +58,26 @@ const parseLinkLiteral = (literal: string) => {
     return parsed.href;
 };
 
+function getCopyLinkMessage(href: string) {
+    if (isTelHref(href)) {
+        return messages.copyPhone;
+    }
+
+    if (isEmail(href.replace(/^(mailto:|tel:)/i, ''))) {
+        return messages.copyEmail;
+    }
+
+    return messages.copyURL;
+}
+
 const MarkdownLink = ({children, experimentalNormalizeMarkdownLinks, href, siteURL, onLinkLongPress}: MarkdownLinkProps) => {
     const intl = useIntl();
-    const {bottom} = useSafeAreaInsets();
     const managedConfig = useManagedConfig<ManagedConfig>();
     const serverUrl = useServerUrl();
-    const theme = useTheme();
 
-    const {formatMessage} = intl;
-
-    const handlePress = useCallback(preventDoubleTap(async () => {
-        const url = normalizeProtocol(href);
-
-        if (!url) {
-            return;
-        }
-
-        const onError = () => {
-            Alert.alert(
-                formatMessage({
-                    id: 'mobile.link.error.title',
-                    defaultMessage: 'Error',
-                }),
-                formatMessage({
-                    id: 'mobile.link.error.text',
-                    defaultMessage: 'Unable to open the link.',
-                }),
-            );
-        };
-
-        const match = matchDeepLink(url, serverUrl, siteURL);
-
-        if (match) {
-            const {error} = await handleDeepLink(match.url, intl);
-            if (error) {
-                tryOpenURL(match.url, onError);
-            }
-        } else {
-            tryOpenURL(url, onError);
-        }
-    }), [href, intl.locale, serverUrl, siteURL]);
-
-    const parseChildren = useCallback(() => {
-        return Children.map(children, (child: ReactElement) => {
-            if (!child.props.literal || typeof child.props.literal !== 'string' || (child.props.context && child.props.context.length && !child.props.context.includes('link'))) {
-                return child;
-            }
-
-            const {props, ...otherChildProps} = child;
-            // eslint-disable-next-line react/prop-types
-            const {literal, ...otherProps} = props;
-
-            const nextProps = {
-                literal: parseLinkLiteral(literal),
-                ...otherProps,
-            };
-
-            return {
-                props: nextProps,
-                ...otherChildProps,
-            };
-        });
-    }, [children]);
+    const handlePress = usePreventDoubleTap(useCallback(() => {
+        openLink(href, serverUrl, siteURL ?? '', intl);
+    }, [href, intl, serverUrl, siteURL]));
 
     const handleLongPress = useCallback(() => {
         if (managedConfig?.copyAndPasteProtection !== 'true') {
@@ -114,6 +85,9 @@ const MarkdownLink = ({children, experimentalNormalizeMarkdownLinks, href, siteU
                 onLinkLongPress(href);
                 return;
             }
+
+            const cleanHref = href.replace(/^(mailto:|tel:)/i, '');
+            const copyMessage = getCopyLinkMessage(href);
 
             const renderContent = () => {
                 return (
@@ -125,10 +99,10 @@ const MarkdownLink = ({children, experimentalNormalizeMarkdownLinks, href, siteU
                             leftIcon='content-copy'
                             onPress={() => {
                                 dismissBottomSheet();
-                                Clipboard.setString(href);
+                                Clipboard.setString(cleanHref);
                             }}
                             testID='at_mention.bottom_sheet.copy_url'
-                            text={intl.formatMessage({id: 'mobile.markdown.link.copy_url', defaultMessage: 'Copy URL'})}
+                            text={intl.formatMessage(copyMessage)}
                         />
                         <SlideUpPanelItem
                             destructive={true}
@@ -143,17 +117,36 @@ const MarkdownLink = ({children, experimentalNormalizeMarkdownLinks, href, siteU
                 );
             };
 
-            bottomSheet({
-                closeButtonId: 'close-mardown-link',
-                renderContent,
-                snapPoints: [1, bottomSheetSnapPoint(2, ITEM_HEIGHT, bottom)],
-                title: intl.formatMessage({id: 'post.options.title', defaultMessage: 'Options'}),
-                theme,
-            });
+            bottomSheet(renderContent, [1, bottomSheetSnapPoint(2, ITEM_HEIGHT)]);
         }
-    }, [managedConfig, intl, bottom, theme, onLinkLongPress]);
+    }, [managedConfig?.copyAndPasteProtection, onLinkLongPress, href, intl]);
 
-    const renderChildren = experimentalNormalizeMarkdownLinks ? parseChildren() : children;
+    const renderedChildren = useMemo(() => {
+        if (!experimentalNormalizeMarkdownLinks) {
+            return children;
+        }
+
+        return Children.map(children, (c) => {
+            const child = c as ReactElement<any>;
+            if (!child.props.literal || typeof child.props.literal !== 'string' || (child.props.context && child.props.context.length && !child.props.context.includes('link'))) {
+                return child;
+            }
+
+            const {props, ...otherChildProps} = child;
+
+            const {literal, ...otherProps} = props;
+
+            const nextProps = {
+                literal: parseLinkLiteral(literal),
+                ...otherProps,
+            };
+
+            return {
+                props: nextProps,
+                ...otherChildProps,
+            };
+        });
+    }, [children, experimentalNormalizeMarkdownLinks]);
 
     return (
         <Text
@@ -161,7 +154,7 @@ const MarkdownLink = ({children, experimentalNormalizeMarkdownLinks, href, siteU
             onLongPress={handleLongPress}
             testID='markdown_link'
         >
-            {renderChildren}
+            {renderedChildren}
         </Text>
     );
 };

@@ -33,20 +33,30 @@ export const getServerHasChannels = async (serverUrl: string) => {
 
 export const observeServerHasChannels = (serverUrl: string) => {
     return queryHasChannels(serverUrl)?.observe().pipe(
-        switchMap((channels) => of$(channels?.length > 0 ?? false)),
+        switchMap((channels) => of$(channels.length > 0)),
     ) || of$(false);
 };
 
 export const hasChannels = async () => {
     try {
         const servers = await getAllServers();
-        const activeSrvers = servers.filter((s) => s.identifier && s.lastActiveAt);
+        const activeSrvers = servers.filter((s) => s.identifier && s.lastActiveAt && s.persistenceFlag !== 'zero-persistence');
         const promises: Array<Promise<boolean>> = [];
         for (const active of activeSrvers) {
             promises.push(getServerHasChannels(active.url));
         }
         const result = await Promise.all(promises);
         return result.some((r) => r);
+    } catch {
+        return false;
+    }
+};
+
+export const allActiveServersZeroPersistence = async () => {
+    try {
+        const servers = await getAllServers();
+        const activeServers = servers.filter((s) => s.identifier && s.lastActiveAt);
+        return activeServers.length > 0 && activeServers.every((s) => s.persistenceFlag === 'zero-persistence');
     } catch {
         return false;
     }

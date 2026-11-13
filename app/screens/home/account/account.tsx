@@ -5,10 +5,11 @@ import {useRoute} from '@react-navigation/native';
 import React, {useCallback, useState} from 'react';
 import {ScrollView, View} from 'react-native';
 import Animated, {useAnimatedStyle, withTiming} from 'react-native-reanimated';
-import {type Edge, SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
-import {View as ViewConstants} from '@constants';
+import {View as ViewConstants, Screens} from '@constants';
 import {useTheme} from '@context/theme';
+import useAndroidHomeTabBackHandler from '@hooks/android_home_tab_back_handler';
 import {useIsTablet} from '@hooks/device';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
@@ -24,14 +25,8 @@ type AccountScreenProps = {
     showFullName: boolean;
 };
 
-const edges: Edge[] = ['left', 'right'];
-
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     return {
-        container: {
-            flex: 1,
-            backgroundColor: theme.sidebarBg,
-        },
         flex: {
             flex: 1,
         },
@@ -62,6 +57,8 @@ const AccountScreen = ({currentUser, enableCustomUserStatuses, showFullName}: Ac
     const route = useRoute();
     const insets = useSafeAreaInsets();
     const isTablet = useIsTablet();
+
+    useAndroidHomeTabBackHandler(Screens.ACCOUNT);
 
     let tabletSidebarStyle;
     if (isTablet) {
@@ -97,6 +94,7 @@ const AccountScreen = ({currentUser, enableCustomUserStatuses, showFullName}: Ac
             alwaysBounceVertical={false}
             style={tabletSidebarStyle}
             contentContainerStyle={styles.totalHeight}
+            testID='account.scroll_view'
         >
             <AccountUserInfo
                 user={currentUser}
@@ -113,13 +111,12 @@ const AccountScreen = ({currentUser, enableCustomUserStatuses, showFullName}: Ac
     ) : null;
 
     return (
-        <SafeAreaView
-            edges={edges}
-            style={styles.container}
+        <View
+            style={styles.flex}
             testID='account.screen'
         >
-            <View style={[{height: insets.top, flexDirection: 'row'}]}>
-                <View style={[styles.container, tabletSidebarStyle]}/>
+            <View style={[{height: insets.top, flexDirection: 'row', backgroundColor: theme.sidebarBg}]}>
+                <View style={[styles.flex, tabletSidebarStyle]}/>
                 {isTablet && <View style={styles.tabletContainer}/>}
             </View>
             <Animated.View
@@ -128,12 +125,12 @@ const AccountScreen = ({currentUser, enableCustomUserStatuses, showFullName}: Ac
             >
                 {content}
                 {isTablet &&
-                <View style={[styles.tabletContainer, styles.tabletDivider]}>
-                    <AccountTabletView/>
-                </View>
+                    <View style={[styles.tabletContainer, styles.tabletDivider]}>
+                        <AccountTabletView/>
+                    </View>
                 }
             </Animated.View>
-        </SafeAreaView>
+        </View>
     );
 };
 

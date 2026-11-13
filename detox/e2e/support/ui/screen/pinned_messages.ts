@@ -6,20 +6,18 @@ import {
     ChannelInfoScreen,
     PostOptionsScreen,
 } from '@support/ui/screen';
-import {timeouts, wait} from '@support/utils';
+import {isAndroid, isIos, longPressWithRetry, tapNativeBackButton, timeouts, wait, waitForElementToBeVisible, waitForElementToExist, waitForElementToNotExist, withSynchronizationDisabled} from '@support/utils';
 import {expect} from 'detox';
 
 class PinnedMessagesScreen {
     testID = {
         pinnedMessagesScreenPrefix: 'pinned_messages.',
         pinnedMessagesScreen: 'pinned_messages.screen',
-        backButton: 'screen.back.button',
         emptyTitle: 'pinned_messages.empty.title',
         emptyParagraph: 'pinned_messages.empty.paragraph',
     };
 
     pinnedMessagesScreen = element(by.id(this.testID.pinnedMessagesScreen));
-    backButton = element(by.id(this.testID.backButton));
     emptyTitle = element(by.id(this.testID.emptyTitle));
     emptyParagraph = element(by.id(this.testID.emptyParagraph));
 
@@ -38,30 +36,85 @@ class PinnedMessagesScreen {
     };
 
     toBeVisible = async () => {
-        await waitFor(this.pinnedMessagesScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        const timeout = isAndroid() ? timeouts.HALF_MIN : timeouts.TEN_SEC;
+
+        // Same reason as ChannelInfoScreen.toBeVisible: the screen exists while the push
+        // animation is still in flight, so callers that assert on a child straight after
+        // this would race the transition. Wait for real visibility, not just presence.
+        if (isIos()) {
+            await withSynchronizationDisabled(async () => {
+                await waitForElementToExist(this.pinnedMessagesScreen, timeout);
+                await waitForElementToBeVisible(this.pinnedMessagesScreen, timeout);
+            });
+            return this.pinnedMessagesScreen;
+        }
+        await waitForElementToExist(this.pinnedMessagesScreen, timeout);
+        await waitForElementToBeVisible(this.pinnedMessagesScreen, timeout);
 
         return this.pinnedMessagesScreen;
     };
 
     open = async () => {
         // # Open pinned messages screen
+        if (isIos()) {
+            await withSynchronizationDisabled(async () => {
+                await waitForElementToExist(ChannelInfoScreen.pinnedMessagesOption, timeouts.TEN_SEC);
+
+                // Channel Info is still translating when the pin journey keeps Detox
+                // sync off. A center tap then misses TouchableOpacity onPress.
+                await wait(timeouts.TWO_SEC);
+                await ChannelInfoScreen.pinnedMessagesOption.tap({x: 1, y: 1});
+                try {
+                    await waitForElementToExist(this.pinnedMessagesScreen, timeouts.TEN_SEC);
+                } catch {
+                    await ChannelInfoScreen.pinnedMessagesOption.tap({x: 1, y: 1});
+                    await waitForElementToExist(this.pinnedMessagesScreen, timeouts.TEN_SEC);
+                }
+            });
+            return this.pinnedMessagesScreen;
+        }
+
         await ChannelInfoScreen.pinnedMessagesOption.tap();
 
         return this.toBeVisible();
     };
 
     back = async () => {
-        await this.backButton.tap();
-        await expect(this.pinnedMessagesScreen).not.toBeVisible();
+        if (isAndroid()) {
+            // Prefer native-stack header back over device.pressBack() (UiAutomator flakes on API 35).
+            await tapNativeBackButton();
+            await waitForElementToNotExist(this.pinnedMessagesScreen, timeouts.TEN_SEC);
+            return;
+        }
+
+        await withSynchronizationDisabled(async () => {
+            await wait(timeouts.TWO_SEC);
+            await this.pinnedMessagesScreen.swipe('right', 'fast', 0.8, 0.05, 0.5);
+            try {
+                await waitForElementToNotExist(this.pinnedMessagesScreen, timeouts.TEN_SEC);
+            } catch {
+                // Edge-swipe missed under sync-off — tap the pushed header back chevron.
+                await tapNativeBackButton();
+                await waitForElementToNotExist(this.pinnedMessagesScreen, timeouts.TEN_SEC);
+            }
+        });
     };
 
     openPostOptionsFor = async (postId: string, text: string) => {
         const {postListPostItem} = this.getPostListPostItem(postId, text);
-        await expect(postListPostItem).toBeVisible();
 
-        // # Open post options
-        await postListPostItem.longPress();
-        await PostOptionsScreen.toBeVisible();
+        const flatList = this.postList.getFlatList();
+        try {
+            await flatList.scroll(100, 'down');
+        } catch {
+            // Ignore scroll failures when the list is already at the boundary.
+        }
+        await wait(timeouts.ONE_SEC);
+
+        await waitForElementToExist(postListPostItem, timeouts.TEN_SEC);
+
+        // # Open post options (with retry — longPress can fail on Android during animations)
+        await longPressWithRetry(postListPostItem, PostOptionsScreen.postOptionsScreen);
         await wait(timeouts.TWO_SEC);
     };
 
@@ -74,6 +127,34 @@ class PinnedMessagesScreen {
         await expect(
             this.getPostMessageAtIndex(index),
         ).toHaveText(postMessage);
+    };
+
+    verifyReplyCount = async (postId: string, replyCount: number) => {
+        const replyCountElement = element(
+            by.id(`pinned_messages.post_list.post.${postId}`).
+                withDescendant(by.text(`${replyCount} repl${replyCount === 1 ? 'y' : 'ies'}`)),
+        );
+        if (isAndroid()) {
+            await waitForElementToBeVisible(replyCountElement, timeouts.TEN_SEC);
+        } else {
+            await expect(replyCountElement).toBeVisible();
+        }
+    };
+
+    verifyFollowingLabel = async (postId: string, following: boolean = false) => {
+        const followingLabelElement = element(
+            by.id(`pinned_messages.post_list.post.${postId}`).
+                withDescendant(by.text(following? 'Following' : 'Follow')),
+        );
+        if (isAndroid()) {
+            // After posting a reply, createThreadFromNewPost sets isFollowing=true
+            // immediately in the DB. However the WatermelonDB observer + React re-render
+            // cycle can take a few hundred ms on CI emulators, so use the polling
+            // helper instead of a plain expect() to avoid BridgeIdlingResource contention.
+            await waitForElementToBeVisible(followingLabelElement, timeouts.HALF_MIN);
+        } else {
+            await expect(followingLabelElement).toBeVisible();
+        }
     };
 }
 

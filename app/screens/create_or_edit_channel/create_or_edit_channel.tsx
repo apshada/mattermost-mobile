@@ -1,39 +1,52 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {useNavigation} from 'expo-router';
 import React, {useCallback, useEffect, useMemo, useReducer, useState} from 'react';
-import {useIntl} from 'react-intl';
-import {Keyboard} from 'react-native';
+import {defineMessages, useIntl} from 'react-intl';
+import {Keyboard, StyleSheet, View} from 'react-native';
 
 import {createChannel, patchChannel as handlePatchChannel, switchToChannelById} from '@actions/remote/channel';
-import CompassIcon from '@components/compass_icon';
-import {General} from '@constants';
+import {type ChannelAttributeFormValues} from '@components/channel_attribute_form';
+import NavigationButton from '@components/navigation_button';
+import {General, Screens} from '@constants';
 import {MIN_CHANNEL_NAME_LENGTH} from '@constants/channel';
+import {MISSING_REQUIRED_ATTRIBUTES_ERROR_ID} from '@constants/channel_attributes';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {buildNavigationButton, dismissModal, popTopScreen, setButtons} from '@screens/navigation';
+import {navigateBack} from '@screens/navigation';
 import {validateDisplayName} from '@utils/channel';
+import {isPropertyFieldRequired, isPropertyValueSet, pruneStaleAttributeValues, type ChannelAttributeField} from '@utils/channel_attributes';
+import {getServerError} from '@utils/errors';
+import {changeOpacity} from '@utils/theme';
 
 import ChannelInfoForm from './channel_info_form';
 
+import type {ChannelAttributeValueInput} from '@actions/remote/channel_attributes';
 import type ChannelModel from '@typings/database/models/servers/channel';
 import type ChannelInfoModel from '@typings/database/models/servers/channel_info';
-import type {AvailableScreens} from '@typings/screens/navigation';
-import type {ImageResource} from 'react-native-navigation';
+
+const messages = defineMessages({
+    missingRequiredAttributes: {
+        id: 'channel_attributes.create.missing_required',
+        defaultMessage: 'This channel is missing a required attribute. Check the channel attributes and try again.',
+    },
+    unsupportedRequiredAttribute: {
+        id: 'channel_attributes.create.unsupported_required',
+        defaultMessage: 'A required channel attribute cannot be set from this device yet. Ask an administrator to create this channel from a computer.',
+    },
+});
 
 type Props = {
-    componentId: AvailableScreens;
     channel?: ChannelModel;
     channelInfo?: ChannelInfoModel;
     headerOnly?: boolean;
-    isModal: boolean;
+    canCreatePublicChannels: boolean;
+    canCreatePrivateChannels: boolean;
+    attributeFields: ChannelAttributeField[];
+    attributesBlocked: boolean;
 }
-
-const CLOSE_BUTTON_ID = 'close-channel';
-const EDIT_BUTTON_ID = 'update-channel';
-const CREATE_BUTTON_ID = 'create-channel';
 
 enum RequestActions {
     START = 'Start',
@@ -51,30 +64,31 @@ interface RequestAction {
     error?: string;
 }
 
-const close = (componentId: AvailableScreens, isModal: boolean): void => {
+const close = async (): Promise<void> => {
     Keyboard.dismiss();
-    if (isModal) {
-        dismissModal({componentId});
-    } else {
-        popTopScreen(componentId);
-    }
+    await navigateBack();
 };
 
 const isDirect = (channel?: ChannelModel): boolean => {
     return channel?.type === General.DM_CHANNEL || channel?.type === General.GM_CHANNEL;
 };
 
-const makeCloseButton = (icon: ImageResource) => {
-    return buildNavigationButton(CLOSE_BUTTON_ID, 'close.create_or_edit_channel.button', icon);
-};
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+    },
+});
 
 const CreateOrEditChannel = ({
-    componentId,
+    canCreatePrivateChannels,
+    canCreatePublicChannels,
     channel,
     channelInfo,
     headerOnly,
-    isModal,
+    attributeFields,
+    attributesBlocked,
 }: Props) => {
+    const navigation = useNavigation();
     const intl = useIntl();
     const {formatMessage} = intl;
     const theme = useTheme();
@@ -88,6 +102,7 @@ const CreateOrEditChannel = ({
     const [displayName, setDisplayName] = useState<string>(channel?.displayName || '');
     const [purpose, setPurpose] = useState<string>(channelInfo?.purpose || '');
     const [header, setHeader] = useState<string>(channelInfo?.header || '');
+    const [attributeValues, setAttributeValues] = useState<ChannelAttributeFormValues>({});
 
     const [appState, dispatch] = useReducer((state: RequestState, action: RequestAction) => {
         switch (action.type) {
@@ -115,45 +130,6 @@ const CreateOrEditChannel = ({
         saving: false,
     });
 
-    const rightButton = useMemo(() => {
-        const base = buildNavigationButton(
-            editing ? EDIT_BUTTON_ID : CREATE_BUTTON_ID,
-            editing ? 'create_or_edit_channel.save.button' : 'create_or_edit_channel.create.button',
-            undefined,
-            editing ? formatMessage({id: 'mobile.edit_channel', defaultMessage: 'Save'}) : formatMessage({id: 'mobile.create_channel', defaultMessage: 'Create'}),
-        );
-        base.enabled = canSave;
-        base.showAsAction = 'always';
-        base.color = theme.sidebarHeaderTextColor;
-        return base;
-    }, [editing, theme.sidebarHeaderTextColor, intl, canSave]);
-
-    useEffect(() => {
-        setButtons(componentId, {
-            rightButtons: [rightButton],
-        });
-    }, [rightButton, componentId]);
-
-    useEffect(() => {
-        if (isModal) {
-            const icon = CompassIcon.getImageSourceSync('close', 24, theme.sidebarHeaderTextColor);
-            setButtons(componentId, {
-                leftButtons: [makeCloseButton(icon)],
-            });
-        }
-    }, [theme, isModal]);
-
-    useEffect(() => {
-        setCanSave(
-            displayName.length >= MIN_CHANNEL_NAME_LENGTH && (
-                displayName !== channel?.displayName ||
-                purpose !== channelInfo?.purpose ||
-                header !== channelInfo?.header ||
-                type !== channel.type
-            ),
-        );
-    }, [channel, displayName, purpose, header, type]);
-
     const isValidDisplayName = useCallback((): boolean => {
         if (isDirect(channel)) {
             return true;
@@ -168,7 +144,51 @@ const CreateOrEditChannel = ({
             return false;
         }
         return true;
-    }, [channel, displayName]);
+    }, [channel, displayName, intl]);
+
+    // attributeFields is a live subscription: an administrator can remove a field
+    // or an option while this screen is open. Without this, a draft pick that
+    // stopped existing between the tap and Create would still be sent, for the
+    // server to reject with nothing on screen to explain why.
+    useEffect(() => {
+        setAttributeValues((current) => pruneStaleAttributeValues(attributeFields, current));
+    }, [attributeFields]);
+
+    // Also derive the pruned values synchronously. A sheet opened before an option
+    // update can submit its stale selection after the effect above has run; this
+    // keeps rendering, validation, and the create payload on the latest fields.
+    const validAttributeValues = useMemo(
+        () => pruneStaleAttributeValues(attributeFields, attributeValues),
+        [attributeFields, attributeValues],
+    );
+
+    // Required attributes gate Create only: editing gains no attribute gate, both
+    // because there is no attribute editing on this screen in edit mode and
+    // because a channel that already exists cannot regress into "incomplete".
+    // Only fields still marked required count: with the required flag off the
+    // form can offer classification as optional, and an empty optional field must
+    // not block Create.
+    const allRequiredAttributesSet = editing || attributeFields.every((field) => !isPropertyFieldRequired(field) || isPropertyValueSet(validAttributeValues[field.id]));
+
+    // attributesBlocked means some required attribute the caller could otherwise
+    // satisfy has no mobile editor at all — nothing typed here could ever fix
+    // that, so Create stays disabled rather than round-tripping into a server
+    // rejection with no way to resolve it on screen.
+    const canSubmitAttributes = editing || !attributesBlocked;
+
+    const onAttributeValueChange = useCallback((fieldId: string, value: ChannelAttributeValueInput) => {
+        setAttributeValues((current) => {
+            if (!isPropertyValueSet(value)) {
+                if (!(fieldId in current)) {
+                    return current;
+                }
+                const next = {...current};
+                delete next[fieldId];
+                return next;
+            }
+            return {...current, [fieldId]: value as string | string[]};
+        });
+    }, []);
 
     const onCreateChannel = useCallback(async () => {
         dispatch({type: RequestActions.START});
@@ -177,20 +197,34 @@ const CreateOrEditChannel = ({
             return;
         }
 
-        setCanSave(false);
-        const createdChannel = await createChannel(serverUrl, displayName, purpose, header, type);
-        if (createdChannel.error) {
+        // The header button can still hold this callback from before a field
+        // update made a draft value stale, so the gate is checked again here.
+        if (!allRequiredAttributesSet || !canSubmitAttributes) {
             dispatch({
                 type: RequestActions.FAILURE,
-                error: createdChannel.error as string,
+                error: formatMessage(canSubmitAttributes ? messages.missingRequiredAttributes : messages.unsupportedRequiredAttribute),
+            });
+            return;
+        }
+
+        const propertyValues = attributeFields.
+            filter((field) => isPropertyValueSet(validAttributeValues[field.id])).
+            map((field) => ({field_id: field.id, value: validAttributeValues[field.id]}));
+        const createdChannel = await createChannel(serverUrl, displayName, purpose, header, type, propertyValues);
+        if (createdChannel.error) {
+            const isMissingRequiredAttributes = getServerError(createdChannel.error) === MISSING_REQUIRED_ATTRIBUTES_ERROR_ID;
+            dispatch({
+                type: RequestActions.FAILURE,
+                error: isMissingRequiredAttributes ? formatMessage(messages.missingRequiredAttributes) : createdChannel.error as string,
             });
             return;
         }
 
         dispatch({type: RequestActions.COMPLETE});
-        close(componentId, isModal);
+        navigation.getParent()?.goBack();
+        await new Promise((resolve) => setTimeout(resolve, 250));
         switchToChannelById(serverUrl, createdChannel.channel!.id, createdChannel.channel!.team_id);
-    }, [serverUrl, type, displayName, header, isModal, purpose, isValidDisplayName]);
+    }, [isValidDisplayName, allRequiredAttributesSet, canSubmitAttributes, serverUrl, displayName, purpose, header, type, attributeFields, validAttributeValues, formatMessage, navigation]);
 
     const onUpdateChannel = useCallback(async () => {
         if (!channel) {
@@ -210,7 +244,6 @@ const CreateOrEditChannel = ({
             },
         };
 
-        setCanSave(false);
         const patchedChannel = await handlePatchChannel(serverUrl, channel.id, patchChannel);
         if (patchedChannel.error) {
             dispatch({
@@ -220,34 +253,66 @@ const CreateOrEditChannel = ({
             return;
         }
         dispatch({type: RequestActions.COMPLETE});
-        close(componentId, isModal);
-    }, [channel?.id, channel?.type, displayName, header, isModal, purpose, isValidDisplayName]);
+        close();
+    }, [channel, isValidDisplayName, header, displayName, purpose, serverUrl]);
 
-    const handleClose = useCallback(() => {
-        close(componentId, isModal);
-    }, [isModal]);
+    const isEnabled = canSave && !appState.saving;
 
-    useNavButtonPressed(CLOSE_BUTTON_ID, componentId, handleClose, [handleClose]);
-    useNavButtonPressed(CREATE_BUTTON_ID, componentId, onCreateChannel, [onCreateChannel]);
-    useNavButtonPressed(EDIT_BUTTON_ID, componentId, onUpdateChannel, [onUpdateChannel]);
-    useAndroidHardwareBackHandler(componentId, handleClose);
+    useEffect(() => {
+        const buttonText = editing ? formatMessage({id: 'mobile.edit_channel', defaultMessage: 'Save'}) : formatMessage({id: 'mobile.create_channel', defaultMessage: 'Create'});
+        navigation.setOptions({
+            headerRight: () => (
+                <NavigationButton
+                    onPress={editing ? onUpdateChannel : onCreateChannel}
+                    text={buttonText}
+                    testID={editing ? 'create_or_edit_channel.save.button' : 'create_or_edit_channel.create.button'}
+                    color={isEnabled ? theme.sidebarHeaderTextColor : changeOpacity(theme.sidebarHeaderTextColor, 0.5)}
+                    disabled={!isEnabled}
+                />
+            ),
+        });
+    }, [editing, formatMessage, navigation, onUpdateChannel, onCreateChannel, isEnabled, theme.sidebarHeaderTextColor]);
+
+    useEffect(() => {
+        setCanSave(
+            displayName.length >= MIN_CHANNEL_NAME_LENGTH && (
+                displayName !== channel?.displayName ||
+                purpose !== channelInfo?.purpose ||
+                header !== channelInfo?.header ||
+                type !== channel.type
+            ) && allRequiredAttributesSet && canSubmitAttributes,
+        );
+    }, [channel, displayName, purpose, header, type, channelInfo?.purpose, channelInfo?.header, allRequiredAttributesSet, canSubmitAttributes]);
+
+    useAndroidHardwareBackHandler(Screens.CREATE_OR_EDIT_CHANNEL, close);
+
+    // A save error takes priority: it is the outcome of something the user just
+    // did, where the unsupported-attribute notice is standing background context.
+    const displayError = appState.error || (canSubmitAttributes ? '' : formatMessage(messages.unsupportedRequiredAttribute));
 
     return (
-        <ChannelInfoForm
-            error={appState.error}
-            saving={appState.saving}
-            channelType={channel?.type}
-            editing={editing}
-            onTypeChange={setType}
-            type={type}
-            displayName={displayName}
-            onDisplayNameChange={setDisplayName}
-            header={header}
-            headerOnly={headerOnly}
-            onHeaderChange={setHeader}
-            purpose={purpose}
-            onPurposeChange={setPurpose}
-        />
+        <View style={styles.container}>
+            <ChannelInfoForm
+                error={displayError}
+                saving={appState.saving}
+                channelType={channel?.type}
+                editing={editing}
+                onTypeChange={setType}
+                type={type}
+                displayName={displayName}
+                onDisplayNameChange={setDisplayName}
+                header={header}
+                headerOnly={headerOnly}
+                onHeaderChange={setHeader}
+                purpose={purpose}
+                onPurposeChange={setPurpose}
+                canCreatePrivateChannels={canCreatePrivateChannels}
+                canCreatePublicChannels={canCreatePublicChannels}
+                attributeFields={attributeFields}
+                attributeValues={validAttributeValues}
+                onAttributeValueChange={onAttributeValueChange}
+            />
+        </View>
     );
 };
 

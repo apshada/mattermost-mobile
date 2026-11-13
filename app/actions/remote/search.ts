@@ -2,11 +2,13 @@
 // See LICENSE.txt for license information.
 
 import {getPosts} from '@actions/local/post';
+import {captureRedactionEpoch} from '@actions/local/redaction';
+import {General} from '@constants';
 import {SYSTEM_IDENTIFIERS} from '@constants/database';
 import DatabaseManager from '@database/manager';
 import NetworkManager from '@managers/network_manager';
 import {prepareMissingChannelsForAllTeams} from '@queries/servers/channel';
-import {getConfigValue} from '@queries/servers/system';
+import {canViewArchivedChannels, getCurrentTeamId} from '@queries/servers/system';
 import {getIsCRTEnabled, prepareThreadsFromReceivedPosts} from '@queries/servers/thread';
 import {getCurrentUser} from '@queries/servers/user';
 import {getFullErrorMessage} from '@utils/errors';
@@ -18,6 +20,7 @@ import {fetchPostAuthors, fetchMissingChannelsFromPosts} from './post';
 import {forceLogoutIfNecessary} from './session';
 
 import type Model from '@nozbe/watermelondb/Model';
+import type ChannelModel from '@typings/database/models/servers/channel';
 import type PostModel from '@typings/database/models/servers/post';
 
 export async function fetchRecentMentions(serverUrl: string): Promise<PostSearchRequest> {
@@ -56,14 +59,18 @@ export const searchPosts = async (serverUrl: string, teamId: string, params: Pos
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const client = NetworkManager.getClient(serverUrl);
-        const viewArchivedChannels = await getConfigValue(database, 'ExperimentalViewArchivedChannels');
+        const viewArchivedChannels = await canViewArchivedChannels(database);
         const user = await getCurrentUser(database);
         const timezoneOffset = getUtcOffsetForTimeZone(getUserTimezone(user)) * 60;
+
+        // The epoch counter is at least every channel's requirement, so one capture covers results
+        // spanning channels.
+        const redactionVerifiedEpoch = await captureRedactionEpoch(serverUrl);
 
         let postsArray: Post[] = [];
         const data = await client.searchPostsWithParams(teamId, {
             ...params,
-            include_deleted_channels: Boolean(viewArchivedChannels),
+            include_deleted_channels: viewArchivedChannels,
             time_zone_offset: timezoneOffset,
         });
 
@@ -104,6 +111,7 @@ export const searchPosts = async (serverUrl: string, teamId: string, params: Pos
                     posts: postsArray,
                     previousPostId: '',
                     prepareRecordsOnly: true,
+                    redactionVerifiedEpoch,
                 }),
             );
         }
@@ -129,10 +137,15 @@ export const searchPosts = async (serverUrl: string, teamId: string, params: Pos
     }
 };
 
-export const searchFiles = async (serverUrl: string, teamId: string, params: FileSearchParams): Promise<{files?: FileInfo[]; channels?: string[]; error?: unknown}> => {
+export const searchFiles = async (serverUrl: string, teamId: string, params: FileSearchParams, channel?: ChannelModel): Promise<{files?: FileInfo[]; channels?: string[]; error?: unknown}> => {
     try {
+        let currentTeamId = teamId;
+        if (channel && (channel.type === General.DM_CHANNEL || channel.type === General.GM_CHANNEL)) {
+            const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+            currentTeamId = await getCurrentTeamId(database);
+        }
         const client = NetworkManager.getClient(serverUrl);
-        const result = await client.searchFiles(teamId, params.terms);
+        const result = await client.searchFiles(currentTeamId, params.terms, false);
         const files = result?.file_infos ? Object.values(result.file_infos) : [];
         const [allChannelIds, allPostIds] = files.reduce<[Set<string>, Set<string>]>((acc, f) => {
             if (f.channel_id) {
@@ -153,7 +166,9 @@ export const searchFiles = async (serverUrl: string, teamId: string, params: Fil
             return acc;
         }, {});
         files.forEach((f) => {
-            f.postProps = idToPost[f.post_id]?.props;
+            if (f.post_id) {
+                f.postProps = idToPost[f.post_id]?.props || {};
+            }
         });
         return {files, channels};
     } catch (error) {

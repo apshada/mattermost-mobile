@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import React, {memo, useCallback} from 'react';
-import {Text, TouchableOpacity, View} from 'react-native';
+import {Keyboard, Text, TouchableOpacity, View} from 'react-native';
 
 import Emoji from '@components/emoji';
 import {useTheme} from '@context/theme';
@@ -41,12 +41,18 @@ const EmojiTouchable = ({name, onEmojiPress}: TouchableEmojiProps) => {
     const theme = useTheme();
     const style = getStyleSheetFromTheme(theme);
 
-    const onPress = useCallback(() => onEmojiPress(name), []);
+    const onPress = useCallback(() => {
+        if (Keyboard.isVisible()) {
+            Keyboard.dismiss();
+        }
+        onEmojiPress(name);
+    }, [name, onEmojiPress]);
 
     return (
         <TouchableOpacity
             onPress={onPress}
             style={style.container}
+            testID={`emoji_picker.search_result.${name}`}
         >
             <View style={style.emojiContainer}>
                 <Emoji

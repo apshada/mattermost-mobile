@@ -14,16 +14,23 @@ import {Screens, View as ViewConstants} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import DatabaseManager from '@database/manager';
+import {usePreventDoubleTap} from '@hooks/utils';
+import NetworkManager from '@managers/network_manager';
+import {getActiveServerUrl} from '@queries/app/servers';
 import {getChannelById} from '@queries/servers/channel';
 import {getUserById, observeTeammateNameDisplay} from '@queries/servers/user';
-import {goToScreen} from '@screens/navigation';
-import {preventDoubleTap} from '@utils/tap';
+import {navigateToScreen} from '@screens/navigation';
+import SettingsStore from '@store/settings_store';
+import {logDebug} from '@utils/log';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
+import {secureGetFromRecord} from '@utils/types';
+import {typography} from '@utils/typography';
 import {displayUsername} from '@utils/user';
 
 import type {WithDatabaseArgs} from '@typings/database/database';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
-type Selection = DialogOption | Channel | UserProfile | DialogOption[] | Channel[] | UserProfile[];
+export type Selection = DialogOption | Channel | UserProfile | DialogOption[] | Channel[] | UserProfile[];
 
 type AutoCompleteSelectorProps = {
     dataSource?: string;
@@ -38,10 +45,15 @@ type AutoCompleteSelectorProps = {
     placeholder?: string;
     roundedBorders?: boolean;
     selected?: SelectedDialogValue;
-    showRequiredAsterisk?: boolean;
     teammateNameDisplay: string;
     isMultiselect?: boolean;
     testID: string;
+    location: AvailableScreens;
+
+    // Interim solution not to rewrite this component nor
+    // break any existing features that rely on it, until
+    // we apply blocks in all integration surfaces.
+    omitMargins?: boolean;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -53,6 +65,10 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         paddingRight: 30,
         paddingVertical: 7,
         height: 40,
+    };
+    const baseText = {
+        ...typography('Body', 200),
+        color: theme.centerChannelColor,
     };
 
     return {
@@ -68,22 +84,23 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         },
         input,
         dropdownPlaceholder: {
-            top: 3,
-            marginLeft: 5,
-            color: changeOpacity(theme.centerChannelColor, 0.5),
+            ...baseText,
         },
         dropdownSelected: {
-            top: 3,
-            marginLeft: 5,
-            color: theme.centerChannelColor,
+            ...baseText,
         },
         icon: {
             position: 'absolute',
-            top: 13,
+            top: 10,
             right: 12,
         },
         disabled: {
             opacity: 0.5,
+        },
+        noMargins: {
+            marginBottom: 0,
+            marginRight: 0,
+            marginTop: 0,
         },
     };
 });
@@ -93,7 +110,7 @@ async function getItemName(serverUrl: string, selected: string, teammateNameDisp
         return '';
     }
 
-    const database = DatabaseManager.serverDatabases[serverUrl]?.database;
+    const database = secureGetFromRecord(DatabaseManager.serverDatabases, serverUrl)?.database;
 
     switch (dataSource) {
         case ViewConstants.DATA_SOURCE_USERS: {
@@ -110,7 +127,24 @@ async function getItemName(serverUrl: string, selected: string, teammateNameDisp
             }
 
             const channel = await getChannelById(database, selected);
-            return channel?.displayName || intl.formatMessage({id: 'autocomplete_selector.unknown_channel', defaultMessage: 'Unknown channel'});
+
+            if (channel?.displayName) {
+                return channel.displayName;
+            }
+
+            // If channel not found locally, try to fetch from server
+            try {
+                const activeServerUrl = await getActiveServerUrl();
+                if (activeServerUrl) {
+                    const client = NetworkManager.getClient(activeServerUrl);
+                    const serverChannel = await client.getChannel(selected);
+                    return serverChannel?.display_name || intl.formatMessage({id: 'autocomplete_selector.unknown_channel', defaultMessage: 'Unknown channel'});
+                }
+            } catch (error) {
+                logDebug('[AutoCompleteSelector.getItemName] Failed to fetch channel from server', error);
+            }
+
+            return intl.formatMessage({id: 'autocomplete_selector.unknown_channel', defaultMessage: 'Unknown channel'});
         }
     }
 
@@ -130,8 +164,23 @@ function getTextAndValueFromSelectedItem(item: Selection, teammateNameDisplay: s
 }
 
 function AutoCompleteSelector({
-    dataSource, disabled = false, errorText, getDynamicOptions, helpText, label, onSelected, optional = false,
-    options, placeholder, roundedBorders = true, selected, teammateNameDisplay, isMultiselect = false, testID,
+    dataSource,
+    disabled = false,
+    errorText,
+    getDynamicOptions,
+    helpText,
+    label,
+    onSelected,
+    optional = false,
+    options,
+    placeholder,
+    roundedBorders = true,
+    selected,
+    teammateNameDisplay,
+    isMultiselect = false,
+    testID,
+    location,
+    omitMargins = false,
 }: AutoCompleteSelectorProps) {
     const intl = useIntl();
     const theme = useTheme();
@@ -139,11 +188,6 @@ function AutoCompleteSelector({
     const style = getStyleSheet(theme);
     const title = placeholder || intl.formatMessage({id: 'mobile.action_menu.select', defaultMessage: 'Select an option'});
     const serverUrl = useServerUrl();
-
-    const goToSelectorScreen = useCallback(preventDoubleTap(() => {
-        const screen = Screens.INTEGRATION_SELECTOR;
-        goToScreen(screen, title, {dataSource, handleSelect, options, getDynamicOptions, selected, isMultiselect});
-    }), [dataSource, options, getDynamicOptions]);
 
     const handleSelect = useCallback((newSelection?: Selection) => {
         if (!newSelection) {
@@ -165,7 +209,13 @@ function AutoCompleteSelector({
         if (onSelected) {
             onSelected(selectedOptions);
         }
-    }, [teammateNameDisplay, intl, dataSource]);
+    }, [teammateNameDisplay, intl, dataSource, onSelected]);
+
+    const goToSelectorScreen = usePreventDoubleTap(useCallback((() => {
+        SettingsStore.setIntegrationsSelectCallback(handleSelect);
+        SettingsStore.setIntegrationsDynamicOptionsCallback(getDynamicOptions);
+        navigateToScreen(Screens.INTEGRATION_SELECTOR, {dataSource, options, selected, title, isMultiselect});
+    }), [handleSelect, getDynamicOptions, dataSource, options, selected, title, isMultiselect]));
 
     // Handle the text for the default value.
     useEffect(() => {
@@ -185,10 +235,10 @@ function AutoCompleteSelector({
         Promise.all(namePromises).then((names) => {
             setItemText(names.join(', '));
         });
-    }, []);
+    }, [dataSource, teammateNameDisplay, intl, options, selected, serverUrl]);
 
     return (
-        <View style={style.container}>
+        <View style={[style.container, omitMargins && style.noMargins]}>
             {Boolean(label) && (
                 <Label
                     label={label!}
@@ -201,6 +251,7 @@ function AutoCompleteSelector({
                 onPress={goToSelectorScreen}
                 style={disabled ? style.disabled : null}
                 type='opacity'
+                testID={`${testID}.select.button`}
             >
                 <View style={roundedBorders ? style.roundedInput : style.input}>
                     <Text
@@ -211,6 +262,7 @@ function AutoCompleteSelector({
                     </Text>
                     <CompassIcon
                         name='chevron-down'
+                        size={20}
                         color={changeOpacity(theme.centerChannelColor, 0.5)}
                         style={style.icon}
                     />
@@ -220,6 +272,7 @@ function AutoCompleteSelector({
                 disabled={disabled}
                 helpText={helpText}
                 errorText={errorText}
+                location={location}
             />
         </View>
     );

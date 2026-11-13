@@ -1,0 +1,530 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {router} from 'expo-router';
+import {DeviceEventEmitter} from 'react-native';
+
+import {Events, Navigation, Screens} from '@constants';
+import BottomSheetStore from '@store/bottom_sheet_store';
+import CallbackStore from '@store/callback_store';
+import {NavigationStore} from '@store/navigation_store';
+import {safeParseJSON} from '@utils/helpers';
+import {logError} from '@utils/log';
+
+import {
+    bottomSheet,
+    dismissAllRoutesAndPopToScreen,
+    dismissBottomSheet,
+    dismissToStackRoot,
+    navigateBack,
+    navigateToChannelInfoScreen,
+    navigateToHomeTab,
+    navigateToRoot,
+    navigateToScreen,
+    navigateToScreenWithBaseRoute,
+    navigateToSettingsScreen,
+    propsToParams,
+    updateParams,
+} from './navigation';
+
+jest.mock('@utils/log');
+
+// Mock router functions to return immediately resolved promises
+jest.mock('expo-router', () => ({
+    router: {
+        push: jest.fn(),
+        replace: jest.fn(),
+        back: jest.fn(),
+        canGoBack: jest.fn(() => true),
+        canDismiss: jest.fn(() => true),
+        dismiss: jest.fn(),
+        dismissAll: jest.fn(),
+        dismissTo: jest.fn(),
+        setParams: jest.fn(),
+        navigate: jest.fn(),
+    },
+    useRouter: () => ({
+        push: jest.fn(),
+        replace: jest.fn(),
+        back: jest.fn(),
+        canGoBack: jest.fn(() => true),
+        navigate: jest.fn(),
+    }),
+}));
+
+describe('navigation', () => {
+// Reset all mocks before each test
+    beforeEach(() => {
+        jest.clearAllMocks();
+
+        // Reset stores to clean state
+        BottomSheetStore.reset();
+        CallbackStore.removeCallback();
+    });
+
+    describe('propsToParams', () => {
+        it('should JSON-encode string props to preserve type on round-trip', () => {
+            const props = {name: 'test', id: '123'};
+            const result = propsToParams(props);
+
+            expect(result).toEqual({name: '"test"', id: '"123"'});
+        });
+
+        it('should preserve numeric strings through params round-trip', () => {
+            const props = {loginId: '123456789', password: '654321'};
+            const params = propsToParams(props);
+
+            const decoded = Object.keys(params).reduce((acc, key) => {
+                acc[key] = safeParseJSON(params[key]);
+                return acc;
+            }, {} as Record<string, unknown>);
+
+            expect(decoded).toEqual({loginId: '123456789', password: '654321'});
+        });
+
+        it('should convert non-string props to JSON strings', () => {
+            const props = {
+                count: 42,
+                active: true,
+                data: {key: 'value'},
+                items: ['a', 'b'],
+            };
+            const result = propsToParams(props);
+
+            expect(result).toEqual({
+                count: '42',
+                active: 'true',
+                data: '{"key":"value"}',
+                items: '["a","b"]',
+            });
+        });
+
+        it('should handle empty props', () => {
+            const result = propsToParams({});
+            expect(result).toEqual({});
+        });
+
+        it('should handle null/undefined props', () => {
+            const result = propsToParams(null);
+            expect(result).toEqual({});
+        });
+
+        it('should handle mixed types', () => {
+            const props = {
+                string: 'value',
+                number: 123,
+                boolean: false,
+                object: {nested: true},
+            };
+            const result = propsToParams(props);
+
+            expect(result).toEqual({
+                string: '"value"',
+                number: '123',
+                boolean: 'false',
+                object: '{"nested":true}',
+            });
+        });
+    });
+
+    describe('updateParams', () => {
+        it('should call router.setParams with converted params', () => {
+            const props = {theme: 'dark', userId: '123'};
+            updateParams(props);
+
+            expect(router.setParams).toHaveBeenCalledWith({
+                theme: '"dark"',
+                userId: '"123"',
+            });
+        });
+
+        it('should handle complex props', () => {
+            const props = {count: 5, active: true};
+            updateParams(props);
+
+            expect(router.setParams).toHaveBeenCalledWith({
+                count: '5',
+                active: 'true',
+            });
+        });
+
+        it('should handle empty props', () => {
+            updateParams({});
+            expect(router.setParams).toHaveBeenCalledWith({});
+        });
+    });
+
+    describe('navigateToScreen', () => {
+        it('should navigate to unauthenticated screen', () => {
+            navigateToScreen(Screens.LOGIN, {serverUrl: 'https://example.com'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(unauthenticated)/login',
+                params: {serverUrl: '"https://example.com"'},
+            });
+        });
+
+        it('should navigate to unauthenticated screen as modal when isModal prop is true', () => {
+            navigateToScreen(Screens.LOGIN, {isModal: true, serverUrl: 'https://example.com'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(add-server)/login',
+                params: {isModal: 'true', serverUrl: '"https://example.com"'},
+            });
+        });
+
+        it('should navigate to home tab screen', () => {
+            navigateToScreen(Screens.CHANNEL_LIST);
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(authenticated)/(home)/channel_list',
+                params: {},
+            });
+        });
+
+        it('should navigate to bottom sheet screen', () => {
+            navigateToScreen(Screens.GENERIC_BOTTOM_SHEET, {content: 'test'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(bottom_sheet)/generic_bottom_sheet',
+                params: {content: '"test"'},
+            });
+        });
+
+        it('should navigate to modal screen', () => {
+            navigateToScreen(Screens.SETTINGS, {section: 'display'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(settings)',
+                params: {section: '"display"'},
+            });
+        });
+
+        it('should navigate to authenticated screen by default', () => {
+            navigateToScreen(Screens.CHANNEL, {channelId: 'abc123'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(authenticated)/channel',
+                params: {channelId: '"abc123"'},
+            });
+        });
+
+        it('should use router.replace when reset is true', () => {
+            navigateToScreen(Screens.LOGIN, {serverUrl: 'https://example.com'}, true);
+
+            expect(router.replace).toHaveBeenCalledWith({
+                pathname: '/(unauthenticated)/login',
+                params: {serverUrl: '"https://example.com"'},
+            });
+            expect(router.push).not.toHaveBeenCalled();
+        });
+
+        it('should handle navigation without props', () => {
+            navigateToScreen(Screens.CHANNEL_LIST);
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(authenticated)/(home)/channel_list',
+                params: {},
+            });
+        });
+
+        it('should log error if navigation fails', () => {
+            jest.mocked(router.push).mockImplementationOnce(() => {
+                throw new Error('Navigation failed');
+            });
+
+            navigateToScreen(Screens.CHANNEL_LIST);
+
+            expect(logError).toHaveBeenCalledWith(
+                'navigateToScreen: Expo Router navigation failed',
+                expect.any(Error),
+            );
+        });
+    });
+
+    describe('navigateToScreenWithBaseRoute', () => {
+        it('should navigate with base route and screen', () => {
+            navigateToScreenWithBaseRoute('/base', Screens.ACCOUNT, {section: 'profile'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/base/account',
+                params: {section: '"profile"'},
+            });
+        });
+
+        it('should use router.replace when reset is true', () => {
+            navigateToScreenWithBaseRoute('/base', Screens.ACCOUNT, {section: 'profile'}, true);
+
+            expect(router.replace).toHaveBeenCalledWith({
+                pathname: '/base/account',
+                params: {section: '"profile"'},
+            });
+            expect(router.push).not.toHaveBeenCalled();
+        });
+
+        it('should handle navigation without props', () => {
+            navigateToScreenWithBaseRoute('/base', Screens.ACCOUNT);
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/base/account',
+                params: {},
+            });
+        });
+
+        it('should log error if navigation fails', () => {
+            jest.mocked(router.push).mockImplementationOnce(() => {
+                throw new Error('Navigation failed');
+            });
+
+            navigateToScreenWithBaseRoute('/base', Screens.ACCOUNT);
+
+            expect(logError).toHaveBeenCalledWith(
+                'navigateToScreenWithBaseRoute: Expo Router navigation failed',
+                expect.any(Error),
+            );
+        });
+    });
+
+    describe('navigateBack', () => {
+        it('should navigate back when router can go back', async () => {
+            jest.mocked(router.canGoBack).mockReturnValue(true);
+
+            await navigateBack();
+
+            expect(router.canGoBack).toHaveBeenCalled();
+            expect(router.back).toHaveBeenCalled();
+        });
+
+        it('should not navigate back when router cannot go back', async () => {
+            jest.mocked(router.canGoBack).mockReturnValue(false);
+
+            await navigateBack();
+            expect(router.canGoBack).toHaveBeenCalled();
+            expect(router.back).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('navigateToHomeTab', () => {
+        let emitSpy: jest.SpyInstance;
+
+        beforeEach(() => {
+            emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
+        });
+
+        afterEach(() => {
+            emitSpy.mockRestore();
+        });
+
+        it('should emit NAVIGATE_TO_TAB for the channel list tab', () => {
+            navigateToHomeTab();
+
+            expect(emitSpy).toHaveBeenCalledWith(Navigation.NAVIGATE_TO_TAB, {
+                screen: Screens.CHANNEL_LIST,
+                params: undefined,
+            });
+        });
+
+        it('should pass params to the tab navigation event', () => {
+            navigateToHomeTab({direction: 'right'});
+
+            expect(emitSpy).toHaveBeenCalledWith(Navigation.NAVIGATE_TO_TAB, {
+                screen: Screens.CHANNEL_LIST,
+                params: {direction: 'right'},
+            });
+        });
+    });
+
+    describe('dismissToStackRoot', () => {
+        it('should dismiss all when router can dismiss', async () => {
+            jest.mocked(router.canDismiss).mockReturnValue(true);
+
+            await dismissToStackRoot();
+
+            expect(router.canDismiss).toHaveBeenCalled();
+            expect(router.dismissAll).toHaveBeenCalled();
+        });
+
+        it('should not dismiss when router cannot dismiss', async () => {
+            jest.mocked(router.canDismiss).mockReturnValue(false);
+
+            await dismissToStackRoot();
+
+            expect(router.canDismiss).toHaveBeenCalled();
+            expect(router.dismissAll).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('bottomSheet', () => {
+        it('should configure bottom sheet store and navigate', () => {
+            const renderContent = jest.fn();
+            const snapPoints = ['50%', '90%'];
+            const footerComponent = jest.fn();
+
+            bottomSheet(renderContent, snapPoints, footerComponent);
+
+            expect(BottomSheetStore.getSnapPoints()).toEqual(snapPoints);
+            expect(BottomSheetStore.getRenderContentCallback()).toBe(renderContent);
+            expect(BottomSheetStore.getFooterComponent()).toBe(footerComponent);
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(bottom_sheet)/generic_bottom_sheet',
+                params: {},
+            });
+        });
+
+        it('should clear a stale footer component when omitted', () => {
+            const renderContent = jest.fn();
+            const snapPoints = ['50%'];
+            const footerComponent = jest.fn();
+
+            bottomSheet(renderContent, snapPoints, footerComponent);
+            expect(BottomSheetStore.getFooterComponent()).toBe(footerComponent);
+
+            bottomSheet(renderContent, snapPoints);
+
+            expect(BottomSheetStore.getFooterComponent()).toBeUndefined();
+        });
+
+        it('should clear stale keyboard behavior when omitted', () => {
+            const renderContent = jest.fn();
+            const snapPoints = ['50%'];
+
+            bottomSheet(renderContent, snapPoints, undefined, 'interactive');
+            expect(BottomSheetStore.getKeyboardBehavior()).toBe('interactive');
+
+            bottomSheet(renderContent, snapPoints);
+
+            expect(BottomSheetStore.getKeyboardBehavior()).toBeUndefined();
+        });
+    });
+
+    describe('dismissBottomSheet', () => {
+        it('should emit close event, wait for removal, reset store, and wait', async () => {
+            const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
+            const waitSpy = jest.spyOn(NavigationStore, 'waitUntilScreensIsRemoved').mockResolvedValue();
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(true);
+
+            await dismissBottomSheet();
+
+            expect(emitSpy).toHaveBeenCalledWith(Events.CLOSE_BOTTOM_SHEET);
+            expect(waitSpy).toHaveBeenCalledWith(Screens.BOTTOM_SHEET);
+            expect(BottomSheetStore.getRenderContentCallback()).toBeUndefined();
+            expect(BottomSheetStore.getFooterComponent()).toBeUndefined();
+            expect(BottomSheetStore.getSnapPoints()).toBeUndefined();
+        });
+
+        it('should return early if bottom sheet is not in stack', async () => {
+            const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(false);
+
+            await dismissBottomSheet();
+
+            expect(NavigationStore.isScreenInStack).toHaveBeenCalledWith(Screens.BOTTOM_SHEET);
+            expect(emitSpy).not.toHaveBeenCalled();
+        });
+
+        it('should fall back to GENERIC_BOTTOM_SHEET when only the generic variant is in stack', async () => {
+            const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
+            const waitSpy = jest.spyOn(NavigationStore, 'waitUntilScreensIsRemoved').mockResolvedValue();
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockImplementation((screen) => screen === Screens.GENERIC_BOTTOM_SHEET);
+
+            await dismissBottomSheet();
+
+            expect(emitSpy).toHaveBeenCalledWith(Events.CLOSE_BOTTOM_SHEET);
+            expect(waitSpy).toHaveBeenCalledWith(Screens.GENERIC_BOTTOM_SHEET);
+        });
+    });
+
+    describe('navigateToRoot', () => {
+        it('should call dismissTo with the channel_list path', async () => {
+            await navigateToRoot();
+
+            expect(router.dismissTo).toHaveBeenCalledWith('/(authenticated)/(home)/channel_list');
+        });
+    });
+
+    describe('dismissAllRoutesAndPopToScreen', () => {
+        it('should navigate to screen when it is in stack', async () => {
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(true);
+
+            await dismissAllRoutesAndPopToScreen(Screens.CHANNEL, {channelId: 'abc'});
+
+            expect(router.dismissTo).toHaveBeenCalledWith('/(authenticated)/channel');
+            expect(router.setParams).toHaveBeenCalledWith({channelId: '"abc"'});
+        });
+
+        it('should reset to root and push when screen is not in stack', async () => {
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(false);
+
+            await dismissAllRoutesAndPopToScreen(Screens.CHANNEL, {channelId: 'abc'});
+
+            expect(router.dismissTo).toHaveBeenCalledWith('/(authenticated)/(home)/channel_list');
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(authenticated)/channel',
+                params: {channelId: '"abc"'},
+            });
+        });
+
+        it('should navigate when router is available but screen not in stack', async () => {
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(false);
+
+            await dismissAllRoutesAndPopToScreen(Screens.MENTIONS);
+
+            expect(router.dismissTo).toHaveBeenCalledWith('/(authenticated)/(home)/channel_list');
+            expect(router.push).toHaveBeenCalled();
+        });
+
+        it('should log error if navigation fails', async () => {
+            jest.spyOn(NavigationStore, 'isScreenInStack').mockReturnValue(true);
+            jest.mocked(router.dismissTo).mockImplementationOnce(() => {
+                throw new Error('Navigation failed');
+            });
+
+            await dismissAllRoutesAndPopToScreen(Screens.CHANNEL);
+
+            expect(logError).toHaveBeenCalledWith(
+                'dismissAllRoutesAndPopToScreen: Expo Router navigation failed',
+                expect.any(Error),
+            );
+        });
+    });
+
+    describe('navigateToSettingsScreen', () => {
+        it('should navigate to settings screen with base route', () => {
+            navigateToSettingsScreen(Screens.SETTINGS_DISPLAY, {theme: 'dark'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(settings)/settings_display',
+                params: {theme: '"dark"'},
+            });
+        });
+
+        it('should navigate without props', () => {
+            navigateToSettingsScreen(Screens.SETTINGS_DISPLAY);
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(settings)/settings_display',
+                params: {},
+            });
+        });
+    });
+
+    describe('navigateToChannelInfoScreen', () => {
+        it('should navigate to channel info screen with base route', () => {
+            navigateToChannelInfoScreen(Screens.CHANNEL_NOTIFICATION_PREFERENCES, {channelId: 'ch123'});
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(channel_info)/channel_notification_preferences',
+                params: {channelId: '"ch123"'},
+            });
+        });
+
+        it('should navigate without props', () => {
+            navigateToChannelInfoScreen(Screens.CHANNEL_NOTIFICATION_PREFERENCES);
+
+            expect(router.push).toHaveBeenCalledWith({
+                pathname: '/(modals)/(channel_info)/channel_notification_preferences',
+                params: {},
+            });
+        });
+    });
+});

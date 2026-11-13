@@ -2,13 +2,13 @@
 // See LICENSE.txt for license information.
 
 import {NotificationSettingsScreen} from '@support/ui/screen';
-import {timeouts} from '@support/utils';
+import {isIos, tapNativeBackButton, timeouts} from '@support/utils';
 import {expect} from 'detox';
 
 class EmailNotificationSettingsScreen {
     testID = {
         emailNotificationSettingsScreen: 'email_notification_settings.screen',
-        backButton: 'screen.back.button',
+        backButton: 'navigation.header.back',
         scrollView: 'email_notification_settings.scroll_view',
         immediatelyOption: 'email_notification_settings.immediately.option',
         immediatelyOptionSelected: 'email_notification_settings.immediately.option.selected',
@@ -18,12 +18,19 @@ class EmailNotificationSettingsScreen {
         everyHourOptionSelected: 'email_notification_settings.every_hour.option.selected',
         neverOption: 'email_notification_settings.never.option',
         neverOptionSelected: 'email_notification_settings.never.option.selected',
-        emailThreadsOptionToggledOff: 'email_notification_settings.email_threads.option.toggled.false',
-        emailThreadsOptionToggledOn: 'email_notification_settings.email_threads.option.toggled.true',
+        emailThreadsOptionToggledOff: 'email_notification_settings.email_threads.option.toggled.false.button',
+        emailThreadsOptionToggledOn: 'email_notification_settings.email_threads.option.toggled.true.button',
     };
 
     emailNotificationSettingsScreen = element(by.id(this.testID.emailNotificationSettingsScreen));
-    backButton = element(by.id(this.testID.backButton));
+
+    // Native-stack back chevron via accessibility label.
+    get backButton(): Detox.NativeElement {
+        return isIos()
+            ? element(by.label('Back')).atIndex(0)
+            : element(by.label('Navigate up')).atIndex(0);
+    }
+
     scrollView = element(by.id(this.testID.scrollView));
     immediatelyOption = element(by.id(this.testID.immediatelyOption));
     immediatelyOptionSelected = element(by.id(this.testID.immediatelyOptionSelected));
@@ -50,8 +57,9 @@ class EmailNotificationSettingsScreen {
     };
 
     back = async () => {
-        await this.backButton.tap();
-        await expect(this.emailNotificationSettingsScreen).not.toBeVisible();
+        // Native-stack back chevron.
+        await tapNativeBackButton();
+        await waitFor(this.emailNotificationSettingsScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
     toggleEmailThreadsOptionOn = async () => {

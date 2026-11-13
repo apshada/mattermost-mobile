@@ -7,27 +7,21 @@ import {Keyboard} from 'react-native';
 
 import {doAppFetchForm, doAppLookup, doAppSubmit, postEphemeralCallResponseForContext} from '@actions/remote/apps';
 import {handleGotoLocation} from '@actions/remote/command';
+import {Screens} from '@constants';
 import {AppCallResponseTypes} from '@constants/apps';
 import {useServerUrl} from '@context/server';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {dismissModal} from '@screens/navigation';
+import {navigateBack} from '@screens/navigation';
 import {createCallRequest, makeCallErrorResponse} from '@utils/apps';
 
 import AppsFormComponent from './apps_form_component';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
-export type Props = {
+export type AppFormScreenProps = {
     form?: AppForm;
     context?: AppContext;
-    componentId: AvailableScreens;
 };
 
-function AppsFormContainer({
-    form,
-    context,
-    componentId,
-}: Props) {
+function AppsFormScreen({form, context}: AppFormScreenProps) {
     const intl = useIntl();
     const [currentForm, setCurrentForm] = useState(form);
     const serverUrl = useServerUrl();
@@ -151,7 +145,7 @@ function AppsFormContainer({
             case AppCallResponseTypes.NAVIGATE:
                 return {error: makeCallErrorResponse(makeErrorMsg(intl.formatMessage({
                     id: 'apps.error.responses.unexpected_type',
-                    defaultMessage: 'App response type was not expected. Response type: {type}.',
+                    defaultMessage: 'App response type was not expected. Response type: {type}',
                 }, {
                     type: callResp.type,
                 },
@@ -196,10 +190,10 @@ function AppsFormContainer({
 
     const close = useCallback(() => {
         Keyboard.dismiss();
-        dismissModal({componentId});
-    }, [componentId]);
+        navigateBack();
+    }, []);
 
-    useAndroidHardwareBackHandler(componentId, close);
+    useAndroidHardwareBackHandler(Screens.APPS_FORM, close);
 
     if (!currentForm?.submit || !context) {
         return null;
@@ -208,12 +202,12 @@ function AppsFormContainer({
     return (
         <AppsFormComponent
             form={currentForm}
-            componentId={componentId}
             performLookupCall={performLookupCall}
             refreshOnSelect={refreshOnSelect}
             submit={submit}
+            channelId={context?.channel_id}
         />
     );
 }
 
-export default AppsFormContainer;
+export default AppsFormScreen;

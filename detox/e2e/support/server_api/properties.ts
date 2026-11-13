@@ -1,0 +1,681 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {timeouts, wait} from '@support/utils';
+
+import client from './client';
+import {getResponseFromError} from './common';
+import User from './user';
+
+const GROUP_NAME = 'access_control';
+const OBJECT_TYPE = 'template';
+const TARGET_TYPE = 'system';
+const FIELD_NAME = 'classification';
+const LINKED_FIELD_NAME = 'classification';
+const LINKED_OBJECT_TYPE = 'system';
+const DISPLAY_BANNER_TOP = 'display_banner_top';
+
+// Match Playwright classification_markings helpers: permission "admin" (not "sysadmin").
+const ADMIN_PERMISSION = 'admin';
+
+// Server model.IsValidId requires exactly 26 alphanumeric characters.
+// Playwright uses padded IDs like lvlsecret00000000000000000 — same constraint.
+export const CLASSIFICATION_LEVEL_IDS = {
+    topSecret: 'lvltopsecret00000000000000',
+    secret: 'lvlsecret00000000000000000',
+    unclassified: 'lvlunclassified00000000000',
+} as const;
+
+type PropertyFieldOption = {
+    id: string;
+    name: string;
+    color: string;
+    rank?: number;
+};
+
+const DEFAULT_CLASSIFICATION_LEVELS: PropertyFieldOption[] = [
+    {id: CLASSIFICATION_LEVEL_IDS.topSecret, name: 'TOP SECRET', color: '#FCE83A', rank: 1},
+    {id: CLASSIFICATION_LEVEL_IDS.secret, name: 'SECRET', color: '#FF0000', rank: 2},
+    {id: CLASSIFICATION_LEVEL_IDS.unclassified, name: 'UNCLASSIFIED', color: '#00FF00', rank: 3},
+];
+
+/**
+ * Get all property fields for a group/objectType.
+ */
+export const apiGetPropertyFields = async (baseUrl: string, groupName: string, objectType: string, targetType: string, targetId?: string) => {
+    try {
+        let url = `${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/fields?target_type=${targetType}`;
+        if (targetId !== undefined) {
+            url += `&target_id=${encodeURIComponent(targetId)}`;
+        }
+        const response = await client.get(url);
+        return {fields: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Create a property field.
+ */
+export const apiCreatePropertyField = async (baseUrl: string, groupName: string, objectType: string, field: Record<string, unknown>) => {
+    try {
+        const response = await client.post(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/fields`,
+            field,
+        );
+        return {field: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Patch a property field. `attrs` is merged into the field's existing attrs
+ * rather than replacing them (server-side PropertyField.Patch with
+ * mergeAttrs=true), so only the given keys change.
+ */
+export const apiPatchPropertyField = async (baseUrl: string, groupName: string, objectType: string, fieldId: string, patch: {attrs?: Record<string, unknown>}) => {
+    try {
+        const response = await client.patch(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/fields/${fieldId}`,
+            patch,
+        );
+        return {field: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Delete a property field.
+ */
+export const apiDeletePropertyField = async (baseUrl: string, groupName: string, objectType: string, fieldId: string) => {
+    try {
+        await client.delete(`${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/fields/${fieldId}`);
+        return {};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Get property values for a target.
+ */
+export const apiGetPropertyValues = async (baseUrl: string, groupName: string, objectType: string, targetId: string) => {
+    try {
+        const response = await client.get(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/values/${targetId}`,
+        );
+        return {values: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Upsert property values for a target.
+ */
+export const apiPatchPropertyValues = async (baseUrl: string, groupName: string, objectType: string, targetId: string, values: Array<{field_id: string; value: unknown}>) => {
+    try {
+        const response = await client.patch(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/${objectType}/values/${targetId}`,
+            values,
+        );
+        return {values: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Get system-scoped property values.
+ */
+export const apiGetSystemPropertyValues = async (baseUrl: string, groupName: string) => {
+    try {
+        const response = await client.get(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/system/values`,
+        );
+        return {values: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Upsert system-scoped property values.
+ */
+export const apiPatchSystemPropertyValues = async (baseUrl: string, groupName: string, values: Array<{field_id: string; value: string}>) => {
+    try {
+        const response = await client.patch(
+            `${baseUrl}/api/v4/properties/groups/${groupName}/system/values`,
+            values,
+        );
+        return {values: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Setup a complete classification system for E2E testing:
+ * 1. Create a template property field with classification levels
+ * 2. Create a linked system classification field with banner actions
+ * 3. Set a system property value for the classification level
+ *
+ * Levels are identified by their `id` field. The `levelId` option selects which
+ * level the global banner should display, matching Playwright webapp E2E
+ * (keyed by option ID, not name). Option IDs must be valid Mattermost IDs
+ * (exactly 26 alphanumeric characters).
+ *
+ * @returns Object containing the created field IDs and option IDs keyed by name
+ */
+export const apiSetupClassificationWithBanner = async (
+    baseUrl: string,
+    options?: {
+        levels?: PropertyFieldOption[];
+        levelId?: string;
+        user?: {
+            newUser: {
+                username: string;
+                password: string;
+            };
+        };
+    },
+) => {
+    const levels = options?.levels ?? DEFAULT_CLASSIFICATION_LEVELS;
+    const levelId = options?.levelId ?? CLASSIFICATION_LEVEL_IDS.topSecret;
+
+    await apiCleanupClassification(baseUrl);
+
+    // Match Playwright: type rank, no CPA "managed" attr, permission "admin".
+    const templateResult = await apiCreatePropertyField(baseUrl, GROUP_NAME, OBJECT_TYPE, {
+        name: FIELD_NAME,
+        type: 'rank',
+        target_type: TARGET_TYPE,
+        target_id: '',
+        attrs: {
+            options: levels.map((l) => ({id: l.id, name: l.name, color: l.color, rank: l.rank})),
+        },
+        permission_field: ADMIN_PERMISSION,
+        permission_values: ADMIN_PERMISSION,
+        permission_options: ADMIN_PERMISSION,
+    });
+
+    const templateResult_ = templateResult as {field?: any; error?: unknown};
+    if (!templateResult_.field) {
+        throw new Error(`Failed to create template classification field: ${JSON.stringify(templateResult_.error ?? templateResult)}`);
+    }
+
+    const templateField = templateResult_.field;
+    const templateOptions: PropertyFieldOption[] = templateField.attrs?.options ?? [];
+    const selectedOption = templateOptions.find((o) => o.id === levelId);
+    if (!selectedOption) {
+        const available = templateOptions.map((o) => `${o.name} (${o.id})`).join(', ');
+        throw new Error(`Classification level ID "${levelId}" not found in created options. Available: [${available}]`);
+    }
+
+    const optionIdsByName = Object.fromEntries(templateOptions.map((o) => [o.name, o.id]));
+
+    // type/options/permissions are inherited from the template by the server.
+    const linkedResult = await apiCreatePropertyField(baseUrl, GROUP_NAME, LINKED_OBJECT_TYPE, {
+        name: LINKED_FIELD_NAME,
+        type: 'rank',
+        target_type: TARGET_TYPE,
+        target_id: '',
+        linked_field_id: templateField.id,
+        attrs: {
+            actions: [DISPLAY_BANNER_TOP],
+        },
+    });
+
+    const linkedResult_ = linkedResult as {field?: any; error?: unknown};
+    if (!linkedResult_.field) {
+        throw new Error(`Failed to create linked system classification field: ${JSON.stringify(linkedResult_.error ?? linkedResult)}`);
+    }
+
+    const linkedField = linkedResult_.field;
+
+    const patchResult = await apiPatchSystemPropertyValues(baseUrl, GROUP_NAME, [
+        {field_id: linkedField.id, value: selectedOption.id},
+    ]);
+    if ('error' in patchResult) {
+        throw new Error(`Failed to set system property value for field_id=${linkedField.id}, value=${selectedOption.id}: ${JSON.stringify(patchResult.error)}`);
+    }
+
+    const checkLinkedVisible = async (): Promise<string | undefined> => {
+        const verify = await apiGetPropertyFields(baseUrl, GROUP_NAME, LINKED_OBJECT_TYPE, TARGET_TYPE, '') as {fields?: any[]; error?: unknown};
+        const visibleLinked = (verify.fields ?? []).filter(
+            (f) => f.name === LINKED_FIELD_NAME && f.delete_at === 0 && f.linked_field_id && f.id === linkedField.id,
+        );
+        if (visibleLinked.length === 0) {
+            return `linked system field ${linkedField.id} not returned by GET ` +
+                `/properties/groups/${GROUP_NAME}/${LINKED_OBJECT_TYPE}/fields?target_type=${TARGET_TYPE}&target_id=. ` +
+                `Response: ${JSON.stringify(verify)}`;
+        }
+        const linkedOptions = (visibleLinked[0].attrs?.options as PropertyFieldOption[] | undefined) ?? [];
+        if (!linkedOptions.some((o) => o.id === selectedOption.id)) {
+            return `linked field missing selected option ${selectedOption.id}. options=${JSON.stringify(linkedOptions)}`;
+        }
+
+        const verifyValues = await apiGetSystemPropertyValues(baseUrl, GROUP_NAME) as {values?: any[]; error?: unknown};
+        const linkedValue = (verifyValues.values ?? []).find((v) => v.field_id === linkedField.id);
+        if (!linkedValue) {
+            return `no system property value for linked field ${linkedField.id} from GET ` +
+                `/properties/groups/${GROUP_NAME}/system/values ` +
+                `(values returned: ${verifyValues.values?.length ?? 'none'}, ` +
+                `request errored: ${verifyValues.error ? 'yes' : 'no'})`;
+        }
+        if (linkedValue.value !== selectedOption.id) {
+            return `system property value for linked field ${linkedField.id} is ` +
+                `${JSON.stringify(linkedValue.value)}, expected ${selectedOption.id}`;
+        }
+        return undefined;
+    };
+
+    const pollLinkedVisible = async (sessionLabel: string, maxAttempts = 20) => {
+        let lastError: string | undefined;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            // eslint-disable-next-line no-await-in-loop -- sequential poll until propagated
+            lastError = await checkLinkedVisible();
+            if (!lastError) {
+                return;
+            }
+            if (attempt < maxAttempts - 1) {
+                // eslint-disable-next-line no-await-in-loop
+                await wait(timeouts.TWO_SEC);
+            }
+        }
+        throw new Error(`apiSetupClassificationWithBanner (${sessionLabel}): ${lastError}`);
+    };
+
+    await pollLinkedVisible('admin');
+
+    if (options?.user) {
+        const loginResult = await User.apiLogin(baseUrl, options.user.newUser) as {error?: unknown};
+        if (loginResult.error) {
+            throw new Error(`apiSetupClassificationWithBanner: test user login failed: ${JSON.stringify(loginResult.error)}`);
+        }
+
+        // Always restore the admin session, but never let a restore failure mask the
+        // polling error that caused it.
+        let pollError: unknown;
+        try {
+            await pollLinkedVisible('test user');
+        } catch (error) {
+            pollError = error;
+        }
+
+        const adminLoginResult = await User.apiAdminLogin(baseUrl) as {error?: unknown};
+        if (pollError) {
+            throw pollError;
+        }
+        if (adminLoginResult.error) {
+            throw new Error(`apiSetupClassificationWithBanner: failed to restore admin session: ${JSON.stringify(adminLoginResult.error)}`);
+        }
+    }
+
+    return {
+        templateFieldId: templateField.id,
+        linkedFieldId: linkedField.id,
+        selectedOptionId: selectedOption.id,
+        optionIdsByName,
+    };
+};
+
+/**
+ * Clean up classification property fields and values.
+ */
+export const apiCleanupClassification = async (baseUrl: string) => {
+    const {error: adminLoginError} = await User.apiAdminLogin(baseUrl);
+    if (adminLoginError) {
+        throw new Error(`apiCleanupClassification: admin login failed: ${JSON.stringify(adminLoginError)}`);
+    }
+
+    // Channel linked fields first (channel classification tests), then system, then template.
+    // Sequential: dependents must be deleted before the template (enforced below).
+    for (const objectType of ['channel', LINKED_OBJECT_TYPE, 'user'] as const) {
+        // eslint-disable-next-line no-await-in-loop -- order matters across object types
+        const fieldsResult = await apiGetPropertyFields(baseUrl, GROUP_NAME, objectType, TARGET_TYPE) as {fields?: any[]};
+        if (!fieldsResult.fields) {
+            continue;
+        }
+        for (const field of fieldsResult.fields) {
+            if (field.name === LINKED_FIELD_NAME && field.delete_at === 0) {
+                // eslint-disable-next-line no-await-in-loop
+                await apiDeletePropertyField(baseUrl, GROUP_NAME, objectType, field.id);
+            }
+        }
+    }
+
+    const templateFieldsResult = await apiGetPropertyFields(baseUrl, GROUP_NAME, OBJECT_TYPE, TARGET_TYPE) as {fields?: any[]};
+    if (templateFieldsResult.fields) {
+        for (const field of templateFieldsResult.fields) {
+            if (field.name === FIELD_NAME && field.delete_at === 0) {
+                // eslint-disable-next-line no-await-in-loop
+                await apiDeletePropertyField(baseUrl, GROUP_NAME, OBJECT_TYPE, field.id);
+            }
+        }
+    }
+};
+
+const CHANNEL_OBJECT_TYPE = 'channel';
+const CHANNEL_TARGET_TYPE = 'system';
+
+type ChannelAttributeFieldOptions = {
+    fieldName: string;
+    displayName?: string;
+    fieldType?: 'text' | 'select' | 'multiselect' | 'rank';
+    options?: PropertyFieldOption[];
+    actions?: string[];
+    required?: boolean;
+
+    // Governs which value moves the server will accept once a value is set. Omitted
+    // means 'any'; a directional policy also refuses a clear.
+    changePolicy?: 'any' | 'raise_only' | 'lower_only' | 'never';
+
+    // The channel field's permission tier. Defaults to 'admin', which is what the
+    // System Console writes; 'sysadmin' is how a tier the caller cannot satisfy is
+    // set up, and 'none' makes the field permanently read-only.
+    permissionValues?: 'none' | 'sysadmin' | 'admin' | 'member';
+};
+
+/**
+ * Create a template field and a linked channel-scoped field for channel attributes E2E testing.
+ *
+ * Mirrors apiSetupClassificationWithBanner for channel-object fields. Polls until the channel
+ * field and its propagated options are visible on the GET endpoint before returning, so that an
+ * immediately-following apiSetChannelAttributeValue call does not race the write on CI.
+ *
+ * @param {string} baseUrl - the base server URL
+ * @param {ChannelAttributeFieldOptions} opts - field name, options, actions, display metadata
+ * @returns Object with templateFieldId, channelFieldId, and optionIdsByName (name to id map)
+ */
+export const apiSetupChannelAttributeField = async (
+    baseUrl: string,
+    opts: ChannelAttributeFieldOptions,
+) => {
+    const {
+        fieldName,
+        displayName,
+        fieldType = 'rank',
+        options = [],
+        actions = [],
+        required = false,
+        changePolicy,
+        permissionValues = ADMIN_PERMISSION,
+    } = opts;
+
+    const templateResult = await apiCreatePropertyField(baseUrl, GROUP_NAME, OBJECT_TYPE, {
+        name: fieldName,
+        type: fieldType,
+        target_type: TARGET_TYPE,
+        target_id: '',
+        attrs: options.length > 0 ? {
+            options: options.map((o) => ({id: o.id, name: o.name, color: o.color, rank: o.rank})),
+        } : {},
+        permission_field: ADMIN_PERMISSION,
+        permission_values: ADMIN_PERMISSION,
+        permission_options: ADMIN_PERMISSION,
+    });
+
+    const templateResult_ = templateResult as {field?: any; error?: unknown};
+    if (!templateResult_.field) {
+        throw new Error(`apiSetupChannelAttributeField: failed to create template: ${JSON.stringify(templateResult_.error ?? templateResult)}`);
+    }
+    const templateField = templateResult_.field;
+
+    const channelFieldAttrs: Record<string, unknown> = {
+        actions,
+        required,
+    };
+    if (displayName) {
+        channelFieldAttrs.display_name = displayName;
+    }
+    if (changePolicy) {
+        channelFieldAttrs.change_policy = changePolicy;
+
+        // The System Console writes editable alongside a never policy; without it a
+        // field created before change_policy existed would read as editable.
+        if (changePolicy === 'never') {
+            channelFieldAttrs.editable = false;
+        }
+    }
+
+    const channelResult = await apiCreatePropertyField(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, {
+        name: fieldName,
+        type: fieldType,
+        target_type: CHANNEL_TARGET_TYPE,
+        target_id: '',
+        linked_field_id: templateField.id,
+        permission_values: permissionValues,
+        attrs: channelFieldAttrs,
+    });
+
+    const channelResult_ = channelResult as {field?: any; error?: unknown};
+    if (!channelResult_.field) {
+        throw new Error(`apiSetupChannelAttributeField: failed to create channel field: ${JSON.stringify(channelResult_.error ?? channelResult)}`);
+    }
+    const channelField = channelResult_.field;
+
+    const templateOptions: PropertyFieldOption[] = templateField.attrs?.options ?? [];
+    const optionIdsByName = Object.fromEntries(templateOptions.map((o) => [o.name, o.id]));
+
+    // Poll until the channel field is visible and has options propagated from the template
+    // (mirrors pollLinkedVisible in apiSetupClassificationWithBanner). Without this guard an
+    // immediately-following apiSetChannelAttributeValue races the write on a loaded CI server.
+    const pollChannelFieldVisible = async (maxAttempts = 20) => {
+        let lastError = '';
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            // eslint-disable-next-line no-await-in-loop
+            const verify = await apiGetPropertyFields(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, CHANNEL_TARGET_TYPE) as {fields?: any[]; error?: unknown};
+            const found = (verify.fields ?? []).find(
+                (f: any) => f.id === channelField.id && f.delete_at === 0,
+            );
+            if (found && (options.length === 0 || (found.attrs?.options as any[] | undefined)?.length)) {
+                return;
+            }
+            lastError = `channel field ${channelField.id} not visible or missing options after create. Response: ${JSON.stringify(verify)}`;
+            if (attempt < maxAttempts - 1) {
+                // eslint-disable-next-line no-await-in-loop
+                await wait(timeouts.TWO_SEC);
+            }
+        }
+        throw new Error(`apiSetupChannelAttributeField: ${lastError}`);
+    };
+
+    await pollChannelFieldVisible();
+
+    return {templateFieldId: templateField.id, channelFieldId: channelField.id, optionIdsByName};
+};
+
+/**
+ * Marks an existing channel attribute field required (or not) after the fact.
+ *
+ * The server enforces required attributes at channel-creation time for whoever
+ * can set them, so a test that wants both "required" and "channel already
+ * exists with no value" has to create the channel first, while the field is
+ * still optional, and only then flip it required — exactly the real-world
+ * sequence an admin making an existing field mandatory would produce.
+ */
+export const apiSetChannelAttributeFieldRequired = async (baseUrl: string, fieldId: string, required: boolean) => {
+    const result = await apiPatchPropertyField(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, fieldId, {attrs: {required}});
+    if ('error' in result) {
+        throw new Error(`apiSetChannelAttributeFieldRequired: ${JSON.stringify(result.error)}`);
+    }
+    return result;
+};
+
+/**
+ * Set (or replace) a channel attribute value for a specific channel.
+ */
+export const apiSetChannelAttributeValue = async (
+    baseUrl: string,
+    channelId: string,
+    fieldId: string,
+    value: unknown,
+) => {
+    const result = await apiPatchPropertyValues(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, channelId, [
+        {field_id: fieldId, value},
+    ]);
+    if ('error' in result) {
+        throw new Error(`apiSetChannelAttributeValue: ${JSON.stringify((result as any).error)}`);
+    }
+    return result;
+};
+
+/**
+ * The value the server holds for one channel attribute, or undefined when unset.
+ *
+ * This is what proves an edit made in the app actually reached the server, rather
+ * than only having repainted the row.
+ */
+export const apiGetChannelAttributeValue = async (
+    baseUrl: string,
+    channelId: string,
+    fieldId: string,
+): Promise<unknown> => {
+    const result = await apiGetPropertyValues(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, channelId) as {
+        values?: Array<{field_id: string; value: unknown}> | null;
+        error?: unknown;
+    };
+    if (result.error || result.values === undefined) {
+        throw new Error(`apiGetChannelAttributeValue: ${JSON.stringify(result.error ?? result)}`);
+    }
+    return result.values?.find((value) => value.field_id === fieldId)?.value;
+};
+
+/**
+ * Wait until the given channel attribute fields all have a value on a channel.
+ *
+ * Values supplied at channel-creation time are not always readable back immediately, and a
+ * test that goes straight to the UI cannot tell "the server never stored this" from "the app
+ * has not rendered it yet" — both look like a missing element. Read them back first so the
+ * two are distinguishable.
+ *
+ * @param {string} baseUrl - the base server URL
+ * @param {string} channelId - the channel to read values from
+ * @param {string[]} fieldIds - field ids that must each have a non-empty value
+ * @return {boolean} true once every field has a value, false if the budget runs out
+ */
+export const waitForChannelAttributeValues = async (
+    baseUrl: string,
+    channelId: string,
+    fieldIds: string[],
+    {maxAttempts = 10, pollMs = 1000}: {maxAttempts?: number; pollMs?: number} = {},
+): Promise<boolean> => {
+    const hasValue = (value: unknown) => {
+        if (Array.isArray(value)) {
+            return value.length > 0;
+        }
+        return value !== undefined && value !== null && value !== '';
+    };
+
+    /* eslint-disable no-await-in-loop -- polling is sequential by definition */
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const result = await apiGetPropertyValues(baseUrl, GROUP_NAME, CHANNEL_OBJECT_TYPE, channelId);
+        const values: Array<{field_id: string; value: unknown}> = 'values' in result ? result.values ?? [] : [];
+        const present = new Set(values.filter((v) => hasValue(v.value)).map((v) => v.field_id));
+        if (fieldIds.every((id) => present.has(id))) {
+            return true;
+        }
+        if (attempt < maxAttempts) {
+            await wait(pollMs);
+        }
+    }
+    /* eslint-enable no-await-in-loop */
+
+    return false;
+};
+
+/**
+ * Delete all non-deleted channel attribute fields with the given names, plus their templates.
+ *
+ * Channel-linked fields are deleted first (server enforces dependency ordering: linked before
+ * template). Both the channel object type and the system-linked object type are queried with
+ * target_type=system (CHANNEL_TARGET_TYPE and TARGET_TYPE are both 'system'); the two entries
+ * in objectTypePairs differ only by object_type ('channel' vs 'system').
+ *
+ * @param {string} baseUrl - the base server URL
+ * @param {string[]} fieldNames - field names to delete from all object types
+ */
+export const apiCleanupChannelAttributeFields = async (baseUrl: string, fieldNames: string[]) => {
+    const {error: loginError} = await User.apiAdminLogin(baseUrl);
+    if (loginError) {
+        throw new Error(`apiCleanupChannelAttributeFields: admin login failed: ${JSON.stringify(loginError)}`);
+    }
+    const nameSet = new Set(fieldNames);
+
+    // Both pairs use target_type=system (CHANNEL_TARGET_TYPE === TARGET_TYPE === 'system');
+    // they differ only by object_type. Delete channel-scoped fields first (server enforces dependency order).
+    const objectTypePairs: Array<[string, string]> = [
+        [CHANNEL_OBJECT_TYPE, CHANNEL_TARGET_TYPE],
+        [LINKED_OBJECT_TYPE, TARGET_TYPE],
+    ];
+    let firstError: Error | undefined;
+
+    for (const [objectType, targetType] of objectTypePairs) {
+        // eslint-disable-next-line no-await-in-loop
+        const fieldsResult = await apiGetPropertyFields(baseUrl, GROUP_NAME, objectType, targetType) as {
+            fields?: Array<{id: string; name: string; delete_at: number}>;
+            error?: unknown;
+        };
+        if (!fieldsResult.fields) {
+            firstError ??= new Error(`apiCleanupChannelAttributeFields: list ${objectType} fields failed: ${JSON.stringify(fieldsResult.error ?? fieldsResult)}`);
+            continue;
+        }
+        for (const field of fieldsResult.fields) {
+            if (nameSet.has(field.name) && field.delete_at === 0) {
+                // eslint-disable-next-line no-await-in-loop
+                const deleteResult = await apiDeletePropertyField(baseUrl, GROUP_NAME, objectType, field.id) as {error?: unknown};
+                if (deleteResult.error) {
+                    firstError ??= new Error(`apiCleanupChannelAttributeFields: delete ${objectType} field failed: ${JSON.stringify(deleteResult.error)}`);
+                }
+            }
+        }
+    }
+
+    const templateResult = await apiGetPropertyFields(baseUrl, GROUP_NAME, OBJECT_TYPE, TARGET_TYPE) as {
+        fields?: Array<{id: string; name: string; delete_at: number}>;
+        error?: unknown;
+    };
+    if (templateResult.fields) {
+        for (const field of templateResult.fields) {
+            if (nameSet.has(field.name) && field.delete_at === 0) {
+                // eslint-disable-next-line no-await-in-loop
+                const deleteResult = await apiDeletePropertyField(baseUrl, GROUP_NAME, OBJECT_TYPE, field.id) as {error?: unknown};
+                if (deleteResult.error) {
+                    firstError ??= new Error(`apiCleanupChannelAttributeFields: delete template field failed: ${JSON.stringify(deleteResult.error)}`);
+                }
+            }
+        }
+    } else {
+        firstError ??= new Error(`apiCleanupChannelAttributeFields: list template fields failed: ${JSON.stringify(templateResult.error ?? templateResult)}`);
+    }
+
+    if (firstError) {
+        throw firstError;
+    }
+};
+
+export const Properties = {
+    CLASSIFICATION_LEVEL_IDS,
+    apiGetPropertyFields,
+    apiCreatePropertyField,
+    apiPatchPropertyField,
+    apiDeletePropertyField,
+    apiGetPropertyValues,
+    apiPatchPropertyValues,
+    apiGetSystemPropertyValues,
+    apiPatchSystemPropertyValues,
+    apiSetupClassificationWithBanner,
+    apiCleanupClassification,
+    apiSetupChannelAttributeField,
+    apiSetChannelAttributeFieldRequired,
+    apiSetChannelAttributeValue,
+    apiGetChannelAttributeValue,
+    apiCleanupChannelAttributeFields,
+    waitForChannelAttributeValues,
+};
+
+export default Properties;

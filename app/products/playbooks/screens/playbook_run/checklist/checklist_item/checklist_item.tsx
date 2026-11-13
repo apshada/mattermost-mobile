@@ -1,0 +1,386 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React, {useCallback, useMemo, useState} from 'react';
+import {useIntl} from 'react-intl';
+import {View, Text, ActivityIndicator} from 'react-native';
+
+import {handleCallsSlashCommand} from '@calls/actions';
+import BaseChip from '@components/chips/base_chip';
+import UserChip from '@components/chips/user_chip';
+import CompassIcon from '@components/compass_icon';
+import {getFriendlyDate} from '@components/friendly_date';
+import PressableOpacity from '@components/pressable_opacity';
+import {Screens} from '@constants';
+import {useServerUrl} from '@context/server';
+import {useTheme} from '@context/theme';
+import {useIsTablet} from '@hooks/device';
+import {restoreChecklistItem, runChecklistItem, skipChecklistItem, updateChecklistItem} from '@playbooks/actions/remote/checklist';
+import {goToFillRequirements} from '@playbooks/screens/navigation';
+import {isDueSoon, isOverdue} from '@playbooks/utils/run';
+import {bottomSheet, dismissAllRoutesAndPopToScreen} from '@screens/navigation';
+import {getFullErrorMessage} from '@utils/errors';
+import {logDebug} from '@utils/log';
+import {openUserProfile} from '@utils/navigation';
+import {showPlaybookErrorSnackbar} from '@utils/snack_bar';
+import {makeStyleSheetFromTheme, changeOpacity} from '@utils/theme';
+import {typography} from '@utils/typography';
+
+import Checkbox from './checkbox';
+import ChecklistItemBottomSheet, {BOTTOM_SHEET_HEIGHT} from './checklist_item_bottom_sheet';
+import RequirementsAccordion from './requirements_accordion';
+
+import type PlaybookChecklistItemModel from '@playbooks/types/database/models/playbook_checklist_item';
+import type UserModel from '@typings/database/models/servers/user';
+
+const getStyleSheet = makeStyleSheetFromTheme((theme) => ({
+    checklistItem: {
+        flexDirection: 'row',
+        gap: 6,
+    },
+    itemDetails: {
+        gap: 8,
+        flex: 1,
+    },
+    itemTitle: {
+        ...typography('Body', 200, 'Regular'),
+        color: theme.centerChannelColor,
+    },
+    itemDescription: {
+        ...typography('Body', 100, 'Regular'),
+        color: changeOpacity(theme.centerChannelColor, 0.72),
+    },
+    chipsRow: {
+        flexDirection: 'row',
+        gap: 4,
+        flexWrap: 'wrap',
+    },
+    chipIcon: {
+        color: changeOpacity(theme.centerChannelColor, 0.48),
+        marginLeft: 8,
+    },
+    overdueChipIcon: {
+        fontWeight: 600,
+    },
+    dueSoonChipIcon: {
+        color: theme.dndIndicator,
+    },
+    itemDetailsTexts: {
+        gap: 4,
+    },
+    checkboxContainer: {
+        marginVertical: 2,
+    },
+    skippedText: {
+        textDecorationLine: 'line-through',
+    },
+    conditionIcon: {
+        marginHorizontal: 2,
+        alignSelf: 'flex-start',
+        marginTop: 4,
+        transform: [{rotate: '90deg'}],
+    },
+    titleRow: {
+        flexDirection: 'row',
+        alignItems: 'flex-start',
+        marginLeft: 2,
+    },
+}));
+
+type Props = {
+    item: PlaybookChecklistItemModel | PlaybookChecklistItem;
+    assignee?: UserModel;
+    teammateNameDisplay: string;
+    channelId: string;
+    checklistNumber: number;
+    itemNumber: number;
+    playbookRunId: string;
+    isDisabled: boolean;
+    currentUserId: string;
+    channelType: ChannelType;
+    taskRequirementsEnabled: boolean;
+}
+
+const ChecklistItem = ({
+    item,
+    assignee,
+    teammateNameDisplay,
+    channelId,
+    checklistNumber,
+    itemNumber,
+    playbookRunId,
+    isDisabled,
+    currentUserId,
+    channelType,
+    taskRequirementsEnabled,
+}: Props) => {
+    const dueDate = 'dueDate' in item ? item.dueDate : item.due_date;
+    const isTable = useIsTablet();
+    const theme = useTheme();
+    const styles = getStyleSheet(theme);
+    const intl = useIntl();
+    const serverUrl = useServerUrl();
+
+    const [isChecking, setIsChecking] = useState(false);
+    const [isExecuting, setIsExecuting] = useState(false);
+
+    const conditionReason = 'conditionReason' in item ? item.conditionReason : item.condition_reason || '';
+    const conditionAction = 'conditionAction' in item ? item.conditionAction : item.condition_action || '';
+    const requirements = useMemo(() => item.requirements ?? [], [item.requirements]);
+
+    const showConditionIcon = conditionReason !== '' || conditionAction === 'shown_because_modified';
+    const isErrorState = conditionAction === 'shown_because_modified';
+    const iconColor = isErrorState ? theme.errorTextColor : changeOpacity(theme.centerChannelColor, 0.56);
+
+    const checked = item.state === 'closed';
+    const skipped = item.state === 'skipped';
+    const overdue = isOverdue(item);
+    const dueSoon = isDueSoon(item);
+    const showRequirements = taskRequirementsEnabled && requirements.length > 0;
+
+    const openFillRequirements = useCallback((editMode: boolean) => {
+        goToFillRequirements({
+            playbookRunId,
+            itemId: item.id,
+            checklistNumber,
+            itemNumber,
+            taskTitle: item.title,
+            requirements,
+            currentState: item.state,
+            editMode,
+        });
+    }, [checklistNumber, item.id, item.state, item.title, itemNumber, playbookRunId, requirements]);
+
+    const onCompleteRequirements = useCallback(() => {
+        openFillRequirements(false);
+    }, [openFillRequirements]);
+
+    const onEditRequirementValues = useCallback(() => {
+        openFillRequirements(true);
+    }, [openFillRequirements]);
+
+    const onUserChipPress = useCallback((userId: string) => {
+        openUserProfile({
+            userId,
+            channelId,
+            location: Screens.PLAYBOOK_RUN,
+        });
+    }, [channelId]);
+
+    const executeCommand = useCallback(async () => {
+        if (isExecuting) {
+            return;
+        }
+        setIsExecuting(true);
+        const res = await runChecklistItem(serverUrl, playbookRunId, checklistNumber, itemNumber);
+        if (res.error) {
+            showPlaybookErrorSnackbar();
+            setIsExecuting(false);
+            return;
+        }
+
+        dismissAllRoutesAndPopToScreen(isTable ? Screens.HOME : Screens.CHANNEL);
+        if (item.command?.startsWith('/call')) {
+            await handleCallsSlashCommand(item.command, serverUrl, channelId, channelType, '', currentUserId, intl);
+        }
+    }, [channelId, channelType, checklistNumber, currentUserId, intl, isExecuting, isTable, item.command, itemNumber, playbookRunId, serverUrl]);
+
+    const toggleChecked = useCallback(async () => {
+        if (isChecking) {
+            return;
+        }
+
+        if (showRequirements && !checked) {
+            openFillRequirements(false);
+            return;
+        }
+
+        setIsChecking(true);
+        const res = await updateChecklistItem(serverUrl, playbookRunId, item.id, checklistNumber, itemNumber, checked ? '' : 'closed');
+        if (res.error) {
+            showPlaybookErrorSnackbar();
+            logDebug('ChecklistItem.toggleChecked: update failed', getFullErrorMessage(res.error));
+        }
+        setIsChecking(false);
+    }, [checked, checklistNumber, isChecking, item.id, itemNumber, openFillRequirements, playbookRunId, serverUrl, showRequirements]);
+
+    const toggleSkipped = useCallback(async () => {
+        if (isChecking) {
+            return;
+        }
+        setIsChecking(true);
+        let res;
+        if (skipped) {
+            res = await restoreChecklistItem(serverUrl, playbookRunId, item.id, checklistNumber, itemNumber);
+        } else {
+            res = await skipChecklistItem(serverUrl, playbookRunId, item.id, checklistNumber, itemNumber);
+        }
+        if (res.error) {
+            showPlaybookErrorSnackbar();
+        }
+        setIsChecking(false);
+    }, [isChecking, serverUrl, playbookRunId, item.id, checklistNumber, itemNumber, skipped]);
+
+    const chipIconStyle = useMemo(() => {
+        return [
+            styles.chipIcon,
+            dueSoon && styles.dueSoonChipIcon,
+        ];
+    }, [dueSoon, styles.chipIcon, styles.dueSoonChipIcon]);
+
+    const checkbox = isChecking ? (
+        <ActivityIndicator
+            size='small'
+            color={theme.centerChannelColor}
+            testID='checklist-item-loading'
+        />
+    ) : (
+        <Checkbox
+            checked={checked}
+            onPress={toggleChecked}
+            disabled={isDisabled || skipped}
+        />
+    );
+
+    let commandMessage = '';
+    if (item.command) {
+        const commandLastRun = 'commandLastRun' in item ? item.commandLastRun : item.command_last_run;
+        const commandName = item.command.substring(1);
+        if (commandLastRun) {
+            commandMessage = intl.formatMessage({
+                id: 'playbook_run.checklist.rerunCommand',
+                defaultMessage: '{command} (Rerun)',
+            }, {command: commandName});
+        } else {
+            commandMessage = commandName;
+        }
+    }
+
+    const renderBottomSheet = useCallback(() => (
+        <ChecklistItemBottomSheet
+            runId={playbookRunId}
+            checklistNumber={checklistNumber}
+            itemNumber={itemNumber}
+            channelId={channelId}
+            item={item}
+            onCheck={toggleChecked}
+            onSkip={toggleSkipped}
+            onRunCommand={executeCommand}
+            teammateNameDisplay={teammateNameDisplay}
+            isDisabled={isDisabled}
+            conditionReason={conditionReason}
+            showConditionIcon={showConditionIcon}
+            conditionIconColor={iconColor}
+        />
+    ), [
+        playbookRunId,
+        checklistNumber,
+        itemNumber,
+        channelId,
+        item,
+        toggleChecked,
+        toggleSkipped,
+        executeCommand,
+        teammateNameDisplay,
+        isDisabled,
+        conditionReason,
+        showConditionIcon,
+        iconColor,
+    ]);
+
+    const onPress = useCallback(() => {
+        const initialHeight = BOTTOM_SHEET_HEIGHT.base + (isDisabled ? 0 : BOTTOM_SHEET_HEIGHT.actionButtons) + (showConditionIcon ? BOTTOM_SHEET_HEIGHT.conditionSection : 0);
+        bottomSheet(renderBottomSheet, [1, initialHeight, '80%']);
+    }, [isDisabled, renderBottomSheet, showConditionIcon]);
+
+    return (
+        <View style={styles.checklistItem}>
+            <View style={styles.checkboxContainer}>
+                {checkbox}
+            </View>
+            {showConditionIcon && (
+                <PressableOpacity onPress={onPress}>
+                    <CompassIcon
+                        name='source-branch'
+                        size={16}
+                        color={iconColor}
+                        style={styles.conditionIcon}
+                        testID='checklist_item.condition_icon'
+                    />
+                </PressableOpacity>
+            )}
+            <View style={styles.itemDetails}>
+                <PressableOpacity onPress={onPress}>
+                    <View style={styles.itemDetailsTexts}>
+                        <View style={styles.titleRow}>
+                            <Text style={[styles.itemTitle, skipped && styles.skippedText]}>{item.title}</Text>
+                        </View>
+                        {Boolean(item.description) && (
+                            <Text style={[styles.itemDescription, skipped && styles.skippedText]}>{item.description}</Text>
+                        )}
+                    </View>
+                </PressableOpacity>
+
+                {showRequirements && (
+                    <RequirementsAccordion
+                        requirements={requirements}
+                        isTaskComplete={checked}
+                        readOnly={isDisabled || skipped}
+                        onComplete={onCompleteRequirements}
+                        onEditValues={onEditRequirementValues}
+                    />
+                )}
+
+                {(assignee || dueDate || (item.command)) && (
+                    <View style={styles.chipsRow}>
+                        {assignee && (
+                            <UserChip
+                                user={assignee}
+                                onPress={onUserChipPress}
+                                teammateNameDisplay={teammateNameDisplay}
+                            />
+                        )}
+
+                        {Boolean(dueDate) && (
+                            <BaseChip
+                                label={intl.formatMessage({id: 'playbook_run.checklist.dueIn', defaultMessage: 'Due {dueDate}'}, {dueDate: getFriendlyDate(intl, dueDate)})}
+                                prefix={
+                                    <CompassIcon
+                                        name='calendar-outline'
+                                        style={chipIconStyle}
+                                        size={14}
+                                    />
+                                }
+                                type={dueSoon ? 'danger' : 'normal'}
+                                boldText={overdue}
+                            />
+                        )}
+
+                        {Boolean(item.command) && (
+                            <BaseChip
+                                label={commandMessage}
+                                onPress={executeCommand}
+                                type='link'
+                                prefix={
+                                    isExecuting ? (
+                                        <ActivityIndicator
+                                            size='small'
+                                            color={theme.centerChannelColor}
+                                        />
+                                    ) : (
+                                        <CompassIcon
+                                            name='slash-forward'
+                                            style={styles.chipIcon}
+                                        />
+                                    )
+                                }
+                            />
+                        )}
+                    </View>
+                )}
+            </View>
+        </View>
+    );
+};
+
+export default ChecklistItem;

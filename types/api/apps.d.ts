@@ -23,15 +23,15 @@ type AppsState = {
 };
 
 type AppBinding = {
-    app_id: string;
-    location: string;
+    app_id?: string;
+    location?: string;
     icon?: string;
 
     // Label is the (usually short) primary text to display at the location.
     // - For LocationPostMenu is the menu item text.
     // - For LocationChannelHeader is the dropdown text.
     // - For LocationCommand is the name of the command
-    label: string;
+    label?: string;
 
     // Hint is the secondary text to display
     // - LocationPostMenu: not used
@@ -60,7 +60,7 @@ type AppCallValues = {
 };
 
 type AppCall = {
-    path: string;
+    path?: string;
     expand?: AppExpand;
     state?: any;
 };
@@ -130,6 +130,7 @@ type AppForm = {
     footer?: string;
     icon?: string;
     submit_buttons?: string;
+    submit_label?: string;
     cancel_button?: boolean;
     submit_on_cancel?: boolean;
     fields?: AppField[];
@@ -152,8 +153,8 @@ type AppFormValue = string | boolean | number | AppSelectOption | AppSelectOptio
 type AppFormValues = {[name: string]: AppFormValue};
 
 type AppSelectOption = {
-    label: string;
-    value: string;
+    label?: string;
+    value?: string;
     icon_data?: string;
 };
 
@@ -163,8 +164,8 @@ type AppFieldType = string;
 type AppField = {
 
     // Name is the name of the JSON field to use.
-    name: string;
-    type: AppFieldType;
+    name?: string;
+    type?: AppFieldType;
     is_required?: boolean;
     readonly?: boolean;
 
@@ -185,10 +186,41 @@ type AppField = {
     multiselect?: boolean;
     lookup?: AppCall;
 
+    // File props
+    allow_multiple?: boolean;
+
     // Text props
     subtype?: string;
     min_length?: number;
     max_length?: number;
+
+    // Date/DateTime props
+    min_date?: string;
+    max_date?: string;
+    time_interval?: number;
+    datetime_config?: DateTimeConfig;
+
+    // Action button props
+    action_button_url?: string;
+    action_button_context?: Record<string, string>;
+
+    // Collapsible section props
+    collapsible_config?: AppCollapsibleConfig;
+};
+
+type AppCollapsibleConfig = {
+    fields?: AppField[];
+    expanded?: boolean;
+    bordered?: boolean;
+};
+
+type DateTimeConfig = {
+    time_interval?: number;
+    location_timezone?: string;
+    manual_time_entry?: boolean;
+
+    /** @deprecated Renamed to `manual_time_entry`; v12.0 stopped emitting it, 11.x still does. */
+    allow_manual_time_entry?: boolean;
 };
 
 type AutocompleteElement = AppField;

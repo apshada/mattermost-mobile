@@ -8,10 +8,11 @@ import {postEphemeralCallResponseForChannel} from '@actions/remote/apps';
 import OptionItem from '@components/option_item';
 import {AppBindingLocations} from '@constants/apps';
 import {useAppBinding} from '@hooks/apps';
+import {usePreventDoubleTap} from '@hooks/utils';
 import AppsManager from '@managers/apps_manager';
 import {observeCurrentTeamId} from '@queries/servers/system';
-import {preventDoubleTap} from '@utils/tap';
 
+import type {CompassIconName} from '@components/compass_icon';
 import type {WithDatabaseArgs} from '@typings/database/database';
 
 type Props = {
@@ -39,17 +40,17 @@ const ChannelInfoAppBindings = ({channelId, teamId, dismissChannelInfo, serverUr
 
     const handleBindingSubmit = useAppBinding(context, config);
 
-    const onPress = useCallback(preventDoubleTap(async (binding: AppBinding) => {
+    const onPress = usePreventDoubleTap(useCallback(async (binding: AppBinding) => {
         const submitPromise = handleBindingSubmit(binding);
         await dismissChannelInfo();
 
         const finish = await submitPromise;
         await finish();
-    }), [handleBindingSubmit]);
+    }, [dismissChannelInfo, handleBindingSubmit]));
 
     const options = bindings.map((binding) => (
         <BindingOptionItem
-            key={binding.app_id + binding.location}
+            key={(binding.app_id || '') + (binding.location || '')}
             binding={binding}
             onPress={onPress}
         />
@@ -59,14 +60,14 @@ const ChannelInfoAppBindings = ({channelId, teamId, dismissChannelInfo, serverUr
 };
 
 const BindingOptionItem = ({binding, onPress}: {binding: AppBinding; onPress: (binding: AppBinding) => void}) => {
-    const handlePress = useCallback(preventDoubleTap(() => {
+    const handlePress = usePreventDoubleTap(useCallback(() => {
         onPress(binding);
-    }), [binding, onPress]);
+    }, [binding, onPress]));
 
     return (
         <OptionItem
-            label={binding.label}
-            icon={binding.icon}
+            label={binding.label || ''}
+            icon={binding.icon as CompassIconName}
             action={handlePress}
             type='default'
             testID={`channel_info.options.app_binding.option.${binding.location}`}

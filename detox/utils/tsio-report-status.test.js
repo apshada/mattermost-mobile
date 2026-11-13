@@ -1,0 +1,385 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// CI util unit tests: run with `node --test detox/utils/tsio-report-status.test.js`.
+
+const assert = require('node:assert/strict');
+const {describe, it} = require('node:test');
+
+const {
+    buildDisplayReportUrl,
+    createCommitStatus,
+    decideStatus,
+    decideTargetUrl,
+    overrideCommitStatus,
+    triageAnnouncement,
+} = require('./tsio-report-status');
+
+describe('tsio-report-status', () => {
+    describe('triageAnnouncement', () => {
+        const red = {announce: true, state: 'failure', overrideApplied: false, failed: 7, context: 'e2e-test/detox-ios', runUrl: 'https://github.com/o/r/actions/runs/1'};
+
+        it('marks the PR as waiting for triage on one check shared by every lane', () => {
+            assert.deepEqual(triageAnnouncement(red), {
+                state: 'pending',
+                context: 'e2e-test/triage',
+                description: 'E2E failures found · triage starts when every lane has finished',
+                target_url: 'https://github.com/o/r/actions/runs/1',
+            });
+        });
+
+        it('announces nothing when triage is off for the run, the lane is not red with test failures, or it was overridden', () => {
+            assert.equal(triageAnnouncement({...red, announce: false}), null);
+            assert.equal(triageAnnouncement({...red, state: 'success'}), null);
+            assert.equal(triageAnnouncement({...red, failed: 0}), null, 'a red lane with no failed tests is an infrastructure problem triage does not take');
+            assert.equal(triageAnnouncement({...red, overrideApplied: true}), null);
+        });
+
+        it('says a cancelled run will not be triaged instead of leaving the check pending', () => {
+            assert.deepEqual(triageAnnouncement({...red, cancelled: true}), {
+                state: 'error',
+                context: 'e2e-test/triage',
+                description: 'E2E run cancelled before triage · re-run E2E',
+                target_url: 'https://github.com/o/r/actions/runs/1',
+            });
+            assert.equal(triageAnnouncement({...red, cancelled: true, announce: false}), null);
+        });
+    });
+
+    describe('overrideCommitStatus', () => {
+        it('reports a failure as success so E2E/Override does not block the merge', () => {
+            assert.deepEqual(
+                overrideCommitStatus('failure', '8 passed, 2 failed, 0 skipped'),
+                {
+                    state: 'success',
+                    description: 'E2E/Override — 8 passed, 2 failed, 0 skipped',
+                },
+            );
+        });
+
+        it('leaves non-failure states untouched', () => {
+            assert.deepEqual(
+                overrideCommitStatus('success', '10 passed, 0 skipped'),
+                {state: 'success', description: '10 passed, 0 skipped'},
+            );
+        });
+
+        it('truncates the labelled description to the commit status limit', () => {
+            const {description} = overrideCommitStatus('failure', 'x'.repeat(200));
+            assert.equal(description.length, 140);
+        });
+    });
+
+    describe('decideStatus', () => {
+        // mattermost-mobile run 37162988043: cancelled mid-run, its unfinished shards
+        // were counted as 132 failed specs and posted as test failures.
+        it('reports a cancelled run as cancelled, not as test failures', () => {
+            const detail = {status: 'completed', test_stats: {passed: 49, failed: 132, skipped: 29}};
+            assert.deepEqual(decideStatus(detail, false, true), {
+                state: 'error',
+                description: 'E2E run cancelled before it finished (49 passed by then) · re-run E2E',
+                both_terminal: true,
+                timed_out: false,
+            });
+            assert.equal(decideStatus({status: 'pending'}, false, true).state, 'error');
+            assert.equal(decideStatus(detail, false).state, 'failure', 'without the cancel flag the failures stand');
+        });
+
+        it('returns success for completed report with no failures when upstream succeeded', () => {
+            assert.deepEqual(
+                decideStatus(
+                    {status: 'completed', test_stats: {passed: 10, failed: 0, skipped: 2}},
+                    true,
+                ),
+                {
+                    state: 'success',
+                    description: '10 passed, 2 skipped',
+                    both_terminal: true,
+                    timed_out: false,
+                },
+            );
+        });
+
+        it('returns failure for completed report with failures', () => {
+            assert.deepEqual(
+                decideStatus(
+                    {status: 'completed', test_stats: {passed: 8, failed: 2, skipped: 1}},
+                    true,
+                ),
+                {
+                    state: 'failure',
+                    description: '8 passed, 2 failed, 1 skipped',
+                    both_terminal: true,
+                    timed_out: false,
+                },
+            );
+        });
+
+        it('returns failure for incomplete terminal status even with zero failures', () => {
+            assert.deepEqual(
+                decideStatus(
+                    {status: 'incomplete', test_stats: {passed: 5, failed: 0, skipped: 0}},
+                    true,
+                ),
+                {
+                    state: 'failure',
+                    description: 'Report incomplete — 5 passed, 0 skipped',
+                    both_terminal: true,
+                    timed_out: false,
+                },
+            );
+        });
+
+        it('uses timeout path for non-terminal status', () => {
+            assert.deepEqual(
+                decideStatus({status: 'processing', test_stats: {passed: 1, failed: 0}}, true),
+                {
+                    state: 'success',
+                    description: 'TSIO poll timed out (status=processing) — using CI job status',
+                    both_terminal: false,
+                    timed_out: true,
+                },
+            );
+        });
+
+        it('overrides pass when upstreamSucceeded is false on completed clean report', () => {
+            assert.deepEqual(
+                decideStatus(
+                    {status: 'completed', test_stats: {passed: 10, failed: 0, skipped: 0}},
+                    false,
+                ),
+                {
+                    state: 'failure',
+                    description: '10 passed, 0 skipped',
+                    both_terminal: true,
+                    timed_out: false,
+                },
+            );
+        });
+
+        it('returns failure on timeout when upstreamSucceeded is false', () => {
+            assert.equal(
+                decideStatus({status: 'pending'}, false).state,
+                'failure',
+            );
+            assert.equal(decideStatus({status: 'pending'}, false).timed_out, true);
+        });
+    });
+
+    describe('decideTargetUrl', () => {
+        const display = 'https://test-io.test.mattermost.com/reports/mattermost-mobile/main/abc1234/mobile-pr';
+        const runUrl = 'https://github.com/mattermost/mattermost-mobile/actions/runs/99';
+
+        it('returns TSIO URL with gid when both terminal and success', () => {
+            assert.equal(
+                decideTargetUrl('success', true, display, 'gid-1', runUrl, {
+                    failed: 0,
+                    reportStatus: 'completed',
+                }),
+                `${display}?gid=gid-1`,
+            );
+        });
+
+        it('returns TSIO URL when tests failed but report uploaded', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 187,
+                    reportStatus: 'completed',
+                    upstreamSucceeded: false,
+                }),
+                `${display}?gid=gid-1`,
+            );
+        });
+
+        it('returns TSIO URL for incomplete terminal report', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 0,
+                    reportStatus: 'incomplete',
+                    upstreamSucceeded: true,
+                }),
+                `${display}?gid=gid-1`,
+            );
+        });
+
+        it('returns run URL when CI failed outside tests with a clean completed report', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 0,
+                    reportStatus: 'completed',
+                    upstreamSucceeded: false,
+                }),
+                runUrl,
+            );
+        });
+
+        it('names the posting run in the TSIO URL, so triage can tell who owns the status', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 3,
+                    reportStatus: 'completed',
+                    run: {id: '39407278991', attempt: '2'},
+                }),
+                `${display}?gid=gid-1&gh_run_id=39407278991&gh_run_attempt=2`,
+            );
+        });
+
+        it('leaves the TSIO URL unchanged when the run attempt is unknown, rather than guessing attempt 1', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 3,
+                    reportStatus: 'completed',
+                    run: {id: '39407278991', attempt: ''},
+                }),
+                `${display}?gid=gid-1`,
+            );
+            assert.equal(
+                decideTargetUrl('failure', true, display, 'gid-1', runUrl, {
+                    failed: 3,
+                    reportStatus: 'completed',
+                    run: {id: '39407278991', attempt: undefined},
+                }),
+                `${display}?gid=gid-1`,
+            );
+        });
+
+        it('returns run URL when not both terminal', () => {
+            assert.equal(
+                decideTargetUrl('success', false, display, 'gid-1', runUrl),
+                runUrl,
+            );
+        });
+
+        it('returns run URL when report id is missing', () => {
+            assert.equal(
+                decideTargetUrl('failure', true, display, null, runUrl, {
+                    failed: 2,
+                    reportStatus: 'completed',
+                }),
+                runUrl,
+            );
+        });
+    });
+
+    describe('buildDisplayReportUrl', () => {
+        const base = 'https://test-io.test.mattermost.com';
+
+        it('strips refs/heads/ and encodes path slashes as ~', () => {
+            assert.equal(
+                buildDisplayReportUrl(base, {
+                    repository: 'mattermost/mattermost-mobile',
+                    branch: 'refs/heads/feat/tsio-mobile',
+                    commit_sha: 'abcdef1234567890',
+                    name: 'mobile-pr',
+                }),
+                `${base}/reports/mattermost-mobile/feat~tsio-mobile/abcdef1/mobile-pr`,
+            );
+        });
+
+        it('prefers run_group over name', () => {
+            assert.equal(
+                buildDisplayReportUrl(base, {
+                    repository: 'mattermost/mattermost-mobile',
+                    branch: 'main',
+                    commit_sha: 'deadbeef',
+                    name: 'detox-ios',
+                    run_group: 'mobile-pr',
+                }),
+                `${base}/reports/mattermost-mobile/main/deadbee/mobile-pr`,
+            );
+        });
+
+        it('falls back to name when run_group is absent', () => {
+            assert.equal(
+                buildDisplayReportUrl(base, {
+                    repository: 'mattermost/mattermost-mobile',
+                    branch: 'main',
+                    commit_sha: 'deadbeef',
+                    name: 'mobile-release',
+                }),
+                `${base}/reports/mattermost-mobile/main/deadbee/mobile-release`,
+            );
+        });
+    });
+
+    describe('createCommitStatus', () => {
+        const payload = {state: 'success', context: 'e2e-test/detox-ipad', description: '19 passed', target_url: 'https://example.test'};
+        const respond = (step) => (typeof step === 'number' ? {ok: step < 300, status: step, text: async () => `body ${step}`} : step);
+        const scripted = (...steps) => {
+            const calls = [];
+            const fetchImpl = async (url, options) => {
+                calls.push({url, options});
+                const step = steps[calls.length - 1];
+                if (step instanceof Error) {
+                    throw step;
+                }
+                return respond(step);
+            };
+            return {calls, fetchImpl};
+        };
+        const wait = async () => {};
+
+        it('tries again after a GitHub 5xx and stops once the status is posted', async () => {
+            const waits = [];
+            const recordWait = async (ms) => {
+                waits.push(ms);
+            };
+            const {calls, fetchImpl} = scripted(500, 201);
+            await createCommitStatus('t', 'mattermost/mattermost-mobile', 'abc', payload, {fetchImpl, wait: recordWait});
+            assert.equal(calls.length, 2);
+            assert.equal(calls[0].url, 'https://api.github.com/repos/mattermost/mattermost-mobile/statuses/abc');
+            assert.deepEqual(JSON.parse(calls[1].options.body), payload);
+            assert.deepEqual(waits, [2000]);
+        });
+
+        it('tries again after a dropped connection', async () => {
+            const {calls, fetchImpl} = scripted(new Error('socket hang up'), 201);
+            await createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait});
+            assert.equal(calls.length, 2);
+        });
+
+        it('tries again when a 5xx body cannot be read', async () => {
+            const dropped = {
+                ok: false,
+                status: 502,
+                text: async () => {
+                    throw new Error('terminated');
+                },
+            };
+            const {calls, fetchImpl} = scripted(dropped, 201);
+            await createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait});
+            assert.equal(calls.length, 2);
+        });
+
+        it('tries again when a 5xx body stalls instead of waiting for it', async () => {
+            const stalled = {
+                ok: false,
+                status: 503,
+                text: () => new Promise(() => {}),
+            };
+            const {calls, fetchImpl} = scripted(stalled, 201);
+            await createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait, bodyTimeoutMs: 10});
+            assert.equal(calls.length, 2);
+            assert.equal(calls[0].options.signal.aborted, true);
+            assert.equal(calls[1].options.signal.aborted, true);
+        });
+
+        it('tries again after a 429 rate limit', async () => {
+            const {calls, fetchImpl} = scripted(429, 201);
+            await createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait});
+            assert.equal(calls.length, 2);
+        });
+
+        it('fails at once on a 4xx: the request is wrong, not GitHub', async () => {
+            const {calls, fetchImpl} = scripted(422);
+            await assert.rejects(createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait}), /createCommitStatus failed: 422 body 422/);
+            assert.equal(calls.length, 1);
+        });
+
+        it('gives up after the last attempt with the last error', async () => {
+            const {calls, fetchImpl} = scripted(502, 503, 500);
+            await assert.rejects(createCommitStatus('t', 'o/r', 'abc', payload, {fetchImpl, wait}), /createCommitStatus failed: 500 body 500/);
+            assert.equal(calls.length, 3);
+        });
+    });
+});

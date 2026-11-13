@@ -2,30 +2,32 @@
 // See LICENSE.txt for license information.
 
 import {makeCallsBaseAndBadgeRGB, rgbToCSS} from '@mattermost/calls';
+import {type CallsConfig, isCaption, type Caption, isCallJobMetadata, type CallJobMetadata} from '@mattermost/calls/lib/types';
 import {Alert} from 'react-native';
-import {TextTrackType} from 'react-native-video';
+import {SelectedTrackType, TextTrackType, type ISO639_1, type SelectedTrack, type TextTracks} from 'react-native-video';
 
 import {buildFileUrl} from '@actions/remote/file';
-import {Calls, Post} from '@constants';
+import {
+    type Call,
+    CallCardState,
+    CallPostStatus,
+    type CallsConfigState,
+    type CallSession,
+    type CallsPostProps,
+    type CallsTheme,
+    CallsTransport,
+} from '@calls/types/calls';
+import {Calls, Post, General} from '@constants';
 import {NOTIFICATION_SUB_TYPE} from '@constants/push_notification';
 import {isMinimumServerVersion} from '@utils/helpers';
-import {displayUsername} from '@utils/user';
+import {ensureNumber, ensureString, isArrayOf, isRecordOf, isStringArray} from '@utils/types';
+import {displayUsername, getUserIdFromChannelName} from '@utils/user';
 
-import type {
-    CallsConfigState,
-    CallSession,
-    CallsTheme,
-    CallsVersion,
-    SelectedSubtitleTrack,
-    SubtitleTrack,
-} from '@calls/types/calls';
-import type {CallsConfig, Caption} from '@mattermost/calls/lib/types';
+import type {RTCIceServer} from '@livekit/react-native-webrtc';
+import type ChannelModel from '@typings/database/models/servers/channel';
 import type PostModel from '@typings/database/models/servers/post';
 import type UserModel from '@typings/database/models/servers/user';
 import type {IntlShape} from 'react-intl';
-import type {RTCIceServer} from 'react-native-webrtc';
-
-const callsMessageRegex = /^\u200b.* is inviting you to a call$/;
 
 export function sortSessions(locale: string, teammateNameDisplay: string, sessions?: Dictionary<CallSession>, presenterID?: string): CallSession[] {
     if (!sessions) {
@@ -36,6 +38,30 @@ export function sortSessions(locale: string, teammateNameDisplay: string, sessio
 
     return sessns.sort(sortByName(locale, teammateNameDisplay)).sort(sortByState(presenterID));
 }
+
+export function sortDMSessions(
+    locale: string,
+    teammateNameDisplay: string,
+    myUserId: string,
+    sessions?: Dictionary<CallSession>,
+    presenterID?: string,
+): CallSession[] {
+    return sortSessions(locale, teammateNameDisplay, sessions, presenterID).sort(sortByCurrentUser(myUserId));
+}
+
+const sortByCurrentUser = (myUserId: string) => {
+    return (a: CallSession, b: CallSession) => {
+        if (a.userId === myUserId && b.userId !== myUserId) {
+            return -1;
+        }
+
+        if (b.userId === myUserId && a.userId !== myUserId) {
+            return 1;
+        }
+
+        return 0;
+    };
+};
 
 const sortByName = (locale: string, teammateNameDisplay: string) => {
     return (a: CallSession, b: CallSession) => {
@@ -97,17 +123,23 @@ export function isSupportedServerCalls(serverVersion?: string) {
     return false;
 }
 
-export function isMultiSessionSupported(callsVersion: CallsVersion) {
-    return isMinimumServerVersion(
-        callsVersion.version,
-        Calls.MultiSessionCallsVersion.MAJOR_VERSION,
-        Calls.MultiSessionCallsVersion.MIN_VERSION,
-        Calls.MultiSessionCallsVersion.PATCH_VERSION,
+export function getCallsTransport(config: CallsConfigState): CallsTransport {
+    const isLiveKit = isMinimumServerVersion(
+        config.version.version,
+        Calls.LiveKitCallsVersion.MAJOR_VERSION,
+        Calls.LiveKitCallsVersion.MIN_VERSION,
+        Calls.LiveKitCallsVersion.PATCH_VERSION,
     );
+
+    return isLiveKit ? CallsTransport.LiveKit : CallsTransport.Rtcd;
 }
 
 export function isHostControlsAllowed(config: CallsConfigState) {
     return Boolean(config.HostControlsAllowed);
+}
+
+export function areGroupCallsAllowed(config: CallsConfigState) {
+    return Boolean(config.GroupCallsAllowed);
 }
 
 export function isCallsCustomMessage(post: PostModel | Post): boolean {
@@ -193,6 +225,27 @@ export function userIds<T extends HasUserId>(hasUserId: T[]): string[] {
     return ids;
 }
 
+/**
+ * Returns true if anyone other than myUserId is in the call.
+ * Compares distinct users rather than sessions.
+ */
+export function hasOtherUserJoined(sessions: Dictionary<CallSession>, myUserId: string): boolean {
+    return Object.values(sessions).some((session) => session.userId !== myUserId);
+}
+
+/**
+ * Returns the id of the other party in a 1:1 DM call, or '' when there is no other
+ * party to wait for: the channel isn't a DM, or it's a DM with yourself.
+ */
+export function getDMCalleeId(myUserId: string, channel?: ChannelModel): string {
+    if (channel?.type !== General.DM_CHANNEL) {
+        return '';
+    }
+
+    const calleeId = getUserIdFromChannelName(myUserId, channel.name);
+    return calleeId === myUserId ? '' : calleeId;
+}
+
 export function fillUserModels(sessions: Dictionary<CallSession>, models: UserModel[]) {
     const idToModel = models.reduce((accum, cur) => {
         accum[cur.id] = cur;
@@ -206,41 +259,96 @@ export function fillUserModels(sessions: Dictionary<CallSession>, models: UserMo
 }
 
 export function isCallsStartedMessage(payload?: NotificationData) {
-    if (payload?.sub_type === NOTIFICATION_SUB_TYPE.CALLS) {
-        return true;
-    }
-
-    // MM-55506 - Remove once we can assume MM servers will be >= 9.3.0, mobile will be >= 2.11.0,
-    // calls will be >= 0.21.0, and push proxy will be >= 5.27.0
-    return (payload?.message === 'You\'ve been invited to a call' || callsMessageRegex.test(payload?.message || ''));
+    return payload?.sub_type === NOTIFICATION_SUB_TYPE.CALLS;
 }
 
-export const hasCaptions = (postProps?: Record<string, any> & { captions?: Caption[] }): boolean => {
-    return !(!postProps || !postProps.captions?.[0]);
+export const hasCaptions = (postProps?: Record<string, unknown>): boolean => {
+    return Boolean(isArrayOf<Caption>(postProps?.captions, isCaption) && postProps.captions[0]);
 };
 
-export const getTranscriptionUri = (serverUrl: string, postProps?: Record<string, any> & { captions?: Caption[] }): {
-    tracks?: SubtitleTrack[];
-    selected: SelectedSubtitleTrack;
+export const getTranscriptionUri = (serverUrl: string, postProps?: Record<string, unknown>): {
+    tracks?: TextTracks;
+    selected: SelectedTrack;
 } => {
     // Note: We're not using hasCaptions above because this tells typescript that the caption exists later.
     // We could use some fancy typescript to do the same, but it's not worth the complexity.
-    if (!postProps || !postProps.captions?.[0]) {
+    if (!isArrayOf<Caption>(postProps?.captions, isCaption) || !postProps.captions[0]) {
         return {
             tracks: undefined,
-            selected: {type: 'disabled'},
+            selected: {type: SelectedTrackType.DISABLED, value: ''},
         };
     }
 
-    const tracks: SubtitleTrack[] = postProps.captions.map((t) => ({
+    const tracks: TextTracks = postProps.captions.map((t) => ({
         title: t.title,
-        language: t.language,
+        language: t.language as ISO639_1,
         type: TextTrackType.VTT,
         uri: buildFileUrl(serverUrl, t.file_id),
     }));
 
     return {
         tracks,
-        selected: {type: 'index', value: 0},
+        selected: {type: SelectedTrackType.INDEX, value: 0},
     };
 };
+
+const CALL_POST_STATUSES: string[] = Object.values(CallPostStatus);
+
+// Older posts, and calls in non-DM channels that have not ended yet, have no call_status prop.
+function ensureCallPostStatus(value: unknown): CallPostStatus | '' {
+    const status = ensureString(value);
+    return CALL_POST_STATUSES.includes(status) ? status as CallPostStatus : '';
+}
+
+export function getCallPropsFromPost(post: PostModel | Post): CallsPostProps {
+    return {
+        title: ensureString(post.props?.title),
+        start_at: ensureNumber(post.props?.start_at),
+        end_at: ensureNumber(post.props?.end_at),
+        call_status: ensureCallPostStatus(post.props?.call_status),
+        recordings: isRecordOf<CallJobMetadata>(post.props?.recordings, isCallJobMetadata) ? post.props.recordings : {},
+        transcriptions: isRecordOf<CallJobMetadata>(post.props?.transcriptions, isCallJobMetadata) ? post.props.transcriptions : {},
+        participants: isStringArray(post.props?.participants) ? post.props.participants : [],
+    };
+}
+
+/**
+ * Derives which state the call post card should render. Mirrors getCallCardState in the webapp
+ * (webapp/src/components/custom_post_types/post_type_event.tsx).
+ * The server keeps call_status at 'calling' after the callee answers, so the number of people in
+ * the call is what tells a ringing call apart from a connected one.
+ */
+export function getCallCardState(callProps: CallsPostProps, numUsers: number, callExists: boolean): CallCardState {
+    if (callProps.end_at > 0) {
+        switch (callProps.call_status) {
+            case CallPostStatus.NoAnswer:
+                return CallCardState.NoAnswer;
+            case CallPostStatus.CanceledByCaller:
+                return CallCardState.Canceled;
+            case CallPostStatus.Declined:
+                return CallCardState.Declined;
+            default:
+                return CallCardState.Ended;
+        }
+    }
+
+    // The call_end event lands before the post is updated with end_at, so without this the card
+    // would fall back to "Calling..." (with a Cancel button) for the rest of that window.
+    if (!callExists) {
+        return CallCardState.Ended;
+    }
+
+    if (callProps.call_status === CallPostStatus.Calling && numUsers <= 1) {
+        return CallCardState.Calling;
+    }
+
+    return CallCardState.Active;
+}
+
+/**
+ * Counts the distinct users in a call rather than their sessions, since one user can be connected
+ * from more than one client. Mirrors numUsersInCallInChannel in the webapp (webapp/src/selectors.ts).
+ */
+export function getNumUsersInCall(call?: Call): number {
+    return new Set(Object.values(call?.sessions ?? {}).map((session) => session.userId)).size;
+}

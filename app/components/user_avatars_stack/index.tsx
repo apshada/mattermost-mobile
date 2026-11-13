@@ -2,17 +2,15 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
-import {useIntl} from 'react-intl';
+import {type MessageDescriptor} from 'react-intl';
 import {type StyleProp, Text, type TextStyle, TouchableOpacity, View, type ViewStyle} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import FormattedText from '@components/formatted_text';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {TITLE_HEIGHT} from '@screens/bottom_sheet/content';
 import {bottomSheet} from '@screens/navigation';
 import {bottomSheetSnapPoint} from '@utils/helpers';
-import {preventDoubleTap} from '@utils/tap';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
@@ -20,13 +18,14 @@ import UserAvatar from './user_avatar';
 import UsersList from './users_list';
 
 import type UserModel from '@typings/database/models/servers/user';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 const OVERFLOW_DISPLAY_LIMIT = 99;
 const USER_ROW_HEIGHT = 40;
 
 type Props = {
-    channelId: string;
-    location: string;
+    channelId?: string;
+    location: AvailableScreens;
     users: UserModel[];
     breakAt?: number;
     style?: StyleProp<ViewStyle>;
@@ -35,6 +34,7 @@ type Props = {
     overflowContainerStyle?: StyleProp<ViewStyle>;
     overflowItemStyle?: StyleProp<ViewStyle>;
     overflowTextStyle?: StyleProp<TextStyle>;
+    bottomSheetTitle: MessageDescriptor;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -98,24 +98,20 @@ const UserAvatarsStack = ({
     overflowContainerStyle,
     overflowItemStyle,
     overflowTextStyle,
+    bottomSheetTitle,
 }: Props) => {
     const theme = useTheme();
-    const intl = useIntl();
-    const isTablet = useIsTablet();
-    const {bottom} = useSafeAreaInsets();
+    const style = getStyleSheet(theme);
 
-    const showParticipantsList = useCallback(preventDoubleTap(() => {
+    const showParticipantsList = usePreventDoubleTap(useCallback(() => {
         const renderContent = () => (
             <>
-                {!isTablet && (
-                    <View style={style.listHeader}>
-                        <FormattedText
-                            id='mobile.participants.header'
-                            defaultMessage={'Thread Participants'}
-                            style={style.listHeaderText}
-                        />
-                    </View>
-                )}
+                <View style={style.listHeader}>
+                    <FormattedText
+                        {...bottomSheetTitle}
+                        style={style.listHeaderText}
+                    />
+                </View>
                 <UsersList
                     channelId={channelId}
                     location={location}
@@ -124,25 +120,18 @@ const UserAvatarsStack = ({
             </>
         );
 
-        const snapPoints: Array<string | number> = [1, bottomSheetSnapPoint(Math.min(users.length, 5), USER_ROW_HEIGHT, bottom) + TITLE_HEIGHT];
+        const height = bottomSheetSnapPoint(Math.min(users.length, 5), USER_ROW_HEIGHT) + TITLE_HEIGHT;
+
+        const snapPoints: Array<string | number> = [1, height];
         if (users.length > 5) {
             snapPoints.push('80%');
         }
 
-        bottomSheet({
-            closeButtonId: 'close-set-user-status',
-            renderContent,
-            initialSnapIndex: 1,
-            snapPoints,
-            title: intl.formatMessage({id: 'mobile.participants.header', defaultMessage: 'Thread Participants'}),
-            theme,
-        });
-    }), [isTablet, theme, users, channelId, location, bottom]);
+        bottomSheet(renderContent, snapPoints);
+    }, [users, style.listHeader, style.listHeaderText, bottomSheetTitle, channelId, location]));
 
     const displayUsers = users.slice(0, breakAt);
     const overflowUsersCount = Math.min(users.length - displayUsers.length, OVERFLOW_DISPLAY_LIMIT);
-
-    const style = getStyleSheet(theme);
 
     return (
         <TouchableOpacity

@@ -1,19 +1,42 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import Emm from '@mattermost/react-native-emm';
+import Emm, {AuthenticationOutcome} from '@mattermost/react-native-emm';
 import deepEqual from 'deep-equal';
-import JailMonkey from 'jail-monkey';
-import {Alert, type AlertButton, AppState, type AppStateStatus, Platform} from 'react-native';
+import {isRootedExperimentalAsync} from 'expo-device';
+import {defineMessages} from 'react-intl';
+import {Alert, AppState, type AppStateStatus, type EventSubscription, type NativeEventSubscription, Platform} from 'react-native';
 
-import {DEFAULT_LOCALE, getTranslations, t} from '@i18n';
-import {toMilliseconds} from '@utils/datetime';
+import {DEFAULT_LOCALE, getTranslations} from '@i18n';
+import {showAuthenticationInterruptedAlert, showNotSecuredAlert} from '@utils/alerts';
+import {getFullErrorMessage} from '@utils/errors';
 import {isMainActivity} from '@utils/helpers';
+import {logDebug} from '@utils/log';
 import {getIOSAppGroupDetails} from '@utils/mattermost_managed';
+import {handleAppStateResume} from '@utils/security/app_state';
+import {getAuthenticationOutcome, probeDeviceSecured} from '@utils/security/authentication';
+import {AuthenticationSource} from '@utils/security/constants';
 
-const PROMPT_IN_APP_PIN_CODE_AFTER = toMilliseconds({minutes: 5});
+const messages = defineMessages({
+    blocked: {
+        id: 'mobile.managed.blocked_by',
+        defaultMessage: 'Blocked by {vendor}',
+    },
+    jailbreak: {
+        id: 'mobile.managed.jailbreak.emm',
+        defaultMessage: 'Jailbroken or rooted devices are not trusted by {vendor}.\n\nThe app will now close.',
+    },
+    exit: {
+        id: 'mobile.managed.exit',
+        defaultMessage: 'Exit',
+    },
+    securedBy: {
+        id: 'mobile.managed.secured_by',
+        defaultMessage: 'Secured by {vendor}',
+    },
+});
 
-class ManagedApp {
+class ManagedAppSingleton {
     backgroundSince = 0;
     enabled = false;
     inAppPinCode = false;
@@ -22,9 +45,11 @@ class ManagedApp {
     processConfigTimeout?: NodeJS.Timeout;
     vendor = 'Mattermost';
     cacheConfig?: ManagedConfig = undefined;
+    private emmListener: EventSubscription | undefined;
+    private appStateChangeListener: NativeEventSubscription | undefined;
 
     constructor() {
-        Emm.addListener((cfg: ManagedConfig) => {
+        this.emmListener = Emm.addListener((cfg: ManagedConfig) => {
             if (!deepEqual(cfg, this.cacheConfig)) {
                 this.processConfig(cfg);
                 this.cacheConfig = cfg;
@@ -33,12 +58,18 @@ class ManagedApp {
 
         this.setIOSAppGroupIdentifier();
 
-        AppState.addEventListener('change', this.onAppStateChange);
+        this.appStateChangeListener = AppState.addEventListener('change', this.onAppStateChange);
     }
 
     init() {
+        logDebug('ManagedApp: Initializing');
         this.cacheConfig = Emm.getManagedConfig<ManagedConfig>();
         this.processConfig(this.cacheConfig);
+    }
+
+    cleanup() {
+        this.emmListener?.remove();
+        this.appStateChangeListener?.remove();
     }
 
     setIOSAppGroupIdentifier = () => {
@@ -77,7 +108,7 @@ class ManagedApp {
         }
 
         const jailbreakProtection = config!.jailbreakProtection === 'true';
-        if (jailbreakProtection && !this.isTrustedDevice()) {
+        if (jailbreakProtection && (await isRootedExperimentalAsync())) {
             this.alertDeviceIsNotTrusted();
             return;
         }
@@ -94,13 +125,11 @@ class ManagedApp {
         const locale = DEFAULT_LOCALE;
         const translations = getTranslations(locale);
         Alert.alert(
-            translations[t('mobile.managed.blocked_by')].replace('{vendor}', this.vendor),
-            translations[t('mobile.managed.jailbreak')].
-                replace('{vendor}', this.vendor).
-                replace('{reason}', JailMonkey.jailBrokenMessage() || translations[t('mobile.managed.jailbreak_no_reason')]).
-                replace('{debug}', JSON.stringify(JailMonkey.androidRootedDetectionMethods || translations[t('mobile.managed.jailbreak_no_debug_info')])),
+            translations[messages.blocked.id].replace('{vendor}', this.vendor),
+            translations[messages.jailbreak.id].
+                replace('{vendor}', this.vendor),
             [{
-                text: translations[t('mobile.managed.exit')],
+                text: translations[messages.exit.id],
                 style: 'destructive',
                 onPress: () => {
                     Emm.exitApp();
@@ -112,97 +141,94 @@ class ManagedApp {
 
     handleDeviceAuthentication = async (authExpired = true) => {
         this.performingAuthentication = true;
-        const isSecured = await Emm.isDeviceSecured();
+
+        try {
+            return await this.runAuthenticationGate(authExpired);
+        } catch (error) {
+            // Nobody failed authentication here, so the app stays open; the finally below
+            // keeps the flag from latching and blocking every future prompt.
+            logDebug('ManagedApp: Authentication gate failed', {reason: getFullErrorMessage(error)});
+            return false;
+        } finally {
+            this.performingAuthentication = false;
+        }
+    };
+
+    /**
+     * Unbounded: every iteration needs a Retry tap, and the alternative on a final attempt
+     * would be closing the app on a user who never failed to authenticate.
+     */
+    private runAuthenticationGate = async (authExpired: boolean) => {
         const locale = DEFAULT_LOCALE;
         const translations = getTranslations(locale);
 
-        if (!isSecured) {
-            await this.showNotSecuredAlert(translations);
-            Emm.exitApp();
-            return;
-        }
+        /* eslint-disable no-await-in-loop */
+        for (;;) {
+            const secured = await probeDeviceSecured(AuthenticationSource.ManagedApp);
 
-        if (authExpired) {
-            try {
-                const auth = await Emm.authenticate({
-                    reason: translations[t('mobile.managed.secured_by')].replace('{vendor}', this.vendor),
-                    fallback: true,
-                    supressEnterPassword: true,
-                });
-                if (!auth) {
-                    throw new Error('Authorization cancelled');
-                }
-            } catch (err) {
+            if (secured === 'notSecured') {
+                await showNotSecuredAlert('', this.vendor, locale, true);
                 Emm.exitApp();
-                return;
+                return false;
+            }
+
+            if (secured === 'secured' && !authExpired) {
+                return true;
+            }
+
+            if (secured === 'secured') {
+                const outcome = await this.runAuthenticationAttempt(translations);
+
+                if (outcome === 'success') {
+                    this.backgroundSince = 0;
+                    return true;
+                }
+
+                if (outcome === 'failed') {
+                    Emm.exitApp();
+                    return false;
+                }
+            }
+
+            // Cancelled, interrupted, or the secured check could not be determined: nobody
+            // failed, so offer a retry instead of closing the app.
+            const choice = await showAuthenticationInterruptedAlert('', this.vendor, locale);
+            if (choice !== 'retry') {
+                return false;
             }
         }
-
-        this.performingAuthentication = false;
     };
 
-    isTrustedDevice = () => {
-        return __DEV__ || !JailMonkey.isJailBroken();
+    private runAuthenticationAttempt = async (translations: Record<string, string>) => {
+        try {
+            await Emm.authenticate({
+                reason: translations[messages.securedBy.id].replace('{vendor}', this.vendor),
+                fallback: true,
+                supressEnterPassword: true,
+            });
+
+            return 'success';
+        } catch (error) {
+            const outcome = getAuthenticationOutcome(error);
+            logDebug('ManagedApp: Authentication attempt did not succeed', {outcome, reason: getFullErrorMessage(error)});
+
+            return outcome === AuthenticationOutcome.Failed ? 'failed' : 'interrupted';
+        }
     };
 
     onAppStateChange = async (appState: AppStateStatus) => {
-        const isActive = appState === 'active';
-        const isBackground = appState === 'background';
+        await handleAppStateResume(appState, this, {
+            isEnabled: () => this.enabled && this.inAppPinCode && isMainActivity(),
+            isGateOpen: () => this.performingAuthentication,
+            authenticate: (authExpired) => this.handleDeviceAuthentication(authExpired),
 
-        if (isActive && this.previousAppState === 'background' && !this.performingAuthentication) {
-            if (this.enabled && this.inAppPinCode && isMainActivity()) {
-                const authExpired = this.backgroundSince > 0 && (Date.now() - this.backgroundSince) >= PROMPT_IN_APP_PIN_CODE_AFTER;
-                await this.handleDeviceAuthentication(authExpired);
-            }
-
-            this.backgroundSince = 0;
-        } else if (isBackground) {
-            this.backgroundSince = Date.now();
-        }
-
-        this.previousAppState = appState;
-    };
-
-    showNotSecuredAlert = (translations: Record<string, string>) => {
-        return new Promise(async (resolve) => { /* eslint-disable-line no-async-promise-executor */
-            const buttons: AlertButton[] = [];
-
-            if (Platform.OS === 'android') {
-                buttons.push({
-                    text: translations[t('mobile.managed.settings')],
-                    onPress: () => {
-                        Emm.openSecuritySettings();
-                    },
-                });
-            }
-
-            buttons.push({
-                text: translations[t('mobile.managed.exit')],
-                onPress: resolve,
-                style: 'cancel',
-            });
-
-            let message;
-            if (Platform.OS === 'ios') {
-                const {face} = await Emm.deviceSecureWith();
-
-                if (face) {
-                    message = translations[t('mobile.managed.not_secured.ios')];
-                } else {
-                    message = translations[t('mobile.managed.not_secured.ios.touchId')];
-                }
-            } else {
-                message = translations[t('mobile.managed.not_secured.android')];
-            }
-
-            Alert.alert(
-                translations[t('mobile.managed.blocked_by')].replace('{vendor}', this.vendor),
-                message,
-                buttons,
-                {cancelable: false, onDismiss: () => resolve},
-            );
+            // The device-secured check still runs on every resume, even inside the window.
+            promptWhenNotExpired: true,
+            source: AuthenticationSource.ManagedApp,
         });
     };
+
 }
 
-export default new ManagedApp();
+const ManagedApp = new ManagedAppSingleton();
+export default ManagedApp;

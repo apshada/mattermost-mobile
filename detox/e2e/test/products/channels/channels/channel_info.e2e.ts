@@ -1,0 +1,154 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {Setup} from '@support/server_api';
+import {
+    serverOneUrl,
+    siteOneUrl,
+} from '@support/test_config';
+import {
+    ChannelScreen,
+    ChannelListScreen,
+    HomeScreen,
+    LoginScreen,
+    ServerScreen,
+    ChannelInfoScreen,
+    ChannelSettingsScreen,
+} from '@support/ui/screen';
+import {timeouts} from '@support/utils';
+import {expect, waitFor} from 'detox';
+
+describe('Channels - Channel Info', () => {
+    const serverOneDisplayName = 'Server 1';
+    const channelsCategory = 'channels';
+    let testChannel: any;
+
+    beforeAll(async () => {
+        const {channel, user} = await Setup.apiInit(siteOneUrl);
+        testChannel = channel;
+
+        // # Log in to server
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(user);
+
+        // Ensure the channel has propagated to the sidebar before any test body runs.
+        await ChannelListScreen.waitForSidebarPublicChannelDisplayNameVisible(testChannel.name);
+    });
+
+    beforeEach(async () => {
+        // * Verify on channel list screen
+        await ChannelListScreen.toBeVisible();
+    });
+
+    afterAll(async () => {
+        // # Log out
+        await HomeScreen.logout();
+    });
+
+    it('MM-T4928_1 - should match elements on channel info screen', async () => {
+        // # Open a channel screen and open channel info screen
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await ChannelInfoScreen.open();
+
+        // * Verify basic elements on channel info screen
+        await expect(ChannelInfoScreen.closeButton).toBeVisible();
+        await expect(ChannelInfoScreen.publicPrivateTitleDisplayName).toHaveText(testChannel.display_name);
+        await expect(ChannelInfoScreen.publicPrivateTitlePurpose).toHaveText(`Channel purpose: ${testChannel.display_name.toLowerCase()}`);
+        await expect(element(by.text(`Channel header: ${testChannel.display_name.toLowerCase()}`))).toBeVisible();
+        await expect(ChannelInfoScreen.favoriteAction).toBeVisible();
+        await expect(ChannelInfoScreen.muteAction).toBeVisible();
+
+        // Note: joinStartCallAction only visible when Calls plugin is enabled on the server
+        try {
+            await waitFor(ChannelInfoScreen.joinStartCallAction).toBeVisible().withTimeout(timeouts.TWO_SEC);
+        } catch {
+            // Calls plugin not enabled — skip assertion
+        }
+        await expect(ChannelInfoScreen.ignoreMentionsOptionToggledOff).toBeVisible();
+        await ChannelInfoScreen.scrollView.scrollTo('bottom');
+        await expect(ChannelInfoScreen.pinnedMessagesOption).toBeVisible();
+
+        try {
+            await waitFor(ChannelInfoScreen.copyChannelLinkOption).toBeVisible().withTimeout(timeouts.TWO_SEC);
+        } catch {
+            // Calls not enabled — copy link is in the quick actions bar instead
+            await expect(ChannelInfoScreen.copyChannelLinkAction).toExist();
+        }
+        await ChannelInfoScreen.scrollView.scrollTo('bottom');
+        await expect(ChannelInfoScreen.channelSettingsOption).toBeVisible();
+        await ChannelInfoScreen.scrollView.scrollTo('bottom');
+        await expect(ChannelInfoScreen.leaveChannelOption).toBeVisible();
+
+        // # Go back to channel list screen
+        await ChannelInfoScreen.close();
+        await ChannelScreen.back();
+    });
+
+    it('MM-T849_4 - should match elements on channel settings screen', async () => {
+        // # Open a channel screen, open channel info screen, and open channel settings screen
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await ChannelInfoScreen.open();
+        await ChannelInfoScreen.openChannelSettings();
+
+        // * Verify basic elements on channel settings screen
+        await ChannelSettingsScreen.toBeVisible();
+
+        // Note: Channel Settings uses expo-router's native stack header, not the custom
+        // NavigationHeader component, so 'navigation.header.back' testID does not exist
+        // on this screen. Back navigation is tested implicitly via ChannelSettingsScreen.close().
+        await expect(ChannelSettingsScreen.channelInfoOption).toBeVisible();
+
+        // Note: convertPrivateOption visibility depends on server-side permissions
+        // which may vary by server version. Only assert if it exists.
+        try {
+            await waitFor(ChannelSettingsScreen.convertPrivateOption).toExist().withTimeout(timeouts.TWO_SEC);
+        } catch {
+            // Convert to private option not available — permission-dependent
+        }
+        await expect(ChannelSettingsScreen.archiveChannelOption).toBeVisible();
+
+        // # Go back to channel list screen
+        await ChannelSettingsScreen.close();
+        await ChannelInfoScreen.close();
+        await ChannelScreen.back();
+    });
+
+    it('MM-T4928_2 - should be able to view channel info by tapping intro channel info action', async () => {
+        // # Open a channel screen and tap on intro channel info action
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await ChannelScreen.tapIntroChannelInfoAction({category: channelsCategory, channelName: testChannel.name});
+
+        // * Verify on channel info screen
+        await ChannelInfoScreen.toBeVisible();
+
+        // # Go back to channel list screen
+        await ChannelInfoScreen.close();
+        await ChannelScreen.back();
+    });
+
+    it('MM-T4928_3 - should be able to view channel info from channel quick actions', async () => {
+        // # Open a channel screen, tap on channel quick actions button, and tap on channel info action
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await waitFor(ChannelScreen.channelQuickActionsButton).
+            toBeVisible().
+            withTimeout(timeouts.TEN_SEC);
+        await ChannelScreen.channelQuickActionsButton.tap();
+        await waitFor(ChannelScreen.channelInfoQuickAction).
+            toBeVisible().
+            withTimeout(timeouts.TEN_SEC);
+        await ChannelScreen.channelInfoQuickAction.tap();
+
+        // * Verify on channel info screen
+        await ChannelInfoScreen.toBeVisible();
+
+        // # Go back to channel list screen
+        await ChannelInfoScreen.close();
+        await ChannelScreen.back();
+    });
+});

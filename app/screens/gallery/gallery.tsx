@@ -1,33 +1,35 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState} from 'react';
+import React, {forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState} from 'react';
 import {BackHandler} from 'react-native';
-import FastImage, {type ImageStyle} from 'react-native-fast-image';
-import Animated, {runOnJS, runOnUI, useAnimatedReaction, type AnimatedStyle} from 'react-native-reanimated';
+import {useAnimatedReaction, type SharedValue} from 'react-native-reanimated';
+import {scheduleOnRN, scheduleOnUI} from 'react-native-worklets';
 
+import {buildFileUrl} from '@actions/remote/file';
+import {ExpoImageAnimated} from '@components/expo_image';
 import {useGallery} from '@context/gallery';
-import {freezeOtherScreens, measureItem} from '@utils/gallery';
+import {useServerUrl} from '@context/server';
+import {isGif} from '@utils/file';
+import {galleryItemToFileInfo, measureItem} from '@utils/gallery';
 
-import DocumentRenderer from './document_renderer';
 import LightboxSwipeout, {type LightboxSwipeoutRef, type RenderItemInfo} from './lightbox_swipeout';
 import Backdrop, {type BackdropProps} from './lightbox_swipeout/backdrop';
-import VideoRenderer from './video_renderer';
+import DocumentRenderer from './renderers/document';
+import VideoRenderer from './renderers/video';
 import GalleryViewer from './viewer';
 
-import type {ImageRendererProps} from './image_renderer';
-import type {GalleryItemType} from '@typings/screens/gallery';
-
-const AnimatedImage = Animated.createAnimatedComponent(FastImage);
+import type {GalleryItemType, GalleryPagerItem} from '@typings/screens/gallery';
 
 interface GalleryProps {
+    headerAndFooterHidden: SharedValue<boolean>;
     galleryIdentifier: string;
     initialIndex: number;
     items: GalleryItemType[];
     onIndexChange?: (index: number) => void;
     onHide: () => void;
     targetDimensions: { width: number; height: number };
-    onShouldHideControls: (hide: boolean) => void;
+    hideHeaderAndFooter: (hide: boolean) => void;
 }
 
 export interface GalleryRef {
@@ -35,30 +37,33 @@ export interface GalleryRef {
 }
 
 const Gallery = forwardRef<GalleryRef, GalleryProps>(({
+    headerAndFooterHidden,
     galleryIdentifier,
     initialIndex,
     items,
     onHide,
     targetDimensions,
-    onShouldHideControls,
+    hideHeaderAndFooter,
     onIndexChange,
 }: GalleryProps, ref) => {
     const {refsByIndexSV, sharedValues} = useGallery(galleryIdentifier);
     const [localIndex, setLocalIndex] = useState(initialIndex);
     const lightboxRef = useRef<LightboxSwipeoutRef>(null);
     const item = items[localIndex];
+    const fileInfo = useMemo(() => galleryItemToFileInfo(item), [item]);
+    const serverUrl = useServerUrl();
 
     const close = () => {
         lightboxRef.current?.closeLightbox();
     };
 
-    const onLocalIndex = (index: number) => {
+    const onLocalIndex = useCallback((index: number) => {
         setLocalIndex(index);
         onIndexChange?.(index);
-    };
+    }, [onIndexChange]);
 
     useEffect(() => {
-        runOnUI(() => {
+        scheduleOnUI(() => {
             'worklet';
 
             const tw = targetDimensions.width;
@@ -66,7 +71,10 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
             const scaleFactor = item.width / targetDimensions.width;
             const th = item.height / scaleFactor;
             sharedValues.targetHeight.value = th;
-        })();
+        });
+
+        // sharedValues do not trigger re-renders
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [item, targetDimensions.width]);
 
     useEffect(() => {
@@ -89,7 +97,7 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
         (index) => {
             const galleryItems = refsByIndexSV.value;
 
-            if (index > -1 && galleryItems[index]) {
+            if (index > -1 && galleryItems[index] && items[index].type !== 'file') {
                 measureItem(galleryItems[index].ref, sharedValues);
             }
         },
@@ -98,9 +106,9 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
     const onIndexChangeWorklet = useCallback((nextIndex: number) => {
         'worklet';
 
-        runOnJS(onLocalIndex)(nextIndex);
+        scheduleOnRN(onLocalIndex, nextIndex);
         sharedValues.activeIndex.value = nextIndex;
-    }, []);
+    }, [onLocalIndex, sharedValues]);
 
     const renderBackdropComponent = useCallback(
         ({animatedStyles, translateY}: BackdropProps) => {
@@ -118,18 +126,17 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
         'worklet';
 
         if (Math.abs(translateY) > 8) {
-            onShouldHideControls(true);
+            hideHeaderAndFooter(true);
         }
     }
 
     function onSwipeFailure() {
         'worklet';
 
-        runOnJS(freezeOtherScreens)(true);
-        onShouldHideControls(false);
+        hideHeaderAndFooter(false);
     }
 
-    function hideLightboxItem() {
+    const hideLightboxItem = useCallback(() => {
         'worklet';
 
         sharedValues.width.value = 0;
@@ -139,23 +146,26 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
         sharedValues.x.value = 0;
         sharedValues.y.value = 0;
 
-        runOnJS(onHide)();
-    }
+        scheduleOnRN(onHide);
+    }, [onHide, sharedValues]);
 
     const onRenderItem = useCallback((info: RenderItemInfo) => {
-        if (item.type === 'video' && item.posterUri) {
+        const currentItem = items[localIndex];
+        if (currentItem.type === 'video' && currentItem.posterUri) {
             return (
-                <AnimatedImage
-                    source={{uri: item.posterUri}}
-                    style={info.itemStyles as AnimatedStyle<ImageStyle>}
+                <ExpoImageAnimated
+                    id={currentItem.cacheKey}
+                    source={{uri: currentItem.posterUri}}
+                    style={info.itemStyles}
+                    placeholderContentFit='cover'
                 />
             );
         }
 
         return null;
-    }, [item]);
+    }, [items, localIndex]);
 
-    const onRenderPage = useCallback((props: ImageRendererProps, idx: number) => {
+    const onRenderPage = useCallback((props: GalleryPagerItem, idx: number) => {
         switch (props.item.type) {
             case 'video':
                 return (
@@ -163,48 +173,55 @@ const Gallery = forwardRef<GalleryRef, GalleryProps>(({
                         {...props}
                         index={idx}
                         initialIndex={initialIndex}
-                        onShouldHideControls={onShouldHideControls}
+                        hideHeaderAndFooter={hideHeaderAndFooter}
                     />
                 );
             case 'file':
                 return (
                     <DocumentRenderer
                         item={props.item}
-                        onShouldHideControls={onShouldHideControls}
+                        hideHeaderAndFooter={hideHeaderAndFooter}
+                        width={props.width}
+                        height={props.height}
                     />
                 );
             default:
                 return null;
         }
-    }, []);
+    }, [hideHeaderAndFooter, initialIndex]);
+
+    const source = useMemo(() => {
+        if (isGif(fileInfo) && fileInfo.id && !fileInfo.id.startsWith('uid')) {
+            return buildFileUrl(serverUrl, fileInfo.id, fileInfo.update_at);
+        }
+
+        return fileInfo.localPath || fileInfo.uri || item.uri;
+    }, [fileInfo, item.uri, serverUrl]);
 
     return (
         <LightboxSwipeout
+            headerAndFooterHidden={headerAndFooterHidden}
             ref={lightboxRef}
             target={item}
             onAnimationFinished={hideLightboxItem}
             sharedValues={sharedValues}
-            source={item.uri}
+            source={source}
             onSwipeActive={onSwipeActive}
             onSwipeFailure={onSwipeFailure}
             renderBackdropComponent={renderBackdropComponent}
             targetDimensions={targetDimensions}
             renderItem={onRenderItem}
         >
-            {({onGesture, shouldHandleEvent}) => (
-                <GalleryViewer
-                    items={items}
-                    onIndexChange={onIndexChangeWorklet}
-                    shouldPagerHandleGestureEvent={shouldHandleEvent}
-                    onShouldHideControls={onShouldHideControls}
-                    height={targetDimensions.height}
-                    width={targetDimensions.width}
-                    initialIndex={initialIndex}
-                    onPagerEnabledGesture={onGesture}
-                    numToRender={1}
-                    renderPage={onRenderPage}
-                />
-            )}
+            <GalleryViewer
+                items={items}
+                onIndexChange={onIndexChangeWorklet}
+                hideHeaderAndFooter={hideHeaderAndFooter}
+                height={targetDimensions.height}
+                width={targetDimensions.width}
+                initialIndex={initialIndex}
+                numToRender={1}
+                renderPage={onRenderPage}
+            />
         </LightboxSwipeout>
     );
 });

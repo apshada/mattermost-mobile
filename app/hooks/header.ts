@@ -1,9 +1,10 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useMemo} from 'react';
-import Animated, {runOnJS, scrollTo, useAnimatedRef, useAnimatedScrollHandler, useDerivedValue, useSharedValue, withTiming} from 'react-native-reanimated';
+import React, {useCallback, useMemo, useState} from 'react';
+import Animated, {scrollTo, useAnimatedRef, useAnimatedScrollHandler, useDerivedValue, useSharedValue, withTiming} from 'react-native-reanimated';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import {scheduleOnRN} from 'react-native-worklets';
 
 import ViewConstants from '@constants/view';
 import {useIsTablet} from '@hooks/device';
@@ -44,7 +45,7 @@ export const useHeaderHeight = () => {
         defaultHeight,
         largeHeight,
         headerOffset,
-    }), [defaultHeight, largeHeight]);
+    }), [defaultHeight, headerOffset, largeHeight]);
 };
 
 export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset: number) => void) => {
@@ -52,13 +53,13 @@ export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset:
     const animatedRef = useAnimatedRef<Animated.ScrollView>();
     const {largeHeight, defaultHeight, headerOffset} = useHeaderHeight();
     const scrollValue = useSharedValue(0);
-    const lockValue = useSharedValue<number | null>(null);
+    const [lockValue, setLockValue] = useState<number>(0);
     const autoScroll = useSharedValue(false);
     const snapping = useSharedValue(false);
     const scrollEnabled = useSharedValue(true);
 
     const headerHeight = useDerivedValue(() => {
-        const value = -(scrollValue?.value || 0);
+        const value = -(scrollValue.value);
         const heightWithScroll = (isLargeTitle ? largeHeight : defaultHeight) + value;
         let height = Math.max(heightWithScroll, defaultHeight);
         if (value > insets.top) {
@@ -72,9 +73,9 @@ export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset:
         if (onSnap && !snapping.value) {
             snapping.value = true;
             if (dir === 'down' && offset < largeHeight) {
-                runOnJS(onSnap)(0);
+                scheduleOnRN(onSnap, 0);
             } else if (dir === 'up' && offset < (defaultHeight)) {
-                runOnJS(onSnap)(headerOffset);
+                scheduleOnRN(onSnap, headerOffset);
             }
             snapping.value = Boolean(withTiming(0, {duration: 100}));
         }
@@ -124,7 +125,7 @@ export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset:
                     const offset = Math.abs(e.contentOffset.y);
 
                     if (onSnap && offset < largeHeight) {
-                        runOnJS(onSnap)(0);
+                        scheduleOnRN(onSnap, 0);
                     }
                     ctx.momentum = undefined;
                 }
@@ -134,11 +135,13 @@ export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset:
 
     const hideHeader = useCallback((lock = false) => {
         if (lock) {
-            lockValue.value = defaultHeight;
+            // by disabling scroll, this prevent the scrollValue from being updated needlessly as observed in iOS simulators
+            scrollEnabled.value = false;
+            setLockValue(defaultHeight);
         }
 
         const offset = headerOffset;
-        if (animatedRef?.current && Math.abs((scrollValue?.value || 0)) <= insets.top) {
+        if (animatedRef?.current && Math.abs((scrollValue.value)) <= insets.top) {
             autoScroll.value = true;
             if ('scrollTo' in animatedRef.current) {
                 animatedRef.current.scrollTo({y: offset, animated: true});
@@ -151,11 +154,12 @@ export const useCollapsibleHeader = <T>(isLargeTitle: boolean, onSnap?: (offset:
                 // No scroll for section lists?
             }
         }
-    }, [largeHeight, defaultHeight]);
+    }, [headerOffset, animatedRef, scrollValue, insets.top, scrollEnabled, defaultHeight, autoScroll]);
 
     const unlock = useCallback(() => {
-        lockValue.value = null;
-    }, []);
+        scrollEnabled.value = true;
+        setLockValue(0);
+    }, [scrollEnabled]);
 
     return {
         defaultHeight,

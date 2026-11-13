@@ -1,8 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {type StyleProp, StyleSheet, type ViewStyle, DeviceEventEmitter} from 'react-native';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {type StyleProp, StyleSheet, type ViewStyle, type ViewToken, DeviceEventEmitter} from 'react-native';
 import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 
 import {markChannelAsRead, unsetActiveChannelOnServer} from '@actions/remote/channel';
@@ -11,9 +11,10 @@ import {PER_PAGE_DEFAULT} from '@client/rest/constants';
 import PostList from '@components/post_list';
 import {Events, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
-import {debounce} from '@helpers/api/general';
 import {useAppState, useIsTablet} from '@hooks/device';
+import useDidMount from '@hooks/did_mount';
 import useDidUpdate from '@hooks/did_update';
+import {useDebounce} from '@hooks/utils';
 import EphemeralStore from '@store/ephemeral_store';
 
 import Intro from './intro';
@@ -26,12 +27,11 @@ type Props = {
     contentContainerStyle?: StyleProp<AnimatedStyle<ViewStyle>>;
     isCRTEnabled: boolean;
     lastViewedAt: number;
-    nativeID: string;
     posts: PostModel[];
     shouldShowJoinLeaveMessages: boolean;
 }
 
-const edges: Edge[] = ['bottom'];
+const edges: Edge[] = [];
 const styles = StyleSheet.create({
     flex: {flex: 1},
     containerStyle: {paddingTop: 12},
@@ -39,7 +39,7 @@ const styles = StyleSheet.create({
 
 const ChannelPostList = ({
     channelId, contentContainerStyle, isCRTEnabled,
-    lastViewedAt, nativeID, posts, shouldShowJoinLeaveMessages,
+    lastViewedAt, posts, shouldShowJoinLeaveMessages,
 }: Props) => {
     const appState = useAppState();
     const isTablet = useIsTablet();
@@ -49,7 +49,7 @@ const ChannelPostList = ({
     const [fetchingPosts, setFetchingPosts] = useState(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channelId));
     const oldPostsCount = useRef<number>(posts.length);
 
-    const onEndReached = useCallback(debounce(async () => {
+    const handleEndReached = useCallback(async () => {
         if (!fetchingPosts && canLoadPostsBefore.current && posts.length) {
             const lastPost = posts[posts.length - 1];
             const result = await fetchPostsBefore(serverUrl, channelId, lastPost?.id || '');
@@ -58,11 +58,9 @@ const ChannelPostList = ({
                 canLoadPostsBefore.current = (result.posts?.length ?? 0) > 0;
             }
         }
-    }, 500), [fetchingPosts, serverUrl, channelId, posts]);
+    }, [fetchingPosts, serverUrl, channelId, posts]);
 
-    useDidUpdate(() => {
-        setFetchingPosts(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channelId));
-    }, [serverUrl, channelId]);
+    const onEndReached = useDebounce(handleEndReached, 500);
 
     useEffect(() => {
         const listener = DeviceEventEmitter.addListener(Events.LOADING_CHANNEL_POSTS, ({serverUrl: eventServerUrl, channelId: eventChannelId, value}) => {
@@ -70,6 +68,7 @@ const ChannelPostList = ({
                 setFetchingPosts(value);
             }
         });
+        setFetchingPosts(EphemeralStore.isLoadingMessagesForChannel(serverUrl, channelId));
 
         return () => listener.remove();
     }, [serverUrl, channelId]);
@@ -82,13 +81,19 @@ const ChannelPostList = ({
             canLoadPost.current = false;
             fetchPosts(serverUrl, channelId);
         }
+
+        // We only want to run this when the number of posts changes or we stop fetching posts
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [fetchingPosts, posts]);
 
     useDidUpdate(() => {
-        if (oldPostsCount.current < posts.length && appState === 'active') {
-            oldPostsCount.current = posts.length;
+        if (posts.length < oldPostsCount.current) {
+            // Cache cleanup evicted posts — allow paginating older posts again.
+            canLoadPostsBefore.current = true;
+        } else if (posts.length > oldPostsCount.current && appState === 'active') {
             markChannelAsRead(serverUrl, channelId, true);
         }
+        oldPostsCount.current = posts.length;
     }, [posts.length]);
 
     useDidUpdate(() => {
@@ -101,12 +106,29 @@ const ChannelPostList = ({
     }, [appState === 'active']);
 
     useEffect(() => {
+        EphemeralStore.setCurrentChannelOldestVisibleCreateAt(undefined);
+    }, [channelId]);
+
+    useDidMount(() => {
         return () => {
+            EphemeralStore.setCurrentChannelOldestVisibleCreateAt(undefined);
             unsetActiveChannelOnServer(serverUrl);
         };
+    });
+
+    const onViewablePostsChanged = useCallback((viewableItems: ViewToken[]) => {
+        // assuming posts were queried in ascending order.
+        for (let i = viewableItems.length - 1; i >= 0; i--) {
+            const {item, isViewable} = viewableItems[i];
+            if (isViewable && item.type === 'post') {
+                EphemeralStore.setCurrentChannelOldestVisibleCreateAt(item.value.currentPost.createAt);
+                return;
+            }
+        }
+        EphemeralStore.setCurrentChannelOldestVisibleCreateAt(undefined);
     }, []);
 
-    const intro = (<Intro channelId={channelId}/>);
+    const intro = useMemo(() => (<Intro channelId={channelId}/>), [channelId]);
 
     const postList = (
         <PostList
@@ -116,8 +138,8 @@ const ChannelPostList = ({
             footer={intro}
             lastViewedAt={lastViewedAt}
             location={Screens.CHANNEL}
-            nativeID={nativeID}
             onEndReached={onEndReached}
+            onViewableItemsChanged={onViewablePostsChanged}
             posts={posts}
             shouldShowJoinLeaveMessages={shouldShowJoinLeaveMessages}
             showMoreMessages={true}

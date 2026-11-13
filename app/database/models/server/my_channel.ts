@@ -44,6 +44,9 @@ export default class MyChannelModel extends Model implements MyChannelModelInter
     /** mentions_count : The number of mentions on this channel */
     @field('mentions_count') mentionsCount!: number;
 
+    /** urgent_mention_count : The number of unread urgent mentions on this channel */
+    @field('urgent_mention_count') urgentMentionCount!: number;
+
     /** is_unread : Whether the channel has unread messages */
     @field('is_unread') isUnread!: boolean;
 
@@ -52,6 +55,16 @@ export default class MyChannelModel extends Model implements MyChannelModelInter
 
     /** viewed_at : The timestamp showing when the user's last opened this channel (this is used for the new line message indicator) */
     @field('viewed_at') viewedAt!: number;
+
+    /** last_playbook_runs_fetch_at : The timestamp of the last successful fetch of playbook runs for this channel, used as the "since" parameter for incremental updates */
+    @field('last_playbook_runs_fetch_at') lastPlaybookRunsFetchAt!: number;
+
+    /* autotranslation: Determines if the channel has automatic translation enabled for this user*/
+    @field('autotranslation_disabled') autotranslationDisabled!: boolean;
+
+    /** redaction_required_epoch : Local-only. Raised when an ABAC change affects this channel alone,
+     * so one channel's policy edit does not invalidate every cached channel. */
+    @field('redaction_required_epoch') redactionRequiredEpoch!: number;
 
     /** channel : The relation pointing to the CHANNEL table */
     @immutableRelation(CHANNEL, 'id') channel!: Relation<ChannelModel>;

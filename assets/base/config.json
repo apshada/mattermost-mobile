@@ -1,4 +1,6 @@
 {
+    "AuthUrlScheme": "mmauth://",
+    "AuthUrlSchemeDev": "mmauthbeta://",
     "DefaultServerUrl": "",
     "DefaultServerName": "",
     "TestServerUrl": "http://localhost:8065",
@@ -26,5 +28,8 @@
     "ShowOnboarding": false,
 
     "ExperimentalNormalizeMarkdownLinks": false,
-    "CustomRequestHeaders": {}
+    "CustomRequestHeaders": {},
+    "CollectNetworkMetrics": false,
+    "EnablePostListPerformance": false,
+    "EnableObservableProfiling": false
 }

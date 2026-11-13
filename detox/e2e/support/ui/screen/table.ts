@@ -1,13 +1,15 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {expect} from 'detox';
+import {NavigationHeader} from '@support/ui/component';
+import {tapNativeBackButton, timeouts} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class TableScreen {
     testID = {
         tableScreen: 'table.screen',
         tableScrollView: 'table.scroll_view',
-        backButton: 'screen.back.button',
+        backButton: 'navigation.header.back',
     };
 
     tableScreen = element(by.id(this.testID.tableScreen));
@@ -15,13 +17,21 @@ class TableScreen {
     backButton = element(by.id(this.testID.backButton));
 
     toBeVisible = async () => {
-        await expect(this.tableScreen).toBeVisible();
+        await waitFor(this.tableScreen).toExist().withTimeout(timeouts.TEN_SEC);
 
         return this.tableScreen;
     };
 
     back = async () => {
-        await this.backButton.tap();
+        try {
+            await NavigationHeader.tapBackButton(1);
+        } catch {
+            try {
+                await NavigationHeader.tapBackButton(0);
+            } catch {
+                await tapNativeBackButton();
+            }
+        }
         await expect(this.tableScreen).not.toBeVisible();
     };
 }

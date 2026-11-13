@@ -1,67 +1,106 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback} from 'react';
-import {Platform, ScrollView, StyleSheet} from 'react-native';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import React, {useEffect} from 'react';
+import {useIntl} from 'react-intl';
+import {Platform, ScrollView, Text, View} from 'react-native';
+import {SafeAreaView, useSafeAreaInsets, type Edge} from 'react-native-safe-area-context';
 
+import {Screens} from '@constants';
+import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {popTopScreen} from '@screens/navigation';
+import {useWindowDimensions} from '@hooks/device';
+import {navigateBack} from '@screens/navigation';
+import CallbackStore from '@store/callback_store';
+import {makeStyleSheetFromTheme} from '@utils/theme';
+import {typography} from '@utils/typography';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
+// Per-side padding applied by styles.fullHeight below.
+const TABLE_PADDING_HORIZONTAL = 5;
 
-type Props = {
-    componentId: AvailableScreens;
+// Total width the padding removes: one TABLE_PADDING_HORIZONTAL on each side.
+const TABLE_HORIZONTAL_INSET = TABLE_PADDING_HORIZONTAL * 2;
+
+export type TableScreenProps = {
     renderAsFlex: boolean;
-    renderRows: (isFullView: boolean) => JSX.Element|null;
     width: number;
 }
 
-const styles = StyleSheet.create({
+// The navigation header already accounts for the top inset
+const SAFE_AREA_EDGES: Edge[] = ['bottom', 'left', 'right'];
+
+const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     container: {
         flex: 1,
     },
     fullHeight: {
         height: '100%',
+        paddingHorizontal: TABLE_PADDING_HORIZONTAL,
     },
-    displayFlex: {
-        ...Platform.select({
-            android: {
-                flex: 1,
-            },
-            ios: {
-                flex: 0,
-            },
-        }),
+    noTableText: {
+        color: theme.dndIndicator,
+        ...typography('Body', 200, 'Regular'),
     },
-});
+    noTableContainer: {
+        padding: 24,
+    },
+}));
 
-const Table = ({componentId, renderAsFlex, renderRows, width}: Props) => {
-    const content = renderRows(true);
-    const viewStyle = renderAsFlex ? styles.displayFlex : {width};
+const Table = ({renderAsFlex, width}: TableScreenProps) => {
+    const contentCallback = CallbackStore.getCallback<(isFullView: boolean) => React.ReactNode>();
+    const content = contentCallback?.(true);
+    const intl = useIntl();
+    const theme = useTheme();
+    const styles = getStyleSheet(theme);
+    const {width: windowWidth} = useWindowDimensions();
+    const insets = useSafeAreaInsets();
 
-    const close = useCallback(() => {
-        popTopScreen(componentId);
-    }, [componentId]);
+    // iOS: flex:1 inside a vertical ScrollView leaves content width ambiguous
+    // and clips wrapped multi-column tables. Size to the safe viewport.
+    // Android already nests a horizontal ScrollView and must keep its previous
+    // flex:1 / explicit-width behavior so production layout does not change.
+    let viewStyle: {width: number} | {flex: number} = {width};
+    if (renderAsFlex) {
+        viewStyle = Platform.OS === 'android' ? {flex: 1} : {
+            width: windowWidth - insets.left - insets.right - TABLE_HORIZONTAL_INSET,
+        };
+    }
 
-    useAndroidHardwareBackHandler(componentId, close);
+    useEffect(() => {
+        return () => {
+            CallbackStore.removeCallback();
+        };
+    }, []);
+
+    useAndroidHardwareBackHandler(Screens.TABLE, navigateBack);
+
+    if (!content) {
+        return (
+            <View style={styles.noTableContainer}>
+                <Text style={styles.noTableText}>{intl.formatMessage({id: 'table.cannot_display_table', defaultMessage: 'Cannot display table'})}</Text>
+            </View>
+        );
+    }
 
     if (Platform.OS === 'android') {
         return (
-            <ScrollView testID='table.screen'>
-                <ScrollView
-                    contentContainerStyle={viewStyle}
-                    horizontal={true}
-                    testID='table.scroll_view'
-                >
-                    {content}
+            <View style={styles.container}>
+                <ScrollView testID='table.screen'>
+                    <ScrollView
+                        contentContainerStyle={viewStyle}
+                        horizontal={true}
+                        testID='table.scroll_view'
+                    >
+                        {content}
+                    </ScrollView>
                 </ScrollView>
-            </ScrollView>
+            </View>
         );
     }
 
     return (
         <SafeAreaView
+            edges={SAFE_AREA_EDGES}
             style={styles.container}
             testID='table.screen'
         >

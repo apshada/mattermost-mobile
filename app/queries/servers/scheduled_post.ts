@@ -1,0 +1,122 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {Database, Q, type Query} from '@nozbe/watermelondb';
+import {combineLatest, of as of$} from 'rxjs';
+import {switchMap, distinctUntilChanged} from 'rxjs/operators';
+
+import {MM_TABLES} from '@constants/database';
+
+import {getConfigValue, getLicense, observeConfigBooleanValue, observeLicense} from './system';
+
+import type ScheduledPostModel from '@typings/database/models/servers/scheduled_post';
+const {SERVER: {CHANNEL, SCHEDULED_POST}} = MM_TABLES;
+
+export const queryScheduledPostsForTeam = (database: Database, teamId: string, includeDirectChannelPosts?: boolean) => {
+    return database.get<ScheduledPostModel>(SCHEDULED_POST).query(
+        Q.on(CHANNEL,
+            Q.or(
+                Q.where('team_id', teamId),
+                ...(includeDirectChannelPosts ? [
+                    Q.where('team_id', ''), // Direct messages
+                ] : []),
+            ),
+        ),
+        Q.sortBy('scheduled_at', Q.asc),
+    );
+};
+
+export const queryScheduledPost = (database: Database, channelId: string, rootId = '') => {
+    return database.get<ScheduledPostModel>(SCHEDULED_POST).query(
+        Q.and(
+            Q.where('channel_id', channelId),
+            Q.where('root_id', rootId),
+        ),
+    );
+};
+
+export function observeFirstScheduledPost(v: ScheduledPostModel[]) {
+    return v[0]?.observe() || of$(undefined);
+}
+
+export const observeScheduledPostsForTeam = (database: Database, teamId: string, includeDirectChannelPosts?: boolean) => {
+    return queryScheduledPostsForTeam(database, teamId, includeDirectChannelPosts).observeWithColumns(['update_at', 'error_code']);
+};
+
+export const observeScheduledPostCount = (database: Database, teamId: string, includeDirectChannelPosts?: boolean) => {
+    return queryScheduledPostsForTeam(database, teamId, includeDirectChannelPosts).observeCount();
+};
+
+export const observeScheduledPostById = (database: Database, scheduledPostId: string) => {
+    return database.get<ScheduledPostModel>(SCHEDULED_POST).
+        query(Q.where('id', scheduledPostId)).observe().pipe(
+            switchMap((scheduledPosts) => observeFirstScheduledPost(scheduledPosts)),
+        );
+};
+
+// A weekly series always has a next occurrence, so recurring posts alone would pin the indicator
+// forever. Like the webapp, the indicator count is 0 unless at least one post is one-time.
+const observeIndicatorCount = (query: Query<ScheduledPostModel>) => {
+    return query.observeWithColumns(['repeat_type']).pipe(
+        switchMap((posts) => of$(posts.some((post) => post.repeatType !== 'weekly') ? posts.length : 0)),
+        distinctUntilChanged(),
+    );
+};
+
+export const observeScheduledPostCountForChannel = (
+    database: Database,
+    channelId: string,
+    isCRTEnabled: boolean,
+) => {
+    let query = database.get<ScheduledPostModel>(SCHEDULED_POST).query(
+        Q.and(
+            Q.where('channel_id', channelId),
+            Q.where('error_code', ''),
+        ),
+    );
+
+    if (isCRTEnabled) {
+        query = query.extend(Q.where('root_id', ''));
+    }
+
+    return observeIndicatorCount(query);
+};
+
+export const observeScheduledPostCountForThread = (database: Database, rootId: string) => {
+    return observeIndicatorCount(database.get<ScheduledPostModel>(SCHEDULED_POST).query(
+        Q.and(
+            Q.where('root_id', rootId),
+            Q.where('error_code', ''),
+        ),
+    ));
+};
+
+export const observeScheduledPostEnabled = (database: Database) => {
+    const isScheduledPostConfigEnabled = observeConfigBooleanValue(database, 'ScheduledPosts');
+    const isLicensed = observeLicense(database);
+
+    const isScheduledPostEnabled = combineLatest([isScheduledPostConfigEnabled, isLicensed]).pipe(
+        switchMap(([isEnabled, license]) => {
+            if (license?.IsLicensed === 'true') {
+                return of$(isEnabled);
+            }
+            return of$(false);
+        }),
+        distinctUntilChanged(),
+    );
+
+    return isScheduledPostEnabled;
+};
+
+// Recurrence only needs the feature flag on top of the scheduled-post enablement the entry points
+// already apply, so this stays a pure flag check rather than duplicating the config/license checks.
+// The flag is still default-off and has no announced removal release, so it cannot use the
+// removed-version helpers in @queries/servers/features; move it there once the server GAs the feature
+// and drops the flag from the client config.
+export const observeRecurringScheduledPostsEnabled = (database: Database) => {
+    return observeConfigBooleanValue(database, 'FeatureFlagRecurringScheduledPosts');
+};
+
+export const getIsScheduledPostEnabled = async (database: Database) => {
+    return (await getConfigValue(database, 'ScheduledPosts')) === 'true' && (await getLicense(database))?.IsLicensed === 'true';
+};

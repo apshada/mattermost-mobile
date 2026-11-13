@@ -1,16 +1,16 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {type ReactElement} from 'react';
+import React from 'react';
 
-type MarkdownList = {
-   children: ReactElement[];
+type MarkdownListProps = {
+   children: Array<React.ReactElement<any>>;
    ordered: boolean;
    start: number;
    tight: boolean;
 };
 
-const MarkdownList = ({start = 1, tight, ordered, children}: MarkdownList) => {
+const MarkdownList = ({start = 1, tight, ordered, children}: MarkdownListProps) => {
     let bulletWidth = 15;
     if (ordered) {
         const lastNumber = (start + children.length) - 1;

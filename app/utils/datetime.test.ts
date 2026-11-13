@@ -1,0 +1,299 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {Platform} from 'react-native';
+
+import {getIntlShape} from '@utils/general';
+
+import {formatTime, getReadableTimestamp, isSameDate, isSameMonth, isSameYear, isToday, isYesterday, parseTimeString, toValidMinuteInterval} from './datetime';
+
+describe('Datetime', () => {
+    test('isSameDate (isSameMonth / isSameYear)', () => {
+        expect(isSameDate(new Date('2024-03-28 02:23:27'), new Date('2025-03-28 02:23:27'))).toBe(false);
+        expect(isSameDate(new Date('2024-03-28 02:23:27'), new Date('2024-02-28 02:23:27'))).toBe(false);
+        expect(isSameDate(new Date('2024-03-28 02:23:27'), new Date('2024-03-18 02:23:27'))).toBe(false);
+        expect(isSameDate(new Date('2024-03-28 02:23:27'), new Date('2024-03-28 00:00:00'))).toBe(true);
+        expect(isSameDate(new Date('2024-03-28 02:23:27'))).toBe(false);
+        expect(isSameDate(new Date())).toBe(true);
+    });
+
+    test('isSameMonth with default', () => {
+        expect(isSameMonth(new Date('2024-03-28 02:23:27'))).toBe(false);
+        expect(isSameMonth(new Date())).toBe(true);
+    });
+
+    test('isSameYear with default', () => {
+        expect(isSameYear(new Date('2022-03-28 02:23:27'))).toBe(false);
+        expect(isSameYear(new Date())).toBe(true);
+    });
+
+    test('isToday', () => {
+        expect(isToday(new Date('2024-03-28 02:23:27'))).toBe(false);
+        expect(isToday(new Date())).toBe(true);
+    });
+
+    test('isYesteday', () => {
+        expect(isYesterday(new Date('2024-03-28 02:23:27'))).toBe(false);
+        const today = new Date();
+        today.setDate(today.getDate() - 1);
+        expect(isYesterday(today)).toBe(true);
+    });
+});
+
+describe('getReadableTimestamp', () => {
+    beforeAll(() => {
+        jest.useFakeTimers();
+        jest.setSystemTime(new Date('2025-06-15T12:00:00Z'));
+    });
+
+    afterAll(() => {
+        jest.useRealTimers();
+    });
+
+    it('should format timestamp correctly in 12-hour format for current year', () => {
+        const timestamp = new Date('2025-06-15T12:00:00Z').getTime();
+        const timeZone = 'America/New_York';
+        const result = getReadableTimestamp(timestamp, timeZone, false, 'en-US');
+        expect(result).toBe('Jun 15, 8:00 AM');
+    });
+
+    it('should format timestamp correctly in 24-hour format for current year', () => {
+        const timestamp = new Date('2025-06-15T12:00:00Z').getTime();
+        const timeZone = 'America/New_York';
+        const result = getReadableTimestamp(timestamp, timeZone, true, 'en-US');
+        expect(result).toBe('Jun 15, 08:00');
+    });
+
+    it('should include year if not current year', () => {
+        const timestamp = new Date('2024-06-15T12:00:00Z').getTime();
+        const timeZone = 'America/New_York';
+        const result = getReadableTimestamp(timestamp, timeZone, false, 'en-US');
+        expect(result).toBe('Jun 15, 2024, 8:00 AM');
+    });
+
+    it('should include year if not current year in 24-hour format', () => {
+        const timestamp = new Date('2024-06-15T12:00:00Z').getTime();
+        const timeZone = 'America/New_York';
+        const result = getReadableTimestamp(timestamp, timeZone, true, 'en-US');
+        expect(result).toBe('Jun 15, 2024, 08:00');
+    });
+
+    it('should format timestamp correctly for different locales', () => {
+        const timestamp = new Date('2025-06-15T12:00:00Z').getTime();
+        const timeZone = 'America/New_York';
+
+        const frResult = getReadableTimestamp(timestamp, timeZone, false, 'fr-FR');
+        expect(frResult).toBe('15 juin, 8:00 AM');
+
+        const deResult = getReadableTimestamp(timestamp, timeZone, false, 'de-DE');
+        expect(deResult).toBe('15. Juni, 8:00 AM');
+    });
+});
+
+describe('formatTime', () => {
+    it('should format seconds only', () => {
+        expect(formatTime(30)).toBe('0:30');
+        expect(formatTime(5)).toBe('0:05');
+        expect(formatTime(59)).toBe('0:59');
+    });
+
+    it('should format minutes and seconds', () => {
+        expect(formatTime(90)).toBe('1:30');
+        expect(formatTime(125)).toBe('2:05');
+        expect(formatTime(3599)).toBe('59:59');
+    });
+
+    it('should format hours, minutes, and seconds', () => {
+        expect(formatTime(3600)).toBe('1:00:00');
+        expect(formatTime(3661)).toBe('1:01:01');
+        expect(formatTime(7325)).toBe('2:02:05');
+        expect(formatTime(36000)).toBe('10:00:00');
+    });
+
+    it('should handle zero seconds', () => {
+        expect(formatTime(0)).toBe('0:00');
+    });
+
+    it('should handle negative values by treating them as zero', () => {
+        expect(formatTime(-30)).toBe('0:00');
+        expect(formatTime(-3600)).toBe('0:00');
+    });
+
+    it('should pad minutes with zero when hours are present', () => {
+        expect(formatTime(3605)).toBe('1:00:05');
+        expect(formatTime(3665)).toBe('1:01:05');
+    });
+
+    it('should not pad minutes with zero when no hours', () => {
+        expect(formatTime(65)).toBe('1:05');
+        expect(formatTime(605)).toBe('10:05');
+    });
+
+    describe('text time format', () => {
+        const intl = getIntlShape();
+
+        it('should format seconds only in text time format', () => {
+            expect(formatTime(30, true, intl)).toBe('30s');
+            expect(formatTime(5, true, intl)).toBe('5s');
+            expect(formatTime(59, true, intl)).toBe('59s');
+        });
+
+        it('should format minutes and seconds in text time format', () => {
+            expect(formatTime(90, true, intl)).toBe('1m 30s');
+            expect(formatTime(125, true, intl)).toBe('2m 5s');
+            expect(formatTime(3599, true, intl)).toBe('59m 59s');
+        });
+
+        it('should format hours, minutes, and seconds in text time format', () => {
+            expect(formatTime(3600, true, intl)).toBe('1h');
+            expect(formatTime(3661, true, intl)).toBe('1h 1m 1s');
+            expect(formatTime(7325, true, intl)).toBe('2h 2m 5s');
+            expect(formatTime(36000, true, intl)).toBe('10h');
+        });
+
+        it('should format hours and minutes only in text time format', () => {
+            expect(formatTime(3660, true, intl)).toBe('1h 1m');
+            expect(formatTime(7200, true, intl)).toBe('2h');
+        });
+
+        it('should format hours and seconds only in text time format', () => {
+            expect(formatTime(3605, true, intl)).toBe('1h 5s');
+        });
+
+        it('should format minutes only in text time format', () => {
+            expect(formatTime(60, true, intl)).toBe('1m');
+            expect(formatTime(120, true, intl)).toBe('2m');
+        });
+
+        it('should handle zero seconds in text time format', () => {
+            expect(formatTime(0, true, intl)).toBe('0s');
+        });
+
+        it('should handle negative values in text time format', () => {
+            expect(formatTime(-30, true, intl)).toBe('0s');
+            expect(formatTime(-3600, true, intl)).toBe('0s');
+        });
+    });
+});
+
+describe('parseTimeString', () => {
+    it('parses 24-hour "HH:MM" time', () => {
+        expect(parseTimeString('13:40')).toEqual({hours: 13, minutes: 40});
+    });
+
+    it('parses 24-hour "H:MM" time', () => {
+        expect(parseTimeString('9:05')).toEqual({hours: 9, minutes: 5});
+    });
+
+    it('parses 12-hour time with pm suffix', () => {
+        expect(parseTimeString('1:30pm')).toEqual({hours: 13, minutes: 30});
+    });
+
+    it('parses 12-hour time with space before suffix and uppercase', () => {
+        expect(parseTimeString('1:30 PM')).toEqual({hours: 13, minutes: 30});
+    });
+
+    it('parses short-form pm like "2pm"', () => {
+        expect(parseTimeString('2pm')).toEqual({hours: 14, minutes: 0});
+    });
+
+    it('parses "12am" as midnight (00:00)', () => {
+        expect(parseTimeString('12am')).toEqual({hours: 0, minutes: 0});
+    });
+
+    it('parses "12pm" as noon (12:00)', () => {
+        expect(parseTimeString('12pm')).toEqual({hours: 12, minutes: 0});
+    });
+
+    it('parses "12:30am" as 00:30', () => {
+        expect(parseTimeString('12:30am')).toEqual({hours: 0, minutes: 30});
+    });
+
+    it('rejects "13:00pm" (24-hour value with pm suffix)', () => {
+        expect(parseTimeString('13:00pm')).toBeNull();
+    });
+
+    it('rejects "0am" (0 with am suffix)', () => {
+        expect(parseTimeString('0am')).toBeNull();
+    });
+
+    it('returns null for empty string', () => {
+        expect(parseTimeString('')).toBeNull();
+    });
+
+    it('returns null for whitespace-only string', () => {
+        expect(parseTimeString('   ')).toBeNull();
+    });
+
+    it('returns null for garbage input', () => {
+        expect(parseTimeString('not a time')).toBeNull();
+    });
+
+    it('returns null when hours are out of range', () => {
+        expect(parseTimeString('25:00')).toBeNull();
+    });
+
+    it('returns null when minutes are out of range', () => {
+        expect(parseTimeString('10:60')).toBeNull();
+    });
+
+    it('trims surrounding whitespace', () => {
+        expect(parseTimeString('  14:30  ')).toEqual({hours: 14, minutes: 30});
+    });
+
+    it('is case-insensitive for the am/pm suffix', () => {
+        expect(parseTimeString('2:15AM')).toEqual({hours: 2, minutes: 15});
+        expect(parseTimeString('2:15Pm')).toEqual({hours: 14, minutes: 15});
+    });
+
+    it('accepts midnight as 00:00 in 24-hour format', () => {
+        expect(parseTimeString('00:00')).toEqual({hours: 0, minutes: 0});
+    });
+
+    it('accepts 23:59 in 24-hour format', () => {
+        expect(parseTimeString('23:59')).toEqual({hours: 23, minutes: 59});
+    });
+
+    it('returns null for missing minutes in colon form (e.g. "14:")', () => {
+        expect(parseTimeString('14:')).toBeNull();
+    });
+
+    it('returns null for partial minutes (single-digit)', () => {
+        expect(parseTimeString('14:3')).toBeNull();
+    });
+});
+
+describe('toValidMinuteInterval', () => {
+    it('should return the interval unchanged when it is supported', () => {
+        for (const interval of [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]) {
+            expect(toValidMinuteInterval(interval)).toBe(interval);
+        }
+    });
+
+    it('should clamp unsupported intervals to 30', () => {
+        expect(toValidMinuteInterval(60)).toBe(30);
+        expect(toValidMinuteInterval(45)).toBe(30);
+        expect(toValidMinuteInterval(7)).toBe(30);
+        expect(toValidMinuteInterval(0)).toBe(30);
+        expect(toValidMinuteInterval(-10)).toBe(30);
+    });
+
+    it('should clamp to 30 when no interval is provided', () => {
+        expect(toValidMinuteInterval()).toBe(30);
+    });
+
+    it('should honor supported intervals on Android (regression MM-10094)', () => {
+        // Regression: the old Android branch returned 30 unconditionally, so supported
+        // intervals like 10 and 15 were silently clamped. Jest defaults to Platform.OS='ios',
+        // so this case must explicitly run as android to catch the regression.
+        const origOS = Platform.OS;
+        Platform.OS = 'android';
+        try {
+            expect(toValidMinuteInterval(10)).toBe(10);
+            expect(toValidMinuteInterval(15)).toBe(15);
+            expect(toValidMinuteInterval(60)).toBe(30);
+        } finally {
+            Platform.OS = origOS;
+        }
+    });
+});

@@ -1,78 +1,49 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {BottomSheetFlatList} from '@gorhom/bottom-sheet';
-import React, {useCallback, useRef, useState} from 'react';
-import {useIntl} from 'react-intl';
-import {Keyboard, type ListRenderItemInfo, type NativeScrollEvent, type NativeSyntheticEvent, PanResponder} from 'react-native';
-import {FlatList} from 'react-native-gesture-handler';
+import {useBottomSheetScrollableCreator} from '@gorhom/bottom-sheet';
+import React, {useCallback} from 'react';
+import {type ListRenderItemInfo, FlatList} from 'react-native';
 
 import UserItem from '@components/user_item';
-import {Screens} from '@constants';
-import {useTheme} from '@context/theme';
-import {dismissBottomSheet, openAsBottomSheet} from '@screens/navigation';
+import {dismissBottomSheet} from '@screens/navigation';
+import {openUserProfile} from '@utils/navigation';
 
 import type UserModel from '@typings/database/models/servers/user';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type Props = {
-    channelId: string;
-    location: string;
-    type?: BottomSheetList;
+    channelId?: string;
+    location: AvailableScreens;
     users: UserModel[];
 };
 
 type ItemProps = {
-    channelId: string;
-    location: string;
+    channelId?: string;
+    location: AvailableScreens;
     user: UserModel;
 }
 
 const Item = ({channelId, location, user}: ItemProps) => {
-    const intl = useIntl();
-    const theme = useTheme();
-
-    const openUserProfile = useCallback(async (u: UserModel | UserProfile) => {
-        await dismissBottomSheet(Screens.BOTTOM_SHEET);
-        const screen = Screens.USER_PROFILE;
-        const title = intl.formatMessage({id: 'mobile.routes.user_profile', defaultMessage: 'Profile'});
-        const closeButtonId = 'close-user-profile';
-        const props = {closeButtonId, location, userId: u.id, channelId};
-
-        Keyboard.dismiss();
-        openAsBottomSheet({screen, title, theme, closeButtonId, props});
-    }, [location, channelId, theme, intl]);
+    const openProfile = useCallback(async (u: UserModel | UserProfile) => {
+        await dismissBottomSheet();
+        openUserProfile({
+            userId: u.id,
+            channelId,
+            location,
+        });
+    }, [location, channelId]);
 
     return (
         <UserItem
             user={user}
-            onUserPress={openUserProfile}
+            onUserPress={openProfile}
         />
     );
 };
 
-const UsersList = ({channelId, location, type = 'FlatList', users}: Props) => {
-    const [enabled, setEnabled] = useState(type === 'BottomSheetFlatList');
-    const [direction, setDirection] = useState<'down' | 'up'>('down');
-    const listRef = useRef<FlatList>(null);
-    const prevOffset = useRef(0);
-    const panResponder = useRef(PanResponder.create({
-        onMoveShouldSetPanResponderCapture: (evt, g) => {
-            const dir = prevOffset.current < g.dy ? 'down' : 'up';
-            prevOffset.current = g.dy;
-            if (!enabled && dir === 'up') {
-                setEnabled(true);
-            }
-            setDirection(dir);
-            return false;
-        },
-    })).current;
-
-    const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
-        if (e.nativeEvent.contentOffset.y <= 0 && enabled && direction === 'down') {
-            setEnabled(false);
-            listRef.current?.scrollToOffset({animated: true, offset: 0});
-        }
-    }, [enabled, direction]);
+const UsersList = ({channelId, location, users}: Props) => {
+    const BottomSheetScrollableCreator = useBottomSheetScrollableCreator();
 
     const renderItem = useCallback(({item}: ListRenderItemInfo<UserModel>) => (
         <Item
@@ -82,26 +53,12 @@ const UsersList = ({channelId, location, type = 'FlatList', users}: Props) => {
         />
     ), [channelId, location]);
 
-    if (type === 'BottomSheetFlatList') {
-        return (
-            <BottomSheetFlatList
-                data={users}
-                renderItem={renderItem}
-                overScrollMode={'always'}
-            />
-        );
-    }
-
     return (
         <FlatList
             data={users}
-            ref={listRef}
             renderItem={renderItem}
-            onScroll={onScroll}
             overScrollMode={'always'}
-            scrollEnabled={enabled}
-            scrollEventThrottle={60}
-            {...panResponder.panHandlers}
+            renderScrollComponent={BottomSheetScrollableCreator}
         />
     );
 };

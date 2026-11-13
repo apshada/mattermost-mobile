@@ -74,7 +74,7 @@ const ChannelListItem = ({
 
     const handleOnPress = useCallback(() => {
         onPress(channel.id);
-    }, [channel.id]);
+    }, [channel.id, onPress]);
 
     const textStyles = useMemo(() => [
         textStyle.regular,
@@ -102,7 +102,10 @@ const ChannelListItem = ({
     }
 
     return (
-        <TouchableOpacity onPress={handleOnPress}>
+        <TouchableOpacity
+            testID={`channel_item.${channel.name}`}
+            onPress={handleOnPress}
+        >
             <>
                 <View style={containerStyle}>
                     <View style={styles.wrapper}>

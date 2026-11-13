@@ -1,4 +1,4 @@
-# Server Database - Schema Version 2
+# Server Database - Schema Version 24
 # Please bump the version by 1, any time the schema changes.
 # Also, include the migration plan under app/database/migration/server,
 # update all models, relationships and types.
@@ -39,6 +39,9 @@ shared bool
 team_id string INDEX FK >- Team.id
 type string
 update_at number
+banner_info string
+abac_policy_enforced boolean
+autotranslation boolean
 
 
 ChannelInfo
@@ -64,6 +67,28 @@ id PK string # auto-generated
 name string
 
 
+CustomProfileField
+-
+id PK string # server-generated
+group_id string
+name string
+type string
+target_id string
+target_type string
+create_at number
+update_at number
+delete_at number
+attrs string NULL # stringified JSON
+
+
+CustomProfileAttribute
+-
+id PK string # composition ID User.id-CustomProfileField.id
+field_id string INDEX FK >- CustomProfileField.id
+user_id string INDEX FK >- User.id
+value string
+
+
 Draft
 -
 id PK string # auto-generated
@@ -71,6 +96,25 @@ channel_id string  INDEX FK >- Channel.id
 files string #stringify (array)
 message string
 root_id string INDEX NULL FK >- Post.id
+type string NULL
+
+
+ScheduledPost
+-
+id PK string # auto-generated
+channel_id string  INDEX FK >- Channel.id
+files string #stringify (array)
+message string
+root_id string INDEX NULL FK >- Post.id
+metadata string NULL
+create_at number
+update_at number
+scheduled_at number
+processed_at number NULL
+error_code string
+type string NULL
+repeat_type string
+repeat_timezone string
 
 
 File
@@ -85,6 +129,7 @@ name string
 post_id string INDEX FK >- Post.id
 size number
 width number
+is_blocked bool #Determines if a file has been blocked and cannot be opened anymore
 
 Group
 -
@@ -133,9 +178,12 @@ last_post_at number
 last_viewed_at number
 manually_unread boolean
 mentions_count number
+urgent_mention_count number
 message_count number
 roles string
 viewed_at number
+autotranslation_disabled boolean
+redaction_required_epoch number
 
 
 MyChannelSettings
@@ -149,7 +197,82 @@ MyTeam
 id PK string FK - Team.id # same as Team.id
 roles string
 
+PlaybookRun
+-
+id PK string # server-generated
+playbook_id string
+name string
+description string
+is_active boolean
+active_stage number
+active_stage_title string
+participant_ids string # stringified array of user IDs
+summary string
+current_status string # (valid values InProgres, Finished)
+owner_user_id string INDEX FK >- User.id
+team_id string INDEX FK >- Team.id
+channel_id string INDEX FK >- Channel.id
+post_id string INDEX FK >- Post.id
+create_at number
+end_at number
+delete_at number
+last_status_update_at number
+retrospective_enabled boolean
+retrospective string
+retrospective_published_at number
+synced string NULL INDEX # optional field for sync status
+last_sync_at number NULL # optional field for last sync timestamp
 
+PlaybookChecklist
+-
+id PK string # server-generated
+run_id string INDEX FK >- PlaybookRun.id
+title string
+sort_order number
+synced string NULL INDEX # optional field for sync status
+last_sync_at number NULL # optional field for last sync timestamp
+
+PlaybookChecklistItem
+-
+id PK string # server-generated
+checklist_id string INDEX FK >- PlaybookChecklist.id
+title string
+description string
+state string # e.g., 'open', 'closed'
+state_modified number
+assignee_id string INDEX FK >- User.id
+assignee_modified number
+command string
+command_last_run number
+due_date number
+task_actions string # stringified array of TaskAction
+requirements string NULL # stringified array of TaskRequirement ({id, label, value})
+condition_action string # condition action for the checklist item (values should be '' or 'hidden')
+condition_reason string # condition reason for the checklist item (default empty string meaning there is no condition affecting)
+order number
+completed_at number
+synced string NULL INDEX # optional field for sync status
+last_sync_at number NULL # optional field for last sync timestamp
+
+PlaybookRunAttribute
+-
+id PK string # server-generated
+group_id string
+name string
+type string
+target_id string
+target_type string
+create_at number
+update_at number
+delete_at number
+attrs string NULL # stringified JSON
+
+PlaybookRunAttributeValue
+-
+id PK string # composition ID PlaybookRun.id-PlaybookRunAttribute.id
+attribute_id string INDEX FK >- PlaybookRunAttribute.id
+run_id string INDEX FK >- PlaybookRun.id
+value string
 
 Post
 -
@@ -165,8 +288,9 @@ original_id string
 pending_post_id string INDEX
 previous_post_id string
 props string
+redaction_verified_epoch number
 root_id string
-type string
+type string INDEX
 update_at number
 user_id string INDEX  FK >- User.id
 
@@ -303,4 +427,84 @@ roles string
 status string
 timezone string
 update_at number
-username string 
+username string
+
+
+AiBot
+-
+id PK string
+display_name string
+username string
+last_icon_update number
+dm_channel_id string INDEX
+channel_access_level number
+channel_ids string
+user_access_level number
+user_ids string
+team_ids string
+
+
+AiThread
+-
+id PK string
+message string
+title string
+channel_id string INDEX FK >- Channel.id
+reply_count number
+update_at number INDEX
+
+
+BoardView
+-
+# WatermelonDB table name is BoardView; the domain model class is BoardViewModel.
+# "BoardView" avoids collision with SQL's reserved VIEW keyword (and with React Native's View) and encodes the boards semantics.
+id PK string # server-generated
+channel_id string INDEX FK >- Channel.id
+type string # 'kanban'
+creator_id string FK >- User.id
+title string
+description string
+sort_order number
+props string # JSON
+create_at number
+update_at number INDEX
+delete_at number # soft-delete, 0 when active
+
+
+PropertyField
+-
+# Definition of a card (or other object) property. Shared infrastructure reused by future property-based features.
+id PK string # server-generated
+group_id string # opaque; resolved server-side
+name string
+type string # 'text' | 'select' | 'multiselect' | ...
+attrs string # JSON (options, sort_order, ...)
+object_type string # 'card' | 'post' | 'user'
+target_id string INDEX # scope target (channel/team id, empty for system)
+target_type string # 'system' | 'team' | 'channel'
+protected boolean
+permission_field string
+permission_values string # JSON
+permission_options string # JSON
+create_at number
+update_at number INDEX
+delete_at number # soft-delete, 0 when active
+created_by string FK >- User.id
+updated_by string FK >- User.id
+
+
+PropertyValue
+-
+# Single object's value for a single PropertyField.
+# target_id is polymorphic (keyed by target_type); no typed WatermelonDB relation is declared for it.
+id PK string # server-generated
+field_id string INDEX FK >- PropertyField.id
+target_id string INDEX # polymorphic target
+target_type string # 'post' | 'user' | ...
+group_id string
+value string # JSON (shape depends on field type)
+create_at number
+update_at number
+delete_at number # soft-delete, 0 when active
+created_by string FK >- User.id
+updated_by string FK >- User.id

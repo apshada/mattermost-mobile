@@ -2,30 +2,32 @@
 // See LICENSE.txt for license information.
 
 import {useManagedConfig} from '@mattermost/react-native-emm';
-import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {useIntl} from 'react-intl';
-import {Alert, BackHandler, Platform, useWindowDimensions, View} from 'react-native';
-import {KeyboardAwareScrollView} from 'react-native-keyboard-aware-scroll-view';
-import {Navigation} from 'react-native-navigation';
-import Animated, {ReduceMotion, useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import {useNavigation} from 'expo-router';
+import React, {useCallback, useEffect, useState} from 'react';
+import {defineMessage, useIntl} from 'react-intl';
+import {Alert, BackHandler, View} from 'react-native';
+import {KeyboardAwareScrollView} from 'react-native-keyboard-controller';
+import Animated from 'react-native-reanimated';
+import urlParse from 'url-parse';
 
 import {doPing} from '@actions/remote/general';
 import {fetchConfigAndLicense} from '@actions/remote/systems';
 import LocalConfig from '@assets/config.json';
 import AppVersion from '@components/app_version';
-import {Screens, Launch} from '@constants';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {t} from '@i18n';
+import {Launch, DeepLink} from '@constants';
+import useDidMount from '@hooks/did_mount';
+import {useScreenTransitionAnimation} from '@hooks/screen_transition_animation';
 import {getServerCredentials} from '@init/credentials';
 import PushNotifications from '@init/push_notifications';
 import NetworkManager from '@managers/network_manager';
+import SecurityManager from '@managers/security_manager';
 import {getServerByDisplayName, getServerByIdentifier} from '@queries/app/servers';
 import Background from '@screens/background';
-import {dismissModal, goToScreen, loginAnimationOptions, popTopScreen} from '@screens/navigation';
-import {getErrorMessage} from '@utils/errors';
+import {navigateBack, navigateToScreen} from '@screens/navigation';
+import EphemeralStore from '@store/ephemeral_store';
+import {getErrorMessage, preauthSecretInvalidMessage} from '@utils/errors';
 import {canReceiveNotifications} from '@utils/push_proxy';
-import {loginOptions} from '@utils/server';
+import {getLoginScreen, loginOptions} from '@utils/server';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {getServerUrlAfterRedirect, isValidUrl, sanitizeUrl} from '@utils/url';
 
@@ -33,43 +35,41 @@ import ServerForm from './form';
 import ServerHeader from './header';
 
 import type {DeepLinkWithData, LaunchProps} from '@typings/launch';
-import type {AvailableScreens} from '@typings/screens/navigation';
 
 interface ServerProps extends LaunchProps {
     animated?: boolean;
-    closeButtonId?: string;
-    componentId: AvailableScreens;
     isModal?: boolean;
     theme: Theme;
 }
 
 let cancelPing: undefined | (() => void);
 
-const defaultServerUrlMessage = {
-    id: t('mobile.server_url.empty'),
+const defaultServerUrlMessage = defineMessage({
+    id: 'mobile.server_url.empty',
     defaultMessage: 'Please enter a valid server URL',
-};
+});
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     appInfo: {
         color: changeOpacity(theme.centerChannelColor, 0.56),
+    },
+    appVersionContainer: {
+        alignItems: 'center',
+        paddingHorizontal: 20,
+        marginTop: 24,
     },
     flex: {
         flex: 1,
     },
     scrollContainer: {
         alignItems: 'center',
-        height: '90%',
+        flexGrow: 1,
         justifyContent: 'center',
     },
 }));
 
-const AnimatedSafeArea = Animated.createAnimatedComponent(SafeAreaView);
-
 const Server = ({
     animated,
-    closeButtonId,
-    componentId,
     displayName: defaultDisplayName,
     extra,
     isModal,
@@ -78,26 +78,24 @@ const Server = ({
     serverUrl: defaultServerUrl,
     theme,
 }: ServerProps) => {
+    const navigation = useNavigation();
     const intl = useIntl();
     const managedConfig = useManagedConfig<ManagedConfig>();
-    const dimensions = useWindowDimensions();
-    const translateX = useSharedValue(animated ? dimensions.width : 0);
-    const keyboardAwareRef = useRef<KeyboardAwareScrollView>(null);
     const [connecting, setConnecting] = useState(false);
     const [displayName, setDisplayName] = useState<string>('');
     const [buttonDisabled, setButtonDisabled] = useState(true);
+    const [preauthSecret, setPreauthSecret] = useState<string>('');
     const [url, setUrl] = useState<string>('');
     const [displayNameError, setDisplayNameError] = useState<string | undefined>();
     const [urlError, setUrlError] = useState<string | undefined>();
+    const [preauthSecretError, setPreauthSecretError] = useState<string | undefined>();
+    const [showAdvancedOptions, setShowAdvancedOptions] = useState<boolean>(false);
     const styles = getStyleSheet(theme);
     const {formatMessage} = intl;
     const disableServerUrl = Boolean(managedConfig?.allowOtherServers === 'false' && managedConfig?.serverUrl);
     const additionalServer = launchType === Launch.AddServerFromDeepLink || launchType === Launch.AddServer;
 
-    const dismiss = () => {
-        NetworkManager.invalidateClient(url);
-        dismissModal({componentId});
-    };
+    const animatedStyles = useScreenTransitionAnimation(animated);
 
     useEffect(() => {
         let serverName: string | undefined = defaultDisplayName || managedConfig?.serverName || LocalConfig.DefaultServerName;
@@ -136,60 +134,66 @@ const Server = ({
             // If no other servers are allowed or the local config for AutoSelectServerUrl is set, attempt to connect
             handleConnect(managedConfig?.serverUrl || LocalConfig.DefaultServerUrl);
         }
-    }, [managedConfig?.allowOtherServers, managedConfig?.serverUrl, managedConfig?.serverName]);
+
+        // We only want to handle connect when a smaller set of variables change
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [managedConfig?.allowOtherServers, managedConfig?.serverUrl, managedConfig?.serverName, defaultServerUrl]);
 
     useEffect(() => {
-        if (url && displayName) {
+        if (url && displayName && !urlError && !preauthSecretError) {
             setButtonDisabled(false);
         } else {
             setButtonDisabled(true);
         }
-    }, [url, displayName]);
+    }, [url, displayName, urlError, preauthSecretError]);
 
     useEffect(() => {
-        const listener = {
-            componentDidAppear: () => {
-                translateX.value = 0;
+        const unsubscribe = navigation.addListener('beforeRemove', (e) => {
+            if (e.data.action.type === 'POP' || e.data.action.type === 'GO_BACK') {
                 if (url) {
                     NetworkManager.invalidateClient(url);
                 }
-            },
-            componentDidDisappear: () => {
-                translateX.value = -dimensions.width;
-            },
-        };
-        const unsubscribe = Navigation.events().registerComponentListener(listener, componentId);
+            }
+        });
 
-        return () => unsubscribe.remove();
-    }, [componentId, url, dimensions]);
+        return unsubscribe;
+    }, [navigation, url]);
 
-    useEffect(() => {
+    useDidMount(() => {
         const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
             if (LocalConfig.ShowOnboarding && animated) {
-                popTopScreen(Screens.SERVER);
+                navigateBack();
                 return true;
             }
+
             if (isModal) {
-                dismiss();
+                navigateBack();
                 return true;
             }
 
             return false;
         });
 
-        PushNotifications.registerIfNeeded();
+        const registerTimeout = setTimeout(() => {
+            PushNotifications.registerIfNeeded();
+        }, 500);
 
-        return () => backHandler.remove();
-    }, []);
-
-    useEffect(() => {
-        translateX.value = 0;
-    }, []);
-
-    useNavButtonPressed(closeButtonId || '', componentId, dismiss, []);
+        return () => {
+            backHandler.remove();
+            clearTimeout(registerTimeout);
+        };
+    });
 
     const displayLogin = (serverUrl: string, config: ClientConfig, license: ClientLicense) => {
-        const {enabledSSOs, hasLoginForm, numberSSOs, ssoOptions} = loginOptions(config, license);
+        const {enabledSSOs, hasLoginForm, ssoOptions} = loginOptions(config, license);
+        const {screen, ssoType} = getLoginScreen(enabledSSOs, hasLoginForm);
+        const trimmedSecret = preauthSecret.trim();
+        if (trimmedSecret) {
+            // Not persisted until a session exists — keep out of Expo Router params.
+            EphemeralStore.setPendingPreauthSecret(serverUrl, trimmedSecret);
+        } else {
+            EphemeralStore.clearPendingPreauthSecret(serverUrl);
+        }
         const passProps = {
             config,
             extra,
@@ -200,17 +204,18 @@ const Server = ({
             serverDisplayName: displayName,
             serverUrl,
             ssoOptions,
+            ssoType,
             theme,
+            isModal,
         };
 
-        const redirectSSO = !hasLoginForm && numberSSOs === 1;
-        const screen = redirectSSO ? Screens.SSO : Screens.LOGIN;
-        if (redirectSSO) {
-            // @ts-expect-error ssoType not in definition
-            passProps.ssoType = enabledSSOs[0];
+        // if deeplink is of type server removing the deeplink info on new login
+        if (extra?.type === DeepLink.Server) {
+            passProps.extra = undefined;
+            passProps.launchType = Launch.Normal;
         }
 
-        goToScreen(screen, '', passProps, loginAnimationOptions());
+        navigateToScreen(screen, passProps);
         setConnecting(false);
         setButtonDisabled(false);
         setUrl(serverUrl);
@@ -269,6 +274,18 @@ const Server = ({
         setUrl(text);
     }, []);
 
+    const handlePreauthSecretTextChanged = useCallback((text: string) => {
+        setPreauthSecret(text);
+
+        // Clear any connection errors when preauth secret is modified
+        if (urlError) {
+            setUrlError(undefined);
+        }
+        if (preauthSecretError) {
+            setPreauthSecretError(undefined);
+        }
+    }, [urlError, preauthSecretError]);
+
     const isServerUrlValid = (serverUrl?: string) => {
         const testUrl = sanitizeUrl(serverUrl ?? url);
         if (!isValidUrl(testUrl)) {
@@ -281,6 +298,16 @@ const Server = ({
         return true;
     };
 
+    // If the URL has a path (e.g. a pasted channel URL), retry with the last path
+    // segment stripped so we fall back to the server's base URL.
+    const retryWithBaseUrl = (currentUrl: string) => {
+        if (urlParse(currentUrl).pathname === '/') {
+            return false;
+        }
+        pingServer(currentUrl.substring(0, currentUrl.lastIndexOf('/')));
+        return true;
+    };
+
     const pingServer = async (pingUrl: string, retryWithHttp = true) => {
         let canceled = false;
         setConnecting(true);
@@ -290,35 +317,62 @@ const Server = ({
             cancelPing = undefined;
         };
 
-        const ping = await getServerUrlAfterRedirect(pingUrl, !retryWithHttp);
-        if (!ping.url) {
+        const headRequest = await getServerUrlAfterRedirect(pingUrl, !retryWithHttp, preauthSecret.trim() || undefined);
+        if (!headRequest.url) {
             cancelPing();
             if (retryWithHttp) {
                 const nurl = pingUrl.replace('https:', 'http:');
                 pingServer(nurl, false);
             } else {
-                setUrlError(getErrorMessage(ping.error, intl));
+                setUrlError(getErrorMessage(headRequest.error, intl));
                 setButtonDisabled(true);
                 setConnecting(false);
             }
             return;
         }
-        const result = await doPing(ping.url, true, managedConfig?.timeout ? parseInt(managedConfig?.timeout, 10) : undefined);
+        const result = await doPing(
+            headRequest.url,
+            true, // verifyPushProxy
+            managedConfig?.timeout ? parseInt(managedConfig?.timeout, 10) : undefined, // timeoutInterval
+            preauthSecret.trim() || undefined, // preauthSecret
+        );
 
         if (canceled) {
             return;
         }
 
         if (result.error) {
-            setUrlError(getErrorMessage(result.error, intl));
+            if (result.isPreauthError) {
+                setPreauthSecretError(intl.formatMessage(preauthSecretInvalidMessage));
+                setShowAdvancedOptions(true);
+            } else {
+                setUrlError(getErrorMessage(result.error, intl));
+            }
             setButtonDisabled(true);
             setConnecting(false);
             return;
         }
 
-        canReceiveNotifications(ping.url, result.canReceiveNotifications as string, intl);
-        const data = await fetchConfigAndLicense(ping.url, true);
+        // NOTE: canReceiveNotifications is deferred until AFTER displayLogin (below).
+        // Calling it here presents a UIAlertController on the server screen while
+        // the connect flow continues in parallel; on iOS 26.x the subsequent
+        // Navigation.push to LoginScreen races with the still-visible alert and
+        // occasionally loses the push, leaving the user stranded on the server
+        // screen. Capturing the verification token here and firing the alert
+        // post-navigation eliminates the race — the alert then renders over the
+        // login screen, which is non-blocking because the RN-Navigation transition
+        // has already completed.
+        const pushProxyVerification = result.canReceiveNotifications as string;
+
+        const data = await fetchConfigAndLicense(headRequest.url, true);
+        if (canceled) {
+            return;
+        }
+
         if (data.error) {
+            if (retryWithBaseUrl(headRequest.url)) {
+                return;
+            }
             setButtonDisabled(true);
             setUrlError(getErrorMessage(data.error, intl));
             setConnecting(false);
@@ -326,6 +380,9 @@ const Server = ({
         }
 
         if (!data.config?.DiagnosticId) {
+            if (retryWithBaseUrl(headRequest.url)) {
+                return;
+            }
             setUrlError(formatMessage({
                 id: 'mobile.diagnostic_id.empty',
                 defaultMessage: 'A DiagnosticId value is missing for this server. Contact your system admin to review this value and restart the server.',
@@ -334,8 +391,24 @@ const Server = ({
             return;
         }
 
+        if (data.config.MobileJailbreakProtection === 'true') {
+            const isJailbroken = await SecurityManager.isDeviceJailbroken(headRequest.url, data.config.SiteName);
+            if (isJailbroken) {
+                setConnecting(false);
+                return;
+            }
+        }
+
+        if (data.config.MobileEnableBiometrics === 'true') {
+            const biometricsResult = await SecurityManager.authenticateWithBiometrics(headRequest.url, data.config.SiteName);
+            if (!biometricsResult) {
+                setConnecting(false);
+                return;
+            }
+        }
+
         const server = await getServerByIdentifier(data.config.DiagnosticId);
-        const credentials = await getServerCredentials(ping.url);
+        const credentials = await getServerCredentials(headRequest.url);
         setConnecting(false);
 
         if (server && server.lastActiveAt > 0 && credentials?.token) {
@@ -347,15 +420,26 @@ const Server = ({
             return;
         }
 
-        displayLogin(ping.url, data.config!, data.license!);
-    };
+        displayLogin(headRequest.url, data.config!, data.license!);
 
-    const transform = useAnimatedStyle(() => {
-        const duration = Platform.OS === 'android' ? 250 : 350;
-        return {
-            transform: [{translateX: withTiming(translateX.value, {duration, reduceMotion: ReduceMotion.Never})}],
-        };
-    }, []);
+        // Fire the push-proxy verification alert AFTER the RNN transition to
+        // LoginScreen has FULLY settled. We use setTimeout (not
+        // InteractionManager.runAfterInteractions) because RN-Navigation's
+        // Navigation.push is a native-side operation that is NOT tracked by the
+        // JS-side InteractionManager — runAfterInteractions would fire immediately
+        // (before the native push completes) and the UIAlertController would still
+        // present on the server screen.
+        //
+        // This prevents the iOS 26.x race where a UIAlertController presented on
+        // the server screen blocks or drops the subsequent Navigation.push,
+        // leaving the user stranded on the server screen. Acknowledgement
+        // persistence (via the Okay button callback in handleAlertResponse) is
+        // unaffected — the alert still targets the same serverUrl, it just
+        // renders on the login screen instead of the server screen.
+        setTimeout(() => {
+            canReceiveNotifications(headRequest.url, pushProxyVerification, intl);
+        }, 1000);
+    };
 
     return (
         <View
@@ -363,22 +447,19 @@ const Server = ({
             testID='server.screen'
         >
             <Background theme={theme}/>
-            <AnimatedSafeArea
+            <Animated.View
                 key={'server_content'}
-                style={[styles.flex, transform]}
+                style={[styles.flex, animatedStyles]}
             >
                 <KeyboardAwareScrollView
                     bounces={false}
                     contentContainerStyle={styles.scrollContainer}
-                    enableAutomaticScroll={Platform.OS === 'android'}
-                    enableOnAndroid={false}
-                    enableResetScrollToCoords={true}
-                    extraScrollHeight={20}
+                    bottomOffset={62}
                     keyboardDismissMode='on-drag'
                     keyboardShouldPersistTaps='handled'
-                    ref={keyboardAwareRef}
                     scrollToOverflowEnabled={true}
                     style={styles.flex}
+                    mode='layout'
                 >
                     <ServerHeader
                         additionalServer={additionalServer}
@@ -393,16 +474,24 @@ const Server = ({
                         disableServerUrl={disableServerUrl}
                         handleConnect={handleConnect}
                         handleDisplayNameTextChanged={handleDisplayNameTextChanged}
+                        handlePreauthSecretTextChanged={handlePreauthSecretTextChanged}
                         handleUrlTextChanged={handleUrlTextChanged}
-                        isModal={isModal}
-                        keyboardAwareRef={keyboardAwareRef}
+                        preauthSecret={preauthSecret}
+                        preauthSecretError={preauthSecretError}
+                        setShowAdvancedOptions={setShowAdvancedOptions}
+                        showAdvancedOptions={showAdvancedOptions}
                         theme={theme}
                         url={url}
                         urlError={urlError}
                     />
+                    <View style={styles.appVersionContainer}>
+                        <AppVersion
+                            textStyle={styles.appInfo}
+                            isWrapped={false}
+                        />
+                    </View>
                 </KeyboardAwareScrollView>
-                <AppVersion textStyle={styles.appInfo}/>
-            </AnimatedSafeArea>
+            </Animated.View>
         </View>
     );
 };

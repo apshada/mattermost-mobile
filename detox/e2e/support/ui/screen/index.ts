@@ -3,18 +3,30 @@
 
 import AboutScreen from './about';
 import AccountScreen from './account';
+import AddMembersScreen from './add_members';
 import AdvancedSettingsScreen from './advanced_settings';
+import {
+    closeArchivedChannel,
+    openArchivedChannel,
+    openArchivedChannelsFilter,
+    postArchivedChannelSentinel,
+} from './archived_channel_navigation';
 import AutoResponderNotificationSettingsScreen from './auto_responder_notification_settings';
 import BrowseChannelsScreen from './browse_channels';
 import ChannelScreen from './channel';
+import ChannelBookmarkScreen from './channel_bookmark';
+import ChannelConfigurationScreen from './channel_configuration';
 import ChannelDropdownMenuScreen from './channel_dropdown_menu';
 import ChannelInfoScreen from './channel_info';
 import ChannelListScreen from './channel_list';
+import ChannelSettingsScreen from './channel_settings';
 import ClockDisplaySettingsScreen from './clock_display_settings';
+import CodeScreen from './code';
 import CreateDirectMessageScreen from './create_direct_message';
 import CreateOrEditChannelScreen from './create_or_edit_channel';
 import CustomStatusScreen from './custom_status';
 import DisplaySettingsScreen from './display_settings';
+import DraftScreen from './draft_screen';
 import EditPostScreen from './edit_post';
 import EditProfileScreen from './edit_profile';
 import EditServerScreen from './edit_server';
@@ -23,9 +35,13 @@ import EmojiPickerScreen from './emoji_picker';
 import FindChannelsScreen from './find_channels';
 import GlobalThreadsScreen from './global_threads';
 import HomeScreen from './home';
+import IntegrationSelectorScreen from './integration_selector';
+import InteractiveDialogScreen from './interactive_dialog';
 import Invite from './invite';
 import LoginScreen from './login';
+import ManageChannelMembersScreen from './manage_channel_members';
 import MentionNotificationSettingsScreen from './mention_notification_settings';
+import MfaScreen from './mfa';
 import NotificationSettingsScreen from './notification_settings';
 import PermalinkScreen from './permalink';
 import PinnedMessagesScreen from './pinned_messages';
@@ -33,7 +49,9 @@ import PostOptionsScreen from './post_options';
 import PushNotificationSettingsScreen from './push_notification_settings';
 import ReactionsScreen from './reactions';
 import RecentMentionsScreen from './recent_mentions';
+import ReportProblemScreen from './report_problem';
 import SavedMessagesScreen from './saved_messages';
+import ScheduleMessageScreen from './scheduled_message_screen';
 import SearchMessagesScreen from './search_messages';
 import SelectTimezoneScreen from './select_timezone';
 import ServerScreen from './server';
@@ -41,6 +59,7 @@ import ServerListScreen from './server_list';
 import SettingsScreen from './settings';
 import TableScreen from './table';
 import TeamDropdownMenuScreen from './team_dropdown_menu';
+import TermsOfServiceScreen from './terms_of_service';
 import ThemeDisplaySettingsScreen from './theme_display_settings';
 import ThreadScreen from './thread';
 import ThreadOptionsScreen from './thread_options';
@@ -50,6 +69,8 @@ import UserProfileScreen from './user_profile';
 export {
     AboutScreen,
     AccountScreen,
+    ChannelBookmarkScreen,
+    AddMembersScreen,
     AdvancedSettingsScreen,
     AutoResponderNotificationSettingsScreen,
     BrowseChannelsScreen,
@@ -57,7 +78,10 @@ export {
     ChannelDropdownMenuScreen,
     ChannelInfoScreen,
     ChannelListScreen,
+    ChannelConfigurationScreen,
+    ChannelSettingsScreen,
     ClockDisplaySettingsScreen,
+    CodeScreen,
     CreateDirectMessageScreen,
     CreateOrEditChannelScreen,
     CustomStatusScreen,
@@ -70,9 +94,13 @@ export {
     FindChannelsScreen,
     GlobalThreadsScreen,
     HomeScreen,
+    IntegrationSelectorScreen,
+    InteractiveDialogScreen,
     Invite,
     LoginScreen,
+    ManageChannelMembersScreen,
     MentionNotificationSettingsScreen,
+    MfaScreen,
     NotificationSettingsScreen,
     PermalinkScreen,
     PinnedMessagesScreen,
@@ -80,6 +108,7 @@ export {
     PushNotificationSettingsScreen,
     ReactionsScreen,
     RecentMentionsScreen,
+    ReportProblemScreen,
     SavedMessagesScreen,
     SearchMessagesScreen,
     SelectTimezoneScreen,
@@ -88,9 +117,16 @@ export {
     SettingsScreen,
     TableScreen,
     TeamDropdownMenuScreen,
+    TermsOfServiceScreen,
     ThemeDisplaySettingsScreen,
     ThreadScreen,
     ThreadOptionsScreen,
     TimezoneDisplaySettingsScreen,
     UserProfileScreen,
+    DraftScreen,
+    ScheduleMessageScreen,
+    closeArchivedChannel,
+    openArchivedChannel,
+    openArchivedChannelsFilter,
+    postArchivedChannelSentinel,
 };

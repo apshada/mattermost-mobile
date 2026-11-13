@@ -5,6 +5,7 @@ import GenericClient from '@mattermost/react-native-network-client';
 import {Linking} from 'react-native';
 import urlParse from 'url-parse';
 
+import * as ClientConstants from '@client/rest/constants';
 import {Files} from '@constants';
 import {emptyFunction} from '@utils/general';
 import {logDebug} from '@utils/log';
@@ -18,9 +19,40 @@ export function isValidUrl(url = '') {
     return regex.test(url);
 }
 
+export function isUrlSafe(url: string): boolean {
+    let unescaped: string;
+
+    try {
+        unescaped = decodeURIComponent(url);
+    } catch {
+        unescaped = unescape(url);
+    }
+
+    unescaped = unescaped.replace(/[^\w:]/g, '').toLowerCase();
+
+    // eslint-disable-next-line no-script-url
+    return !unescaped.startsWith('javascript:') &&
+        !unescaped.startsWith('vbscript:') &&
+        !unescaped.startsWith('data:');
+}
+
+export function isParsableUrl(url: string): boolean {
+    try {
+        const parsedUrl = new URL(url);
+        return Boolean(parsedUrl);
+    } catch {
+        return false;
+    }
+}
+
+export function isSecureUrl(url: string) {
+    return /^(https|wss):\/\//i.test(url);
+}
+
+// useHttp never downgrades a URL that explicitly uses https.
 export function sanitizeUrl(url: string, useHttp = false) {
     let preUrl = urlParse(url, true);
-    let protocol = preUrl.protocol;
+    let protocol = useHttp && preUrl.protocol !== 'https:' ? 'http:' : preUrl.protocol;
 
     if (!preUrl.host || preUrl.protocol === 'file:') {
         preUrl = urlParse('https://' + stripTrailingSlashes(url), true);
@@ -37,11 +69,29 @@ export function sanitizeUrl(url: string, useHttp = false) {
     );
 }
 
-export async function getServerUrlAfterRedirect(serverUrl: string, useHttp = false) {
+export async function getUrlAfterRedirect(url: string, useHttp = false) {
+    const link = sanitizeUrl(url, useHttp);
+    try {
+        const result = await fetch(link, {
+            method: 'HEAD',
+        });
+        return {url: result.url};
+    } catch (error) {
+        return {error};
+    }
+}
+
+export async function getServerUrlAfterRedirect(serverUrl: string, useHttp = false, preauthSecret?: string) {
     let url = sanitizeUrl(serverUrl, useHttp);
 
+    const headers = {
+        ...(preauthSecret && isSecureUrl(url)) ? {[ClientConstants.HEADER_X_MATTERMOST_PREAUTH_SECRET]: preauthSecret} : {},
+    };
+
     try {
-        const resp = await GenericClient.head(url);
+        const resp = await GenericClient.head(url, {
+            headers,
+        });
         if (resp.redirectUrls?.length) {
             url = resp.redirectUrls[resp.redirectUrls.length - 1];
         }
@@ -239,4 +289,17 @@ export function cleanUrlForLogging(baseUrl: string, apiUrl: string): string {
 export function extractFilenameFromUrl(url: string) {
     const uri = urlParse(url);
     return uri.pathname.split('/').pop();
+}
+
+export function safeDecodeURIComponent(v: string) {
+    try {
+        return decodeURIComponent(v);
+    } catch {
+        return v;
+    }
+}
+
+export function getUrlDomain(url: string): string {
+    const parsed = urlParse(url);
+    return parsed.hostname || url;
 }

@@ -5,12 +5,20 @@ import {DeviceEventEmitter} from 'react-native';
 import {BehaviorSubject} from 'rxjs';
 
 import {Events} from '@constants';
+import {CLASSIFICATION_BANNER_CACHE_TTL, CLASSIFICATION_BANNER_FAILURE_BACKOFF} from '@constants/classification';
+import {getDefaultThemeByAppearance} from '@context/theme';
 import {toMilliseconds} from '@utils/datetime';
 
 const TIME_TO_CLEAR_WEBSOCKET_ACTIONS = toMilliseconds({seconds: 30});
+const TIME_TO_CLEAR_RECENTLY_UNSAVED_SAVED_POSTS = toMilliseconds({minutes: 2});
 
-class EphemeralStore {
-    theme: Theme | undefined;
+export type PendingChannelAccessChecks = {
+    teamIds: Set<string>;
+    channelIds: Set<string>;
+};
+
+class EphemeralStoreSingleton {
+    private themeSubject = new BehaviorSubject<Theme>(getDefaultThemeByAppearance());
     creatingChannel = false;
     creatingDMorGMTeammates: string[] = [];
 
@@ -23,6 +31,9 @@ class EphemeralStore {
 
     private websocketEditingPost: {[serverUrl: string]: {[id: string]: {post: Post; timeout: NodeJS.Timeout} | undefined} | undefined} = {};
     private websocketRemovingPost: {[serverUrl: string]: Set<string> | undefined} = {};
+    private recentlyUnsavedSavedPosts: {[serverUrl: string]: {[postId: string]: NodeJS.Timeout} | undefined} = {};
+    private recentlyUnsavedSavedPostsState: {[serverUrl: string]: BehaviorSubject<Set<string>> | undefined} = {};
+    private recentlyUnsavedSavedPostSubjects: {[serverUrl: string]: {[postId: string]: BehaviorSubject<boolean>} | undefined} = {};
 
     // As of today, the server sends a duplicated event to add the user to the team.
     // If we do not handle this, this ends up showing some errors in the database, apart
@@ -37,6 +48,9 @@ class EphemeralStore {
     private acknowledgingPost = new Set<string>();
     private unacknowledgingPost = new Set<string>();
     private currentThreadId = '';
+    private currentChannelOldestVisibleCreateAt: number | undefined = undefined;
+    private currentFileViewerPostId = '';
+    private currentPlaybookRunId = '';
     private notificationTapped = false;
     private enablingCRT = false;
 
@@ -44,6 +58,70 @@ class EphemeralStore {
     // launch will be called) but the notification callbacks are registered. This is used
     // so the notification is processed only once (preferably on launch).
     private processingNotification = '';
+
+    // This is used to track the channels that have their playbooks synced with the server.
+    // This is used to avoid fetching the playbooks for the same channel multiple times.
+    // It is cleared any time the connection with the server is lost.
+    private channelPlaybooksSynced: {[serverUrl: string]: Set<string>} = {};
+
+    private managedCategoryPropertyIds: {[serverUrl: string]: {groupId: string; fieldId: string} | undefined} = {};
+
+    // Track when the classification banner fields were last fetched per server, so
+    // the global banner can skip redundant fetches within the TTL. In-memory only
+    // (cleared on app restart) and cleared per server on logout.
+    private classificationBannerFetchedAt: {[serverUrl: string]: number | undefined} = {};
+
+    // Tracked separately from a successful fetch: a malformed-response failure
+    // backs off for a short window instead of borrowing the 1-hour success TTL,
+    // so a genuine fix or a forced retry is not blocked for the rest of that hour.
+    private classificationBannerFailedAt: {[serverUrl: string]: number | undefined} = {};
+
+    // Track classification option ids we've already forced a field refresh for, so an
+    // option that is genuinely gone server-side does not trigger an infinite re-fetch loop.
+    private classificationFieldSyncAttempted: {[serverUrl: string]: Set<string>} = {};
+
+    // Channels whose attribute values have been fetched from the server, so a
+    // repeated channel switch does not refetch. Values stay fresh afterwards via
+    // websocket events; the set is cleared when the connection drops.
+    private channelAttributeValuesSynced: {[serverUrl: string]: Set<string>} = {};
+
+    // Permalink previews whose linked post fetch already ran, keyed per server. Cleared on logout:
+    // keys embed the redaction epoch, which restarts from the same values once the database is
+    // recreated, so a previous session's entry could block a fetch for the next one.
+    private linkedPostFetchAttempts: {[serverUrl: string]: Set<string>} = {};
+
+    // Channel access checks waiting for the server's next run (see @actions/remote/channel_access).
+    // Cleared on logout, so a previous session's checks are not run for the next one.
+    private pendingChannelAccessChecks: {[serverUrl: string]: PendingChannelAccessChecks} = {};
+
+    // Track how many translations are being executed at the same time on the channel.
+    // We limit this to avoid overwhelming the device.
+    private runningTranslations = new Set<string>();
+
+    // Add-server candidate secret before a session exists (not safe in Expo Router params).
+    private pendingPreauthSecrets: {[serverUrl: string]: string | undefined} = {};
+
+    addRunningTranslation = (postId: string) => {
+        this.runningTranslations.add(postId);
+    };
+
+    removeRunningTranslation = (postId: string) => {
+        this.runningTranslations.delete(postId);
+    };
+
+    totalRunningTranslations = () => {
+        return this.runningTranslations.size;
+    };
+
+    // Track files that have been rejected by plugins (transient state)
+    // Maps file ID to rejection reason
+    private rejectedFiles = new Map<string, string>();
+
+    // Last viewable-items map emitted by each post list, keyed by location. ITEM_IN_VIEWPORT is
+    // fire-and-forget, so a subtree that mounts after the emit has no other way to learn it is on
+    // screen. Kept per location because several lists can be mounted at once (a thread over a
+    // channel) and a single shared map would let one list erase another's entries.
+    private viewableItems: {[location: string]: Record<string, boolean>} = {};
 
     setProcessingNotification = (v: string) => {
         this.processingNotification = v;
@@ -126,6 +204,101 @@ class EphemeralStore {
         }
 
         return undefined;
+    };
+
+    getRecentlyUnsavedSavedPostSubject = (serverUrl: string, postId: string) => {
+        if (!this.recentlyUnsavedSavedPostSubjects[serverUrl]) {
+            this.recentlyUnsavedSavedPostSubjects[serverUrl] = {};
+        }
+
+        const serverSubjects = this.recentlyUnsavedSavedPostSubjects[serverUrl]!;
+        if (!serverSubjects[postId]) {
+            serverSubjects[postId] = new BehaviorSubject(false);
+        }
+
+        return serverSubjects[postId]!;
+    };
+
+    observeRecentlyUnsavedSavedPost = (serverUrl: string, postId: string) => {
+        return this.getRecentlyUnsavedSavedPostSubject(serverUrl, postId).asObservable();
+    };
+
+    getRecentlyUnsavedSavedPostsSubject = (serverUrl: string) => {
+        if (!this.recentlyUnsavedSavedPostsState[serverUrl]) {
+            this.recentlyUnsavedSavedPostsState[serverUrl] = new BehaviorSubject(new Set());
+        }
+
+        return this.recentlyUnsavedSavedPostsState[serverUrl]!;
+    };
+
+    observeRecentlyUnsavedSavedPosts = (serverUrl: string) => {
+        return this.getRecentlyUnsavedSavedPostsSubject(serverUrl).asObservable();
+    };
+
+    addRecentlyUnsavedSavedPost = (serverUrl: string, postId: string) => {
+        if (!this.recentlyUnsavedSavedPosts[serverUrl]) {
+            this.recentlyUnsavedSavedPosts[serverUrl] = {};
+        }
+
+        const serverPosts = this.recentlyUnsavedSavedPosts[serverUrl]!;
+        const subject = this.getRecentlyUnsavedSavedPostSubject(serverUrl, postId);
+        const stateSubject = this.getRecentlyUnsavedSavedPostsSubject(serverUrl);
+        const existingTimeout = serverPosts[postId];
+        if (existingTimeout) {
+            clearTimeout(existingTimeout);
+        }
+
+        subject.next(true);
+        stateSubject.next(new Set([...stateSubject.value, postId]));
+        serverPosts[postId] = setTimeout(() => {
+            subject.next(false);
+            const nextState = new Set(stateSubject.value);
+            nextState.delete(postId);
+            stateSubject.next(nextState);
+            this.removeRecentlyUnsavedSavedPostSubject(serverUrl, postId);
+            delete serverPosts[postId];
+            if (!Object.keys(serverPosts).length) {
+                delete this.recentlyUnsavedSavedPosts[serverUrl];
+            }
+        }, TIME_TO_CLEAR_RECENTLY_UNSAVED_SAVED_POSTS);
+    };
+
+    private removeRecentlyUnsavedSavedPostSubject = (serverUrl: string, postId: string) => {
+        const serverSubjects = this.recentlyUnsavedSavedPostSubjects[serverUrl];
+        if (!serverSubjects?.[postId]) {
+            return;
+        }
+
+        serverSubjects[postId]!.complete();
+        delete serverSubjects[postId];
+        if (!Object.keys(serverSubjects).length) {
+            delete this.recentlyUnsavedSavedPostSubjects[serverUrl];
+        }
+    };
+
+    clearRecentlyUnsavedSavedPost = (serverUrl: string, postId: string) => {
+        this.recentlyUnsavedSavedPostSubjects[serverUrl]?.[postId]?.next(false);
+        const stateSubject = this.recentlyUnsavedSavedPostsState[serverUrl];
+        if (stateSubject?.value.has(postId)) {
+            const nextState = new Set(stateSubject.value);
+            nextState.delete(postId);
+            stateSubject.next(nextState);
+        }
+
+        const timeout = this.recentlyUnsavedSavedPosts[serverUrl]?.[postId];
+        if (timeout) {
+            clearTimeout(timeout);
+            delete this.recentlyUnsavedSavedPosts[serverUrl]![postId];
+            if (!Object.keys(this.recentlyUnsavedSavedPosts[serverUrl]!).length) {
+                delete this.recentlyUnsavedSavedPosts[serverUrl];
+            }
+        }
+
+        this.removeRecentlyUnsavedSavedPostSubject(serverUrl, postId);
+    };
+
+    isRecentlyUnsavedSavedPost = (serverUrl: string, postId: string) => {
+        return Boolean(this.recentlyUnsavedSavedPosts[serverUrl]?.[postId]);
     };
 
     // Ephemeral control when (un)archiving a channel locally
@@ -211,6 +384,26 @@ class EphemeralStore {
         this.currentThreadId = id;
     };
 
+    getCurrentChannelOldestVisibleCreateAt = () => this.currentChannelOldestVisibleCreateAt;
+    setCurrentChannelOldestVisibleCreateAt = (value: number | undefined) => {
+        this.currentChannelOldestVisibleCreateAt = value;
+    };
+
+    // Protects the backing post from eviction while a file viewer is open.
+    getCurrentFileViewerPostId = () => this.currentFileViewerPostId;
+    setCurrentFileViewerPostId = (id: string) => {
+        this.currentFileViewerPostId = id;
+    };
+    clearCurrentFileViewerPostId = () => {
+        this.currentFileViewerPostId = '';
+    };
+
+    // Protects the viewed playbook run from rolling cache eviction.
+    getCurrentPlaybookRunId = () => this.currentPlaybookRunId;
+    setCurrentPlaybookRunId = (id: string) => {
+        this.currentPlaybookRunId = id;
+    };
+
     // Ephemeral control when (un)archiving a channel locally
     addSwitchingToChannel = (channelId: string) => {
         this.switchingToChannel.add(channelId);
@@ -279,6 +472,223 @@ class EphemeralStore {
     isUnacknowledgingPost = (postId: string) => {
         return this.unacknowledgingPost.has(postId);
     };
+
+    getChannelPlaybooksSynced = (serverUrl: string, channelId: string) => {
+        return this.channelPlaybooksSynced[serverUrl]?.has(channelId) ?? false;
+    };
+
+    setChannelPlaybooksSynced = (serverUrl: string, channelId: string) => {
+        if (!this.channelPlaybooksSynced[serverUrl]) {
+            this.channelPlaybooksSynced[serverUrl] = new Set();
+        }
+        this.channelPlaybooksSynced[serverUrl]?.add(channelId);
+    };
+
+    unsetChannelPlaybooksSynced = (serverUrl: string, channelId: string) => {
+        this.channelPlaybooksSynced[serverUrl]?.delete(channelId);
+    };
+
+    clearChannelPlaybooksSynced = (serverUrl: string) => {
+        delete this.channelPlaybooksSynced[serverUrl];
+    };
+
+    observeTheme = () => {
+        return this.themeSubject.asObservable();
+    };
+
+    setTheme = (theme: Theme) => {
+        this.themeSubject.next(theme);
+    };
+
+    getTheme = () => {
+        return this.themeSubject.value;
+    };
+
+    getManagedCategoryPropertyIds = (serverUrl: string) => {
+        return this.managedCategoryPropertyIds[serverUrl];
+    };
+
+    setManagedCategoryPropertyIds = (serverUrl: string, ids: {groupId: string; fieldId: string}) => {
+        this.managedCategoryPropertyIds[serverUrl] = ids;
+    };
+
+    clearManagedCategoryPropertyIds = (serverUrl: string) => {
+        delete this.managedCategoryPropertyIds[serverUrl];
+    };
+
+    // Ephemeral cache for the classification banner fields fetch
+    shouldFetchClassificationBanner = (serverUrl: string) => {
+        const failedAt = this.classificationBannerFailedAt[serverUrl];
+        if (failedAt !== undefined && Date.now() - failedAt < CLASSIFICATION_BANNER_FAILURE_BACKOFF) {
+            return false;
+        }
+
+        const ts = this.classificationBannerFetchedAt[serverUrl];
+        if (ts === undefined) {
+            return true;
+        }
+        return Date.now() - ts >= CLASSIFICATION_BANNER_CACHE_TTL;
+    };
+
+    setClassificationBannerFetched = (serverUrl: string) => {
+        this.classificationBannerFetchedAt[serverUrl] = Date.now();
+        delete this.classificationBannerFailedAt[serverUrl];
+    };
+
+    setClassificationBannerFailed = (serverUrl: string) => {
+        this.classificationBannerFailedAt[serverUrl] = Date.now();
+        delete this.classificationBannerFetchedAt[serverUrl];
+    };
+
+    getClassificationFieldSyncAttempted = (serverUrl: string, optionId: string) => {
+        return this.classificationFieldSyncAttempted[serverUrl]?.has(optionId) ?? false;
+    };
+
+    setClassificationFieldSyncAttempted = (serverUrl: string, optionId: string) => {
+        if (!this.classificationFieldSyncAttempted[serverUrl]) {
+            this.classificationFieldSyncAttempted[serverUrl] = new Set();
+        }
+        this.classificationFieldSyncAttempted[serverUrl]?.add(optionId);
+    };
+
+    clearClassificationCache = (serverUrl: string) => {
+        delete this.classificationBannerFetchedAt[serverUrl];
+        delete this.classificationBannerFailedAt[serverUrl];
+        delete this.classificationFieldSyncAttempted[serverUrl];
+    };
+
+    getChannelAttributeValuesSynced = (serverUrl: string, channelId: string) => {
+        return this.channelAttributeValuesSynced[serverUrl]?.has(channelId) ?? false;
+    };
+
+    setChannelAttributeValuesSynced = (serverUrl: string, channelId: string) => {
+        if (!this.channelAttributeValuesSynced[serverUrl]) {
+            this.channelAttributeValuesSynced[serverUrl] = new Set();
+        }
+        this.channelAttributeValuesSynced[serverUrl]?.add(channelId);
+    };
+
+    unsetChannelAttributeValuesSynced = (serverUrl: string, channelId: string) => {
+        this.channelAttributeValuesSynced[serverUrl]?.delete(channelId);
+    };
+
+    clearChannelAttributeValuesSynced = (serverUrl: string) => {
+        delete this.channelAttributeValuesSynced[serverUrl];
+    };
+
+    hasLinkedPostFetchAttempt = (serverUrl: string, attemptKey: string) => {
+        return this.linkedPostFetchAttempts[serverUrl]?.has(attemptKey) ?? false;
+    };
+
+    addLinkedPostFetchAttempt = (serverUrl: string, attemptKey: string) => {
+        if (!this.linkedPostFetchAttempts[serverUrl]) {
+            this.linkedPostFetchAttempts[serverUrl] = new Set();
+        }
+        this.linkedPostFetchAttempts[serverUrl]?.add(attemptKey);
+    };
+
+    removeLinkedPostFetchAttempt = (serverUrl: string, attemptKey: string) => {
+        this.linkedPostFetchAttempts[serverUrl]?.delete(attemptKey);
+    };
+
+    clearLinkedPostFetchAttempts = (serverUrl: string) => {
+        delete this.linkedPostFetchAttempts[serverUrl];
+    };
+
+    addPendingChannelAccessCheck = (serverUrl: string, {teamId, channelId}: {teamId?: string; channelId?: string}) => {
+        if (!this.pendingChannelAccessChecks[serverUrl]) {
+            this.pendingChannelAccessChecks[serverUrl] = {teamIds: new Set(), channelIds: new Set()};
+        }
+        const checks = this.pendingChannelAccessChecks[serverUrl];
+        if (teamId) {
+            checks.teamIds.add(teamId);
+        }
+        if (channelId) {
+            checks.channelIds.add(channelId);
+        }
+    };
+
+    // Returns the server's pending checks and removes them, so checks added meanwhile wait for the next run.
+    takePendingChannelAccessChecks = (serverUrl: string): PendingChannelAccessChecks | undefined => {
+        const checks = this.pendingChannelAccessChecks[serverUrl];
+        delete this.pendingChannelAccessChecks[serverUrl];
+        return checks;
+    };
+
+    clearPendingChannelAccessChecks = (serverUrl: string) => {
+        delete this.pendingChannelAccessChecks[serverUrl];
+    };
+
+    // Serializes property-write operations that share a key (server:target), so a
+    // REST reconciliation and a websocket write for the same target can never
+    // interleave their read-modify-write sequence. Each caller's whole
+    // read-then-write runs to completion before the next queued one starts.
+    private propertyWriteQueue: Map<string, Promise<unknown>> = new Map();
+
+    runExclusive = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+        const previous = this.propertyWriteQueue.get(key) ?? Promise.resolve();
+        const next = previous.then(fn, fn);
+        const settled = next.then(() => undefined, () => undefined);
+        this.propertyWriteQueue.set(key, settled);
+        settled.then(() => {
+            if (this.propertyWriteQueue.get(key) === settled) {
+                this.propertyWriteQueue.delete(key);
+            }
+        });
+        return next;
+    };
+
+    // Ephemeral control for rejected files
+    addRejectedFile = (fileId: string, rejectionReason?: string) => {
+        this.rejectedFiles.set(fileId, rejectionReason || '');
+
+        // Emit event so components can re-render with the updated rejection status
+        DeviceEventEmitter.emit(Events.FILE_REJECTED, {fileId});
+    };
+
+    isFileRejected = (fileId: string) => {
+        return this.rejectedFiles.has(fileId);
+    };
+
+    getRejectionReason = (fileId: string) => {
+        return this.rejectedFiles.get(fileId);
+    };
+
+    clearRejectedFiles = () => {
+        this.rejectedFiles.clear();
+    };
+
+    setPendingPreauthSecret = (serverUrl: string, secret: string) => {
+        this.pendingPreauthSecrets[serverUrl] = secret;
+    };
+
+    getPendingPreauthSecret = (serverUrl: string) => {
+        return this.pendingPreauthSecrets[serverUrl];
+    };
+
+    clearPendingPreauthSecret = (serverUrl: string) => {
+        delete this.pendingPreauthSecrets[serverUrl];
+    };
+
+    // Ephemeral control for the items currently in a post list viewport
+    setViewableItems = (location: string, items: Record<string, boolean>) => {
+        this.viewableItems[location] = items;
+    };
+
+    // Merges rather than replaces: a permalink preview emits only for itself, and replacing the
+    // location's map would erase every sibling preview.
+    addViewableItem = (location: string, key: string) => {
+        this.viewableItems[location] = {...this.viewableItems[location], [key]: true};
+    };
+
+    isItemInViewPort = (key: string) => {
+        return Object.values(this.viewableItems).some((items) => Boolean(items[key]));
+    };
+
+    clearViewableItems = () => {
+        this.viewableItems = {};
+    };
 }
 
-export default new EphemeralStore();
+const EphemeralStore = new EphemeralStoreSingleton();
+export default EphemeralStore;

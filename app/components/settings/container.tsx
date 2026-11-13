@@ -8,7 +8,7 @@ import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 import {useTheme} from '@context/theme';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 
-const edges: Edge[] = ['left', 'right'];
+const edges: Edge[] = ['left', 'right', 'bottom'];
 
 const getStyleSheet = makeStyleSheetFromTheme((theme) => {
     return {
@@ -16,16 +16,21 @@ const getStyleSheet = makeStyleSheetFromTheme((theme) => {
             flex: 1,
             backgroundColor: theme.centerChannelBg,
         },
+
+        // Padding on scroll content, not the ScrollView frame, so the scroll indicator stays at the safe-area edge.
         contentContainerStyle: {
             marginTop: 8,
+            flexGrow: 1,
+            paddingHorizontal: 20,
         },
     };
 });
 
 type SettingContainerProps = {
-   children: React.ReactNode;
-   testID?: string;
-}
+    children: React.ReactNode;
+    testID?: string;
+};
+
 const SettingContainer = ({children, testID}: SettingContainerProps) => {
     const theme = useTheme();
     const styles = getStyleSheet(theme);

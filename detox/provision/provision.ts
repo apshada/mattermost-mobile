@@ -1,0 +1,80 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {AGENTS_PLUGIN_ID, DEMO_PLUGIN_ID, DEMO_PLUGIN_REQUIREMENT, REQUIRED_PLUGINS} from './constants';
+import {ensureCustomProfileAttributeFields} from './custom-profile-attributes';
+import {createMattermostClient, login} from './http-client';
+import {ensureTrialLicense} from './license';
+import {logInfo, logWarn} from './log';
+import {assertDemoPluginAbsent, disableStrayPlugins, ensureAgentsPlugin, ensureDemoPluginReady, ensureDemoPluginSettingsEntry, installRequiredPlugin} from './plugins';
+import {applyProvisionBaseline, getServerMmVersion, verifyProvisionBaseline} from './server-config';
+
+import type {MattermostClient, ProvisionCredentials} from './types';
+
+type AgentsStatusResponse = {available?: boolean};
+
+async function verifyAgentsSetup(client: MattermostClient, token: string): Promise<boolean> {
+    const statusRes = await client.request<AgentsStatusResponse>('GET', '/api/v4/agents/status', undefined, token);
+    if (statusRes.data?.available === true) {
+        return true;
+    }
+
+    logWarn('Agents not available — agents tests may be skipped.');
+    return false;
+}
+
+export async function provisionServer(serverUrl: string, credentials: ProvisionCredentials, {demoPlugin}: {demoPlugin: boolean}): Promise<void> {
+    const client = createMattermostClient(serverUrl);
+    const token = await login(client, credentials);
+    const serverMmVersion = await getServerMmVersion(client, token);
+    logInfo(`Mattermost server version: ${serverMmVersion}`);
+
+    await ensureTrialLicense(client, token);
+
+    const provisioned = demoPlugin ? [...REQUIRED_PLUGINS, DEMO_PLUGIN_REQUIREMENT] : REQUIRED_PLUGINS;
+
+    // Before the baseline so its writes do not fan out through a stray or unwanted demo plugin. An
+    // active demo plugin on B is left alone here; the install loop below replaces a wrong version.
+    await disableStrayPlugins(client, token, provisioned);
+
+    // Before any further config write: a demo plugin already running on a reused server would otherwise
+    // reset settings the baseline and specs write.
+    if (demoPlugin) {
+        await ensureDemoPluginSettingsEntry(client, token);
+    }
+
+    await applyProvisionBaseline(client, token, serverUrl, serverMmVersion);
+
+    await ensureAgentsPlugin(client, token);
+
+    /* eslint-disable no-await-in-loop -- install required plugins one at a time for clear provisioning logs */
+    for (const plugin of provisioned) {
+        if (plugin.id === AGENTS_PLUGIN_ID) {
+            continue;
+        }
+        await installRequiredPlugin(client, token, plugin);
+        if (plugin.id === DEMO_PLUGIN_ID) {
+            try {
+                await ensureDemoPluginReady(client, token);
+            } catch (error) {
+                logWarn(`Demo plugin readiness check failed: ${error instanceof Error ? error.message : String(error)} — dialog-dependent tests may be skipped.`);
+            }
+        }
+    }
+    /* eslint-enable no-await-in-loop */
+
+    await assertDemoPluginAbsent(client, token, demoPlugin);
+
+    await verifyProvisionBaseline(client, token, serverUrl);
+
+    const agentsOk = await verifyAgentsSetup(client, token);
+    if (!agentsOk) {
+        logWarn('Agents E2E setup verification failed — agents tests may be skipped.');
+    }
+
+    if (!await ensureCustomProfileAttributeFields(client, token)) {
+        logWarn('Custom profile attribute setup incomplete.');
+    }
+
+    logInfo('Server provisioning complete.');
+}

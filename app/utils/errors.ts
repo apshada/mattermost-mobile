@@ -1,16 +1,20 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import type {IntlShape} from 'react-intl';
+import {defineMessage, type IntlShape} from 'react-intl';
+
+export const preauthSecretInvalidMessage = defineMessage({
+    id: 'mobile.server.preauth_secret.invalid',
+    defaultMessage: 'Authentication secret is invalid. Try again or contact your admin.',
+});
 
 export function isServerError(obj: unknown): obj is {server_error_id?: string} {
     return (
         typeof obj === 'object' &&
         obj !== null &&
         (
-            !('server_error_id' in obj) ||
-            typeof obj.server_error_id === 'string' ||
-            typeof obj.server_error_id === 'undefined'
+            ('server_error_id' in obj) &&
+            typeof obj.server_error_id === 'string'
         )
     );
 }
@@ -56,11 +60,8 @@ export function isErrorWithUrl(obj: unknown): obj is {url?: string} {
     return (
         typeof obj === 'object' &&
         obj !== null &&
-        (
-            !('url' in obj) ||
-            typeof obj.url === 'string' ||
-            typeof obj.url === 'undefined'
-        )
+        ('url' in obj) &&
+        typeof obj.url === 'string'
     );
 }
 
@@ -82,7 +83,7 @@ export const getErrorMessage = (error: unknown, intl?: IntlShape) => {
         return error;
     }
     if (isErrorWithIntl(error)) {
-        return intl ? intl.formatMessage({id: error.intl.id, defaultMessage: error.intl.defaultMessage}, error.intl.values) : error.intl.defaultMessage;
+        return intl ? intl.formatMessage(error.intl, error.intl.values) : error.intl.defaultMessage!;
     }
 
     if (isErrorWithMessage(error)) {
@@ -90,4 +91,17 @@ export const getErrorMessage = (error: unknown, intl?: IntlShape) => {
     }
 
     return 'Unknown error';
+};
+
+export const getServerError = (error: unknown, depth = 0): string | undefined => {
+    if (isServerError(error)) {
+        return error.server_error_id!;
+    }
+    if (isErrorWithDetails(error)) {
+        if (depth > 2) {
+            return undefined;
+        }
+        return getServerError(error.details, depth + 1);
+    }
+    return undefined;
 };

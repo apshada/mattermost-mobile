@@ -3,7 +3,7 @@
 
 import React, {forwardRef, useCallback, useEffect, useMemo} from 'react';
 import {DeviceEventEmitter, Keyboard, type NativeSyntheticEvent, Platform, type TextInputFocusEventData, type ViewStyle} from 'react-native';
-import Animated, {type AnimatedStyleProp} from 'react-native-reanimated';
+import Animated, {type AnimatedStyle} from 'react-native-reanimated';
 
 import Search, {type SearchProps, type SearchRef} from '@components/search';
 import {Events} from '@constants';
@@ -11,7 +11,7 @@ import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 type Props = SearchProps & {
-    topStyle: AnimatedStyleProp<ViewStyle>;
+    topStyle: AnimatedStyle<ViewStyle>;
     hideHeader?: () => void;
     theme: Theme;
 }
@@ -50,7 +50,7 @@ const NavigationSearch = forwardRef<SearchRef, Props>(({
     const onFocus = useCallback((e: NativeSyntheticEvent<TextInputFocusEventData>) => {
         hideHeader?.();
         searchProps.onFocus?.(e);
-    }, [hideHeader, searchProps.onFocus]);
+    }, [hideHeader, searchProps]);
 
     const showEmitter = useCallback(() => {
         if (Platform.OS === 'android') {

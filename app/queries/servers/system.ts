@@ -1,14 +1,20 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+/* eslint-disable max-lines */
+
 import {Database, Q} from '@nozbe/watermelondb';
+import {nativeApplicationVersion, nativeBuildVersion} from 'expo-application';
+import {modelName} from 'expo-device';
+import {Platform} from 'react-native';
 import {of as of$, Observable, combineLatest} from 'rxjs';
 import {switchMap, distinctUntilChanged} from 'rxjs/operators';
 
 import {Preferences, License} from '@constants';
 import {MM_TABLES, SYSTEM_IDENTIFIERS} from '@constants/database';
 import {PUSH_PROXY_STATUS_UNKNOWN} from '@constants/push_proxy';
-import {isMinimumServerVersion} from '@utils/helpers';
+import {getFullErrorMessage} from '@utils/errors';
+import {isMinimumLicenseTier, isMinimumServerVersion, type LicenseTierSku} from '@utils/helpers';
 import {logError} from '@utils/log';
 
 import type ServerDataOperator from '@database/operator/server_data_operator';
@@ -18,6 +24,7 @@ import type SystemModel from '@typings/database/models/servers/system';
 export type PrepareCommonSystemValuesArgs = {
     lastUnreadChannelId?: string;
     currentChannelId?: string;
+    currentPushVerificationStatus?: string;
     currentTeamId?: string;
     currentUserId?: string;
     license?: ClientLicense;
@@ -137,17 +144,23 @@ export const getCommonSystemValues = async (serverDatabase: Database) => {
     };
 };
 
-const fromModelToClientConfig = (list: ConfigModel[]) => {
+const fromModelToClientConfig = <T = ClientConfig>(list: ConfigModel[]) => {
     const config: {[key: string]: any} = {};
     list.forEach((v) => {
         config[v.id] = v.value;
     });
-    return config as ClientConfig;
+    return config as T;
 };
 
 export const getConfig = async (database: Database) => {
     const configList = await database.get<ConfigModel>(CONFIG).query().fetch();
     return fromModelToClientConfig(configList);
+};
+
+export const getSecurityConfig = async (database: Database) => {
+    const configList = await database.get<ConfigModel>(CONFIG).query(
+        Q.where('id', Q.oneOf(['MobileEnableBiometrics', 'MobileJailbreakProtection', 'MobilePreventScreenCapture', 'SiteName']))).fetch();
+    return fromModelToClientConfig<SecurityClientConfig>(configList);
 };
 
 export const queryConfigValue = (database: Database, key: keyof ClientConfig) => {
@@ -159,12 +172,65 @@ export const getConfigValue = async (database: Database, key: keyof ClientConfig
     return list.length ? list[0].value : undefined;
 };
 
+export const getConfigBooleanValue = async (database: Database, key: keyof ClientConfig, defaultValue = false) => {
+    const v = await getConfigValue(database, key);
+    return v ? v === 'true' : defaultValue;
+};
+
+/**
+ * Mirrors attributeBasedAccessControlEnabled (server app/access_control.go). No license term: the
+ * client gate must be neither narrower nor broader than the server predicate it mirrors.
+ */
+export const isRedactionEnforced = async (database: Database): Promise<boolean> => {
+    const [flag, setting] = await Promise.all([
+        getConfigValue(database, 'FeatureFlagPermissionPolicies'),
+        getConfigValue(database, 'EnableAttributeBasedAccessControl'),
+    ]);
+    return flag === 'true' && setting === 'true';
+};
+
 export const getLastGlobalDataRetentionRun = async (database: Database) => {
     try {
         const data = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.LAST_DATA_RETENTION_RUN);
         return data?.value || 0;
     } catch {
         return undefined;
+    }
+};
+
+export const getDisconnectedSince = async (database: Database): Promise<number | undefined> => {
+    try {
+        const data = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.DISCONNECTED_SINCE);
+        return data?.value as number | undefined;
+    } catch {
+        return undefined;
+    }
+};
+
+export const getOfflineSince = async (database: Database): Promise<number | undefined> => {
+    try {
+        const data = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.OFFLINE_SINCE);
+        return data?.value as number | undefined;
+    } catch {
+        return undefined;
+    }
+};
+
+export const getLastSeenTime = async (database: Database): Promise<number | undefined> => {
+    try {
+        const data = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.LAST_SEEN_TIME);
+        return data?.value as number | undefined;
+    } catch {
+        return undefined;
+    }
+};
+
+export const getLastBoRPostCleanupRun = async (database: Database) => {
+    try {
+        const data = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.LAST_BOR_POST_CLEANUP_RUN);
+        return data?.value || 0;
+    } catch {
+        return 0;
     }
 };
 
@@ -205,7 +271,7 @@ export const getIsDataRetentionEnabled = async (database: Database) => {
 
 export const observeConfig = (database: Database): Observable<ClientConfig | undefined> => {
     return database.get<ConfigModel>(CONFIG).query().observeWithColumns(['value']).pipe(
-        switchMap((result) => of$(fromModelToClientConfig(result))),
+        switchMap((result) => of$(fromModelToClientConfig<ClientConfig>(result))),
     );
 };
 
@@ -237,6 +303,26 @@ export const observeConfigBooleanValue = (database: Database, key: keyof ClientC
 export const observeConfigIntValue = (database: Database, key: keyof ClientConfig, defaultValue = 0) => {
     return observeConfigValue(database, key).pipe(
         switchMap((v) => of$((parseInt(v || '0', 10) || defaultValue))),
+    );
+};
+
+// The deprecated ExperimentalViewArchivedChannels setting was the last gate on viewing archived
+// channels. It is always enabled on servers newer than v10.11, which stopped sending it in the client
+// config, so an absent value means the feature is on. Supported older servers (down to v5.26.2) still
+// send it and may have explicitly disabled it, so only an explicit 'false' turns archived channels off.
+//
+// TODO: once we drop support for servers <= v10.11 the field is never sent, so these helpers and all of
+// their callers can be removed and archived channels treated as always viewable.
+const archivedChannelsViewable = (value?: string) => value !== 'false';
+
+export const canViewArchivedChannels = async (database: Database) => {
+    return archivedChannelsViewable(await getConfigValue(database, 'ExperimentalViewArchivedChannels'));
+};
+
+export const observeCanViewArchivedChannels = (database: Database) => {
+    return observeConfigValue(database, 'ExperimentalViewArchivedChannels').pipe(
+        switchMap((value) => of$(archivedChannelsViewable(value))),
+        distinctUntilChanged(),
     );
 };
 
@@ -311,7 +397,7 @@ export const observeRecentCustomStatus = (database: Database): Observable<UserCu
     );
 };
 
-export const getWebSocketLastDisconnected = async (serverDatabase: Database) => {
+export const getLastFullSync = async (serverDatabase: Database) => {
     try {
         const websocketLastDisconnected = await serverDatabase.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.WEBSOCKET);
         return (parseInt(websocketLastDisconnected?.value || 0, 10) || 0);
@@ -320,16 +406,17 @@ export const getWebSocketLastDisconnected = async (serverDatabase: Database) => 
     }
 };
 
-export const observeWebsocketLastDisconnected = (database: Database) => {
-    return querySystemValue(database, SYSTEM_IDENTIFIERS.WEBSOCKET).observe().pipe(
-        switchMap((result) => (result.length ? result[0].observe() : of$({value: '0'}))),
-        switchMap((model) => of$(parseInt(model.value || 0, 10) || 0)),
-    );
+export const setLastFullSync = async (operator: ServerDataOperator, value: number, prepareRecordsOnly = false) => {
+    return operator.handleSystem({systems: [{
+        id: SYSTEM_IDENTIFIERS.WEBSOCKET,
+        value,
+    }],
+    prepareRecordsOnly});
 };
 
-export const resetWebSocketLastDisconnected = async (operator: ServerDataOperator, prepareRecordsOnly = false) => {
+export const resetLastFullSync = async (operator: ServerDataOperator, prepareRecordsOnly = false) => {
     const {database} = operator;
-    const lastDisconnectedAt = await getWebSocketLastDisconnected(database);
+    const lastDisconnectedAt = await getLastFullSync(database);
 
     if (lastDisconnectedAt) {
         return operator.handleSystem({systems: [{
@@ -362,7 +449,7 @@ export const patchTeamHistory = (operator: ServerDataOperator, value: string[], 
 export async function prepareCommonSystemValues(
     operator: ServerDataOperator, values: PrepareCommonSystemValuesArgs): Promise<SystemModel[]> {
     try {
-        const {lastUnreadChannelId, currentChannelId, currentTeamId, currentUserId, license} = values;
+        const {lastUnreadChannelId, currentChannelId, currentPushVerificationStatus, currentTeamId, currentUserId, license} = values;
         const systems: IdValue[] = [];
 
         if (license !== undefined) {
@@ -397,6 +484,13 @@ export async function prepareCommonSystemValues(
             systems.push({
                 id: SYSTEM_IDENTIFIERS.CURRENT_CHANNEL_ID,
                 value: currentChannelId,
+            });
+        }
+
+        if (currentPushVerificationStatus !== undefined) {
+            systems.push({
+                id: SYSTEM_IDENTIFIERS.PUSH_VERIFICATION_STATUS,
+                value: currentPushVerificationStatus,
             });
         }
 
@@ -446,7 +540,7 @@ export async function setCurrentTeamId(operator: ServerDataOperator, teamId: str
 
         return {currentTeamId: teamId};
     } catch (error) {
-        logError(error);
+        logError('Failed setCurrentTeamId', getFullErrorMessage(error));
         return {error};
     }
 }
@@ -532,28 +626,6 @@ export const observeLastDismissedAnnouncement = (database: Database) => {
     );
 };
 
-export const observeCanUploadFiles = (database: Database) => {
-    const enableFileAttachments = observeConfigBooleanValue(database, 'EnableFileAttachments', true);
-    const enableMobileFileUpload = observeConfigBooleanValue(database, 'EnableMobileFileUpload', true);
-    const license = observeLicense(database);
-
-    return combineLatest([enableFileAttachments, enableMobileFileUpload, license]).pipe(
-        switchMap(([efa, emfu, l]) => of$(
-            efa &&
-                (l?.IsLicensed !== 'true' || l?.Compliance !== 'true' || emfu),
-        )),
-    );
-};
-
-export const observeCanDownloadFiles = (database: Database) => {
-    const enableMobileFileDownload = observeConfigBooleanValue(database, 'EnableMobileFileDownload', true);
-    const license = observeLicense(database);
-
-    return combineLatest([enableMobileFileDownload, license]).pipe(
-        switchMap(([emfd, l]) => of$((l?.IsLicensed !== 'true' || l?.Compliance !== 'true' || emfd))),
-    );
-};
-
 export const observeLastServerVersionCheck = (database: Database) => {
     return querySystemValue(database, SYSTEM_IDENTIFIERS.LAST_SERVER_VERSION_CHECK).observeWithColumns(['value']).pipe(
         switchMap((result) => (result.length ? result[0].observe() : of$({value: 0}))),
@@ -617,3 +689,54 @@ const observeIsSelfHosterStarter = (database: Database) => {
     );
 };
 
+export const observeIsFreeEdition = (database: Database) => {
+    return observeLicense(database).pipe(
+        switchMap((license) => {
+            const isLicensed = license?.IsLicensed === 'true';
+            const isEntry = license?.SkuShortName === License.SKU_SHORT_NAME.Entry;
+            return of$(!isLicensed || isEntry);
+        }),
+        distinctUntilChanged(),
+    );
+};
+
+export const observeReportAProblemMetadata = (database: Database) => {
+    const currentUserId = observeCurrentUserId(database);
+    const currentTeamId = observeCurrentTeamId(database);
+    const serverVersion = observeConfigValue(database, 'Version');
+    const buildNumber = observeConfigValue(database, 'BuildNumber');
+
+    return combineLatest([
+        currentUserId,
+        currentTeamId,
+        serverVersion,
+        buildNumber,
+    ]).pipe(
+        switchMap(([userId, teamId, version = 'Unknown', build = 'Unknown']) => of$({
+            currentUserId: userId,
+            currentTeamId: teamId,
+            serverVersion: `${version} (Build ${build})`,
+            appVersion: `${nativeApplicationVersion} (Build ${nativeBuildVersion})`,
+            appPlatform: Platform.OS,
+            deviceModel: modelName ?? 'Unknown',
+        })),
+    );
+};
+
+export const observeIsMinimumLicenseTier = (database: Database, shortSku: LicenseTierSku) => {
+    const license = observeLicense(database);
+    const isEnterpriseReady = observeConfigBooleanValue(database, 'BuildEnterpriseReady', false);
+
+    return combineLatest([license, isEnterpriseReady]).pipe(
+        switchMap(([lic, isEnt]) => {
+            if (!shortSku || !isEnt) {
+                return of$(false);
+            }
+
+            const meetsMinimumTier = isMinimumLicenseTier(lic, shortSku);
+
+            return of$(meetsMinimumTier);
+        }),
+        distinctUntilChanged(),
+    );
+};

@@ -3,8 +3,9 @@
 
 import {SYSTEM_IDENTIFIERS} from '@constants/database';
 import DatabaseManager from '@database/manager';
+import {DEFAULT_LOCALE} from '@i18n';
 import {getRecentCustomStatuses} from '@queries/servers/system';
-import {getCurrentUser, getUserById} from '@queries/servers/user';
+import {getCurrentUser, getUserById, queryUsersById} from '@queries/servers/user';
 import {logError} from '@utils/log';
 
 import {addRecentReaction} from './reactions';
@@ -12,7 +13,7 @@ import {addRecentReaction} from './reactions';
 import type Model from '@nozbe/watermelondb/Model';
 import type UserModel from '@typings/database/models/servers/user';
 
-export async function setCurrentUserStatus(serverUrl: string, status: string) {
+export async function setCurrentUserStatus(serverUrl: string, status: string): Promise<{error?: unknown}> {
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const user = await getCurrentUser(database);
@@ -25,14 +26,14 @@ export async function setCurrentUserStatus(serverUrl: string, status: string) {
             await operator.batchRecords([user], 'setCurrentUserStatus');
         }
 
-        return null;
+        return {};
     } catch (error) {
         logError('Failed setCurrentUserStatus', error);
         return {error};
     }
 }
 
-export async function updateLocalCustomStatus(serverUrl: string, user: UserModel, customStatus?: UserCustomStatus) {
+export async function updateLocalCustomStatus(serverUrl: string, user: UserModel, customStatus?: UserCustomStatus): Promise<{error?: unknown}> {
     try {
         const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const models: Model[] = [];
@@ -43,9 +44,9 @@ export async function updateLocalCustomStatus(serverUrl: string, user: UserModel
 
         models.push(userModel);
         if (customStatus) {
-            const recent = await updateRecentCustomStatuses(serverUrl, customStatus, true);
-            if (Array.isArray(recent)) {
-                models.push(...recent);
+            const {models: customStatusModels} = await updateRecentCustomStatuses(serverUrl, customStatus, true);
+            if (customStatusModels?.length) {
+                models.push(...customStatusModels);
             }
 
             if (customStatus.emoji) {
@@ -65,7 +66,7 @@ export async function updateLocalCustomStatus(serverUrl: string, user: UserModel
     }
 }
 
-export const updateRecentCustomStatuses = async (serverUrl: string, customStatus: UserCustomStatus, prepareRecordsOnly = false, remove = false) => {
+export const updateRecentCustomStatuses = async (serverUrl: string, customStatus: UserCustomStatus, prepareRecordsOnly = false, remove = false): Promise<{models?: Model[]; error?: unknown}> => {
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const recentStatuses = await getRecentCustomStatuses(database);
@@ -83,13 +84,14 @@ export const updateRecentCustomStatuses = async (serverUrl: string, customStatus
             recentStatuses.unshift(customStatus);
         }
 
-        return operator.handleSystem({
+        const models = await operator.handleSystem({
             systems: [{
                 id: SYSTEM_IDENTIFIERS.RECENT_CUSTOM_STATUS,
                 value: JSON.stringify(recentStatuses),
             }],
             prepareRecordsOnly,
         });
+        return {models};
     } catch (error) {
         logError('Failed updateRecentCustomStatuses', error);
         return {error};
@@ -158,4 +160,76 @@ export const storeProfile = async (serverUrl: string, profile: UserProfile) => {
         logError('Failed storeProfile', error);
         return {error};
     }
+};
+
+export const getCurrentUserLocale = async (serverUrl: string): Promise<string> => {
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const user = await getCurrentUser(database);
+        return user?.locale || DEFAULT_LOCALE;
+    } catch {
+        return DEFAULT_LOCALE;
+    }
+};
+
+export const getExistingUserProfilesByIdWithFallback = async (serverUrl: string, userIds: string[]): Promise<Record<string, UserProfile>> => {
+    const result: Record<string, UserProfile> = {};
+
+    const fakeUser = (id: string): UserProfile => ({
+        email: '',
+        locale: DEFAULT_LOCALE,
+        username: '',
+        first_name: '',
+        last_name: '',
+        create_at: 0,
+        delete_at: 0,
+        roles: 'system_user',
+        auth_service: '',
+        id,
+        nickname: '',
+        notify_props: {
+            channel: 'false',
+            comments: 'root',
+            desktop: 'default',
+            desktop_sound: 'false',
+            email: 'false',
+            first_name: 'false',
+            highlight_keys: '',
+            mention_keys: '',
+            push: 'default',
+            push_status: 'away',
+            calls_desktop_sound: 'true',
+            calls_mobile_notification_sound: '',
+            calls_mobile_sound: 'true',
+            calls_notification_sound: '',
+        },
+        position: '',
+        update_at: 0,
+    });
+
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const users = await queryUsersById(database, userIds).fetch();
+        const userMap = new Map<string, UserProfile>();
+        for (const user of users) {
+            userMap.set(user.id, user.toAPI());
+        }
+
+        for (const id of userIds) {
+            const user = userMap.get(id);
+            if (user) {
+                result[id] = user;
+            } else {
+                // Fallback for users not found in database
+                result[id] = fakeUser(id);
+            }
+        }
+    } catch (error) {
+        logError('Failed getExistingUserProfilesByIdWithFallback', error);
+        for (const id of userIds) {
+            result[id] = fakeUser(id);
+        }
+    }
+
+    return result;
 };

@@ -2,40 +2,49 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
+import {defineMessages} from 'react-intl';
 
 import {deleteSavedPost, savePostPreference} from '@actions/remote/preference';
 import {BaseOption} from '@components/common_post_options';
 import {useServerUrl} from '@context/server';
-import {t} from '@i18n';
 import {dismissBottomSheet} from '@screens/navigation';
 
-import type {AvailableScreens} from '@typings/screens/navigation';
-
 type CopyTextProps = {
-    bottomSheetId: AvailableScreens;
     isSaved: boolean;
     postId: string;
 }
 
-const SaveOption = ({bottomSheetId, isSaved, postId}: CopyTextProps) => {
+const messages = defineMessages({
+    save: {
+        id: 'mobile.post_info.save',
+        defaultMessage: 'Save',
+    },
+    unsave: {
+        id: 'mobile.post_info.unsave',
+        defaultMessage: 'Unsave',
+    },
+});
+
+const SaveOption = ({isSaved, postId}: CopyTextProps) => {
     const serverUrl = useServerUrl();
 
     const onHandlePress = useCallback(async () => {
         const remoteAction = isSaved ? deleteSavedPost : savePostPreference;
-        await dismissBottomSheet(bottomSheetId);
-        remoteAction(serverUrl, postId);
-    }, [bottomSheetId, postId, serverUrl]);
+        await dismissBottomSheet();
+        await remoteAction(serverUrl, postId);
+    }, [isSaved, postId, serverUrl]);
 
-    const id = isSaved ? t('mobile.post_info.unsave') : t('mobile.post_info.save');
-    const defaultMessage = isSaved ? 'Unsave' : 'Save';
+    const message = isSaved ? messages.unsave : messages.save;
+
+    // formatjs ast:true turns defaultMessage into an AST array; don't interpolate it into testIDs.
+    const testID = isSaved ? 'post_options.Unsave_post.option' : 'post_options.Save_post.option';
 
     return (
         <BaseOption
-            i18nId={id}
-            defaultMessage={defaultMessage}
+            message={message}
             iconName='bookmark-outline'
             onPress={onHandlePress}
-            testID={`post_options.${defaultMessage.toLocaleLowerCase()}_post.option`}
+            testID={testID}
         />
     );
 };

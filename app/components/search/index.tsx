@@ -4,10 +4,10 @@
 /* eslint-disable react/prop-types */
 // We disable the prop types check here as forwardRef & typescript has a bug
 
+import {SearchBar} from '@rneui/base';
 import React, {forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState} from 'react';
 import {useIntl} from 'react-intl';
-import {type ActivityIndicatorProps, Keyboard, Platform, type StyleProp, TextInput, type TextInputProps, type TextStyle, type TouchableOpacityProps, type ViewStyle} from 'react-native';
-import {SearchBar} from 'react-native-elements';
+import {type ActivityIndicatorProps, Keyboard, type NativeSyntheticEvent, Platform, type StyleProp, TextInput, type TextInputFocusEventData, type TextInputProps, type TextStyle, type TouchableOpacityProps, type ViewStyle} from 'react-native';
 
 import CompassIcon from '@components/compass_icon';
 import {SEARCH_INPUT_HEIGHT} from '@constants/view';
@@ -42,12 +42,14 @@ export type SearchProps = TextInputProps & {
     showLoading?: boolean;
 };
 
+type Selection = {start: number; end: number};
+
 export type SearchRef = {
     blur: () => void;
     cancel: () => void;
     clear: () => void;
     focus: () => void;
-    setNativeProps(nativeProps: object): void;
+    setCaretPosition(selection: Selection): void;
 }
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
@@ -62,6 +64,21 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
         borderRadius: 8,
         height: SEARCH_INPUT_HEIGHT,
         marginLeft: 0,
+
+        // RNEUI iOS SearchBar flattens inputContainerStyle last and sets
+        // marginRight to the Cancel width while focused. Omit the key on iOS
+        // (do not set undefined) or flatten overwrites that width and the
+        // clear icon overlaps Cancel. See inputContainerUnfocused for how the
+        // resting margin is restored.
+        ...Platform.select({android: {marginRight: 0}, default: {}}),
+    },
+
+    // While unfocused there is no Cancel button to make room for, so pin the
+    // margin back to 0 to match marginLeft. Without this the bar falls back to
+    // RNEUI's own inputContainer marginRight of 8 and sits asymmetrically.
+    // Applied conditionally so the focused state keeps RNEUI's cancel width.
+    inputContainerUnfocused: {
+        marginRight: 0,
     },
     inputStyle: {
         color: theme.centerChannelColor,
@@ -76,27 +93,47 @@ const Search = forwardRef<SearchRef, SearchProps>((props: SearchProps, ref) => {
     const intl = useIntl();
     const theme = useTheme();
     const styles = getStyleSheet(theme);
-    const searchRef = useRef<TextInput>(null);
+    const searchRef = useRef<TextInput | null>(null);
     const [value, setValue] = useState(props.defaultValue || props.value || '');
+    const [hasFocus, setHasFocus] = useState(false);
     const searchClearButtonTestID = `${props.testID}.search.clear.button`;
     const searchCancelButtonTestID = `${props.testID}.search.cancel.button`;
     const searchInputTestID = `${props.testID}.search.input`;
 
+    const onCancelProp = props.onCancel;
+    const onClearProp = props.onClear;
+    const onChangeTextProp = props.onChangeText;
     const onCancel = useCallback(() => {
         Keyboard.dismiss();
         setValue('');
-        props.onCancel?.();
-    }, [props.onCancel]);
+        onCancelProp?.();
+    }, [onCancelProp]);
 
     const onClear = useCallback(() => {
         setValue('');
-        props.onClear?.();
-    }, [props.onClear]);
+        onClearProp?.();
+    }, [onClearProp]);
 
     const onChangeText = useCallback((text: string) => {
         setValue(text);
-        props.onChangeText?.(text);
-    }, [props.onChangeText]);
+        onChangeTextProp?.(text);
+    }, [onChangeTextProp]);
+
+    // Focus is tracked only to decide the resting marginRight (see styles).
+    // RNEUI wraps its own focus handling in LayoutAnimation.configureNext, and
+    // this update batches into that same commit, so the change still animates.
+    const onFocusProp = props.onFocus;
+    const onBlurProp = props.onBlur;
+
+    const onFocus = useCallback((e: NativeSyntheticEvent<TextInputFocusEventData>) => {
+        setHasFocus(true);
+        onFocusProp?.(e);
+    }, [onFocusProp]);
+
+    const onBlur = useCallback((e: NativeSyntheticEvent<TextInputFocusEventData>) => {
+        setHasFocus(false);
+        onBlurProp?.(e);
+    }, [onBlurProp]);
 
     const cancelButtonProps = useMemo(() => ({
         buttonTextStyle: {
@@ -143,7 +180,7 @@ const Search = forwardRef<SearchRef, SearchProps>((props: SearchProps, ref) => {
             searchRef.current?.blur();
         },
         cancel: () => {
-            // @ts-expect-error cancel is not part of TextInput does exist in SearchBar
+            // @ts-expect-error cancel not in TextInput type but exists at runtime
             searchRef.current?.cancel();
         },
         clear: () => {
@@ -152,8 +189,8 @@ const Search = forwardRef<SearchRef, SearchProps>((props: SearchProps, ref) => {
         focus: () => {
             searchRef.current?.focus();
         },
-        setNativeProps: (nativeProps: object) => {
-            searchRef.current?.setNativeProps(nativeProps);
+        setCaretPosition: (nativeProps: Selection) => {
+            searchRef.current?.setSelection(nativeProps.start, nativeProps.end);
         },
     }), [searchRef]);
 
@@ -163,24 +200,26 @@ const Search = forwardRef<SearchRef, SearchProps>((props: SearchProps, ref) => {
             cancelButtonProps={props.cancelButtonProps || cancelButtonProps}
             cancelButtonTitle={props.cancelButtonTitle || intl.formatMessage({id: 'mobile.post.cancel', defaultMessage: 'Cancel'})}
             cancelIcon={cancelIcon}
-
-            // @ts-expect-error clearIcon definition does not include a ReactElement
             clearIcon={clearIcon}
             containerStyle={[styles.containerStyle, props.containerStyle]}
-            inputContainerStyle={[styles.inputContainerStyle, props.inputContainerStyle]}
+            inputContainerStyle={[
+                styles.inputContainerStyle,
+                Platform.OS === 'ios' && !hasFocus && styles.inputContainerUnfocused,
+                props.inputContainerStyle,
+            ]}
             inputStyle={[styles.inputStyle, props.inputStyle]}
             returnKeyType='search'
             onCancel={onCancel}
             onClear={onClear}
-
-            // @ts-expect-error onChangeText type definition is wrong in elements
             onChangeText={onChangeText}
+            onFocus={onFocus}
+            onBlur={onBlur}
             placeholder={props.placeholder || intl.formatMessage({id: 'search_bar.search', defaultMessage: 'Search'})}
             placeholderTextColor={props.placeholderTextColor || changeOpacity(theme.centerChannelColor, Platform.select({android: 0.56, default: 0.72}))}
             platform={Platform.select({android: 'android', default: 'ios'})}
-            ref={searchRef}
 
-            // @ts-expect-error searchIcon definition does not include a ReactElement
+            // @ts-expect-error legacy ref
+            ref={searchRef}
             searchIcon={searchIcon}
             selectionColor={Platform.select({android: changeOpacity(props.selectionColor || theme.centerChannelColor, 0.24), default: props.selectionColor || theme.centerChannelColor})}
             testID={searchInputTestID}

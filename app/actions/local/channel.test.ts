@@ -1,18 +1,41 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+/* eslint-disable max-lines */
+
 import {DeviceEventEmitter} from 'react-native';
 
-import {Navigation} from '@constants';
+import {ActionType, Events, Navigation} from '@constants';
 import {SYSTEM_IDENTIFIERS} from '@constants/database';
 import DatabaseManager from '@database/manager';
 import {getMyChannel} from '@queries/servers/channel';
+import {getPostById, queryPostsInChannel} from '@queries/servers/post';
 import {getCommonSystemValues, getTeamHistory} from '@queries/servers/system';
 import {getTeamChannelHistory} from '@queries/servers/team';
-import {dismissAllModalsAndPopToRoot, dismissAllModalsAndPopToScreen} from '@screens/navigation';
+import {navigateToRoot, dismissAllRoutesAndPopToScreen} from '@screens/navigation';
+import TestHelper from '@test/test_helper';
 
-import {switchToChannel} from './channel';
+import {
+    switchToChannel,
+    removeCurrentUserFromChannel,
+    setChannelDeleteAt,
+    selectAllMyChannelIds,
+    markChannelAsViewed,
+    markChannelAsUnread,
+    resetMessageCount,
+    storeMyChannelsForTeam,
+    updateMyChannelFromWebsocket,
+    updateChannelInfoFromChannel,
+    updateLastPostAt,
+    updateMyChannelLastFetchedAt,
+    updateChannelsDisplayName,
+    showUnreadChannelsOnly,
+    updateDmGmDisplayName,
+    deletePostsForChannelsWithAutotranslation,
+    deletePostsForChannel,
+} from './channel';
 
+import type {ChannelModel, MyChannelModel, SystemModel} from '@database/models/server';
 import type ServerDataOperator from '@database/operator/server_data_operator';
 import type {Database} from '@nozbe/watermelondb';
 
@@ -23,10 +46,17 @@ jest.mock('@screens/navigation', () => {
     const original = jest.requireActual('@screens/navigation');
     return {
         ...original,
-        dismissAllModalsAndPopToScreen: jest.fn(),
-        dismissAllModalsAndPopToRoot: jest.fn(),
+        dismissAllRoutesAndPopToScreen: jest.fn(),
+        navigateToRoot: jest.fn(),
     };
 });
+
+jest.mock('@store/navigation_store', () => ({
+    NavigationStore: {
+        waitUntilScreenHasLoaded: jest.fn().mockResolvedValue(true),
+        isScreenInStack: jest.fn().mockReturnValue(true),
+    },
+}));
 
 jest.mock('@utils/helpers', () => {
     const original = jest.requireActual('@utils/helpers');
@@ -81,8 +111,8 @@ describe('switchToChannel', () => {
         listener.remove();
 
         expect(error).toBeTruthy();
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(0);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(0);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -103,8 +133,8 @@ describe('switchToChannel', () => {
         expect(teamHistory.length).toBe(0);
         expect(channelHistory.length).toBe(0);
         expect(member?.lastViewedAt).toBe(undefined);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(0);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(0);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -128,8 +158,8 @@ describe('switchToChannel', () => {
         expect(teamHistory.length).toBe(0);
         expect(channelHistory.length).toBe(0);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -154,8 +184,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -181,8 +211,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -209,8 +239,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -237,8 +267,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -264,8 +294,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -290,8 +320,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -317,8 +347,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -344,8 +374,8 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -372,8 +402,8 @@ describe('switchToChannel', () => {
         expect(teamHistory.length).toBe(0);
         expect(channelHistory.length).toBe(0);
         expect(member?.lastViewedAt).toBe(0);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(0);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(0);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -402,8 +432,8 @@ describe('switchToChannel', () => {
         expect(teamHistory.length).toBe(0);
         expect(channelHistory.length).toBe(0);
         expect(member?.lastViewedAt).toBe(0);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(1);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(0);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(1);
+        expect(navigateToRoot).toHaveBeenCalledTimes(0);
         expect(listenerCallback).toHaveBeenCalledTimes(0);
     });
 
@@ -431,8 +461,945 @@ describe('switchToChannel', () => {
         expect(channelHistory.length).toBe(1);
         expect(channelHistory[0]).toBe(channelId);
         expect(member?.lastViewedAt).toBe(now);
-        expect(dismissAllModalsAndPopToScreen).toHaveBeenCalledTimes(0);
-        expect(dismissAllModalsAndPopToRoot).toHaveBeenCalledTimes(1);
+        expect(dismissAllRoutesAndPopToScreen).toHaveBeenCalledTimes(0);
+        expect(navigateToRoot).toHaveBeenCalledTimes(1);
         expect(listenerCallback).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('removeCurrentUserFromChannel', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const team: Team = {
+        id: teamId,
+    } as Team;
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        channel_id: channelId,
+        msg_count: 0,
+    } as ChannelMembership;
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {error} = await removeCurrentUserFromChannel('foo', 'channelId');
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no member', async () => {
+        const {models, error} = await removeCurrentUserFromChannel(serverUrl, 'channelId');
+        expect(error).toBeUndefined();
+        expect(models?.length).toBe(0);
+    });
+
+    it('handle no channel', async () => {
+        await operator.handleTeam({teams: [team], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.CURRENT_TEAM_ID, value: teamId}, {id: SYSTEM_IDENTIFIERS.CURRENT_CHANNEL_ID, value: channelId}], prepareRecordsOnly: false});
+
+        const {models, error} = await removeCurrentUserFromChannel(serverUrl, channelId);
+        expect(error).toBeTruthy();
+        expect(models).toBeUndefined();
+    });
+
+    it('remove user from current channel', async () => {
+        await operator.handleTeam({teams: [team], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.CURRENT_TEAM_ID, value: teamId}, {id: SYSTEM_IDENTIFIERS.CURRENT_CHANNEL_ID, value: channelId}], prepareRecordsOnly: false});
+
+        const {models, error} = await removeCurrentUserFromChannel(serverUrl, channelId);
+
+        const {member} = await queryDatabaseValues(operator.database, teamId, channelId);
+
+        expect(error).toBeUndefined();
+        expect(member).toBeUndefined();
+        expect(models?.length).toBe(2); // Deleted my channel and channel
+    });
+});
+
+describe('setChannelDeleteAt', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {error} = await setChannelDeleteAt('foo', channelId, 0);
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no channel', async () => {
+        const {models, error} = await setChannelDeleteAt(serverUrl, channelId, 0);
+        expect(error).toBeDefined();
+        expect(error).toBe(`channel with id ${channelId} not found`);
+        expect(models).toBeUndefined();
+    });
+
+    it('set channel delete at', async () => {
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {models, error} = await setChannelDeleteAt(serverUrl, channelId, 123);
+        expect(error).toBeUndefined();
+        expect(models?.length).toBe(1); // Deleted channel
+        expect(models![0].deleteAt).toBe(123);
+    });
+});
+
+describe('selectAllMyChannelIds', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        channel_id: channelId,
+        msg_count: 0,
+    } as ChannelMembership;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const result = await selectAllMyChannelIds('foo');
+        expect(result.length).toBe(0);
+    });
+
+    it('handle no my channels', async () => {
+        const result = await selectAllMyChannelIds(serverUrl);
+        expect(result.length).toBe(0);
+    });
+
+    it('select my channels', async () => {
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+
+        const result = await selectAllMyChannelIds(serverUrl);
+        expect(result.length).toBe(1); // My channel
+        expect(result[0]).toBe(channelId);
+    });
+});
+
+describe('markChannelAsViewed', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const channel = TestHelper.fakeChannel({id: channelId});
+    const channelMember = TestHelper.fakeChannelMember({
+        channel_id: channelId,
+        mention_count: 2,
+        urgent_mention_count: 3,
+    });
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('should reset urgent mention count when viewed', async () => {
+        const {error} = await markChannelAsViewed(serverUrl, channelId);
+        const member = await getMyChannel(operator.database, channelId);
+
+        expect(error).toBeUndefined();
+        expect(member?.mentionsCount).toBe(0);
+        expect(member?.urgentMentionCount).toBe(0);
+    });
+});
+
+describe('markChannelAsUnread', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        channel_id: channelId,
+        msg_count: 0,
+    } as ChannelMembership;
+    const unreadArgs = {
+        channelId,
+        messageCount: 10,
+        mentionsCount: 1,
+        urgentMentionCount: 2,
+        lastViewed: 123,
+    };
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {member, error} = await markChannelAsUnread('foo', unreadArgs, false);
+        expect(error).toBeTruthy();
+        expect(member).toBeUndefined();
+    });
+
+    it('handle no member', async () => {
+        const {member, error} = await markChannelAsUnread(serverUrl, unreadArgs, false);
+        expect(error).toBe('not a member');
+        expect(member).toBeUndefined();
+    });
+
+    it('mark channel as unread', async () => {
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {member, error} = await markChannelAsUnread(serverUrl, unreadArgs, false);
+        expect(error).toBeUndefined();
+        expect(member).toBeDefined();
+        expect(member?.viewedAt).toBe(122);
+        expect(member?.lastViewedAt).toBe(122);
+        expect(member?.messageCount).toBe(10);
+        expect(member?.mentionsCount).toBe(1);
+        expect(member?.urgentMentionCount).toBe(2);
+    });
+});
+
+describe('resetMessageCount', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 10,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        channel_id: channelId,
+        msg_count: 10,
+    } as ChannelMembership;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const result = await resetMessageCount('foo', channelId);
+        expect((result as { error: unknown }).error).toBeDefined();
+    });
+
+    it('handle no member', async () => {
+        const result = await resetMessageCount(serverUrl, channelId);
+        expect((result as { error: unknown }).error).toBe('not a member');
+    });
+
+    it('reset message count', async () => {
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const member = await resetMessageCount(serverUrl, channelId);
+        expect((member as { error: unknown }).error).toBeUndefined();
+        expect(member).toBeDefined();
+        expect((member as MyChannelModel).messageCount).toBe(0);
+    });
+});
+
+describe('storeMyChannelsForTeam', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const team: Team = {
+        id: teamId,
+    } as Team;
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: channelId,
+        msg_count: 0,
+    } as ChannelMembership;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {models, error} = await storeMyChannelsForTeam('foo', teamId, [channel], [channelMember], false, false);
+        expect(models).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no member', async () => {
+        await operator.handleTeam({teams: [team], prepareRecordsOnly: false});
+        await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.CURRENT_USER_ID, value: 'userid'}], prepareRecordsOnly: false});
+
+        const {models, error} = await storeMyChannelsForTeam(serverUrl, teamId, [], [], false, false);
+        expect(error).toBeUndefined();
+        expect(models).toBeDefined();
+        expect(models!.length).toBe(0);
+    });
+
+    it('store my channels for team', async () => {
+        await operator.handleTeam({teams: [team], prepareRecordsOnly: false});
+
+        const {models: prepModels, error: prepError} = await storeMyChannelsForTeam(serverUrl, teamId, [channel], [channelMember], true, false);
+        expect(prepError).toBeUndefined();
+        expect(prepModels).toBeDefined();
+        expect(prepModels!.length).toBe(5); // Channel, channel info, member, settings and my channel
+
+        const {models, error} = await storeMyChannelsForTeam(serverUrl, teamId, [channel], [channelMember], false, false);
+        expect(error).toBeUndefined();
+        expect(models).toBeDefined();
+        expect(models!.length).toBe(5);
+    });
+});
+
+describe('updateMyChannelFromWebsocket', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = TestHelper.fakeChannel({
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    });
+    const channelMember: ChannelMembership = TestHelper.fakeChannelMember({
+        id: 'id',
+        user_id: 'userid',
+        channel_id: channelId,
+        msg_count: 0,
+        roles: '',
+    });
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {model, error} = await updateMyChannelFromWebsocket('foo', channelMember, false);
+        expect(model).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('update my channel from websocket', async () => {
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {model, error} = await updateMyChannelFromWebsocket(serverUrl, {...channelMember, roles: 'channel_user'}, false);
+        expect(error).toBeUndefined();
+        expect(model).toBeDefined();
+        expect(model?.roles).toBe('channel_user');
+    });
+
+    it('calls deletePostsForChannel when autotranslation changes', async () => {
+        const post = TestHelper.fakePost({id: 'postid1', channel_id: channelId, root_id: ''});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handlePosts({actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL, order: [post.id], posts: [post], prepareRecordsOnly: false});
+
+        await updateMyChannelFromWebsocket(serverUrl, {...channelMember, autotranslation_disabled: true}, false);
+
+        expect(DeviceEventEmitter.emit).toHaveBeenCalledWith(Events.POST_DELETED_FOR_CHANNEL, {serverUrl, channelId, teamId: channel.team_id});
+    });
+
+    it('updates member autotranslation from channelMember', async () => {
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        await updateMyChannelFromWebsocket(serverUrl, {...channelMember, autotranslation_disabled: true}, false);
+
+        const member = await getMyChannel(operator.database, channelId);
+        expect(member?.autotranslationDisabled).toBe(true);
+    });
+});
+
+describe('updateChannelInfoFromChannel', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {model, error} = await updateChannelInfoFromChannel('foo', channel, false);
+        expect(model).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('update channel info from channel', async () => {
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {model, error} = await updateChannelInfoFromChannel(serverUrl, {...channel, header: 'newheader'}, false);
+        expect(error).toBeUndefined();
+        expect(model).toBeDefined();
+        expect(model?.length).toBe(1);
+        expect(model![0].header).toBe('newheader');
+    });
+});
+
+describe('updateLastPostAt', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: channelId,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {member, error} = await updateLastPostAt('foo', channelId, 123, false);
+        expect(member).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no member', async () => {
+        const {member, error} = await updateLastPostAt(serverUrl, channelId, 123, false);
+        expect(error).toBeDefined();
+        expect(error).toBe('not a member');
+        expect(member).toBeUndefined();
+    });
+
+    it('update last post at', async () => {
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+
+        const {member, error} = await updateLastPostAt(serverUrl, channelId, 123, false);
+        expect(error).toBeUndefined();
+        expect(member).toBeDefined();
+        expect(member?.lastPostAt).toBe(123);
+    });
+});
+
+describe('updateChannelsDisplayName', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const dmChannel: Channel = {
+        id: channelId,
+        name: 'userid__userid2',
+        display_name: '',
+        team_id: '',
+        total_msg_count: 0,
+        delete_at: 0,
+        type: 'D',
+    } as Channel;
+    const dmChannelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: dmChannel.id,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+    const gmChannel: Channel = {
+        id: 'id2',
+        name: 'name',
+        display_name: '',
+        team_id: '',
+        total_msg_count: 0,
+        delete_at: 0,
+        type: 'G',
+    } as Channel;
+    const gmChannelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: gmChannel.id,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+    const user: UserProfile = {
+        id: 'userid',
+        username: 'username',
+        roles: '',
+    } as UserProfile;
+    const user2: UserProfile = {
+        id: 'userid2',
+        username: 'username2',
+        first_name: 'first',
+        last_name: 'last',
+        roles: '',
+    } as UserProfile;
+    const user3: UserProfile = {
+        id: 'userid3',
+        username: 'username3',
+        first_name: 'first',
+        last_name: 'last',
+        roles: '',
+    } as UserProfile;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {models, error} = await updateChannelsDisplayName('foo', [], [], false);
+        expect(models).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no currnet user', async () => {
+        const {models, error} = await updateChannelsDisplayName(serverUrl, [], [], false);
+        expect(models).toBeUndefined();
+        expect(error).toBeUndefined();
+    });
+
+    it('update channels display name', async () => {
+        const channelModels = await operator.handleChannel({channels: [dmChannel, gmChannel], prepareRecordsOnly: false});
+        await operator.handleUsers({users: [user, user2, user3], prepareRecordsOnly: false});
+        await operator.handleChannelMembership({channelMemberships: [{...gmChannelMember, user_id: user2.id}, {...gmChannelMember, user_id: user3.id}], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [dmChannel, gmChannel], myChannels: [dmChannelMember, gmChannelMember], prepareRecordsOnly: false});
+        await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.CURRENT_USER_ID, value: user.id}], prepareRecordsOnly: false});
+
+        const {models, error} = await updateChannelsDisplayName(serverUrl, channelModels, [user, user2], false);
+        expect(error).toBeUndefined();
+        expect(models).toBeDefined();
+        expect(models?.length).toBe(2);
+        expect((models![0] as ChannelModel).displayName).toBe(user2.username);
+        expect((models![1] as ChannelModel).displayName).toBe(`${user2.username}, ${user3.username}`);
+    });
+});
+
+describe('showUnreadChannelsOnly', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const teamId = 'tId1';
+    const channel: Channel = {
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        delete_at: 0,
+    } as Channel;
+    const channelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: channelId,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const result = await showUnreadChannelsOnly('foo', true);
+        expect((result as { error: unknown}).error).toBeTruthy();
+    });
+
+    it('show unread channels only', async () => {
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+
+        const result = await showUnreadChannelsOnly(serverUrl, true);
+        expect((result as { error: unknown}).error).toBeUndefined();
+        const models = (result as SystemModel[]);
+        expect(models).toBeDefined();
+        expect(models?.length).toBe(1);
+        expect(models![0].id).toBe(SYSTEM_IDENTIFIERS.ONLY_UNREADS);
+        expect(models![0].value).toBe(true);
+    });
+});
+
+describe('updateDmGmDisplayName', () => {
+    let operator: ServerDataOperator;
+    const serverUrl = 'baseHandler.test.com';
+    const channelId = 'id1';
+    const dmChannel: Channel = {
+        id: channelId,
+        name: 'userid__userid2',
+        display_name: '',
+        team_id: '',
+        total_msg_count: 0,
+        delete_at: 0,
+        type: 'D',
+    } as Channel;
+    const dmChannelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: dmChannel.id,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+    const gmChannel: Channel = {
+        id: 'id2',
+        name: 'name',
+        display_name: '',
+        team_id: '',
+        total_msg_count: 0,
+        delete_at: 0,
+        type: 'G',
+    } as Channel;
+    const gmChannelMember: ChannelMembership = {
+        id: 'id',
+        user_id: 'userid',
+        channel_id: gmChannel.id,
+        msg_count: 0,
+        roles: '',
+    } as ChannelMembership;
+    const user: UserProfile = {
+        id: 'userid',
+        username: 'username',
+        roles: '',
+    } as UserProfile;
+    const user2: UserProfile = {
+        id: 'userid2',
+        username: 'username2',
+        first_name: 'first',
+        last_name: 'last',
+        roles: '',
+    } as UserProfile;
+    const user3: UserProfile = {
+        id: 'userid3',
+        username: 'username3',
+        first_name: 'first',
+        last_name: 'last',
+        roles: '',
+    } as UserProfile;
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {channels, error} = await updateDmGmDisplayName('foo');
+        expect(channels).toBeUndefined();
+        expect(error).toBeTruthy();
+    });
+
+    it('handle no currnet user', async () => {
+        const {channels, error} = await updateDmGmDisplayName(serverUrl);
+        expect(channels).toBeUndefined();
+        expect(error).toBeDefined();
+        expect(error).toBe('The current user id could not be retrieved from the database');
+    });
+
+    it('update dm gm display name', async () => {
+        await operator.handleChannel({channels: [dmChannel, gmChannel], prepareRecordsOnly: false});
+        await operator.handleUsers({users: [user, user2, user3], prepareRecordsOnly: false});
+        await operator.handleChannelMembership({channelMemberships: [gmChannelMember, dmChannelMember, {...gmChannelMember, user_id: user2.id}, {...gmChannelMember, user_id: user3.id}], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [dmChannel, gmChannel], myChannels: [dmChannelMember, gmChannelMember], prepareRecordsOnly: false});
+        await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.CURRENT_USER_ID, value: user.id}], prepareRecordsOnly: false});
+
+        const {channels, error} = await updateDmGmDisplayName(serverUrl);
+        expect(error).toBeUndefined();
+        expect(channels).toBeDefined();
+        expect(channels?.length).toBe(2);
+        expect((channels![0] as ChannelModel).displayName).toBe(user2.username);
+        expect((channels![1] as ChannelModel).displayName).toBe(`${user2.username}, ${user3.username}`);
+    });
+});
+
+describe('deletePostsForChannel', () => {
+    const serverUrl = 'baseHandler.test.com';
+    let operator: ServerDataOperator;
+
+    const channelId = 'channelid1';
+    const teamId = 'tId1';
+    const channel: Channel = TestHelper.fakeChannel({
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+    });
+    const channelMember: ChannelMembership = TestHelper.fakeChannelMember({
+        id: 'id',
+        channel_id: channelId,
+        msg_count: 0,
+    });
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('handle not found database', async () => {
+        const {models, error} = await deletePostsForChannel('foo', channelId);
+        expect(models).toEqual([]);
+        expect(error).toBeTruthy();
+    });
+
+    it('channel not found', async () => {
+        const {models, error} = await deletePostsForChannel(serverUrl, 'nonexistent');
+        expect(models).toEqual([]);
+        expect(error).toBeFalsy();
+    });
+
+    it('should clear intervals and reset the watermark for a channel with no posts', async () => {
+        // A PostsInChannel interval that outlived its posts is exactly the state that
+        // renders a channel blank, so this must not early-return.
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await updateMyChannelLastFetchedAt(serverUrl, channelId, 900, false);
+        expect((await getMyChannel(operator.database, channelId))?.lastFetchedAt).toBe(900);
+
+        const gone = TestHelper.fakePost({id: 'gone', channel_id: channelId, create_at: 500});
+        await operator.handlePosts({actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL, order: [gone.id], posts: [gone], prepareRecordsOnly: false});
+
+        // the post is destroyed the way a received deletion destroys it, leaving the interval
+        await operator.handlePosts({actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL, order: [gone.id], posts: [{...gone, delete_at: 900, update_at: 900}], prepareRecordsOnly: false});
+        expect(await queryPostsInChannel(operator.database, channelId).fetch()).toHaveLength(1);
+        expect(await getPostById(operator.database, gone.id)).toBeUndefined();
+
+        const {error} = await deletePostsForChannel(serverUrl, channelId);
+        expect(error).toBeFalsy();
+
+        expect(await queryPostsInChannel(operator.database, channelId).fetch()).toHaveLength(0);
+        expect((await getMyChannel(operator.database, channelId))?.lastFetchedAt).toBe(0);
+    });
+
+    it('channel with posts - batch written and event emitted', async () => {
+        const post = TestHelper.fakePost({id: 'postid1', channel_id: channelId, root_id: ''});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [post.id],
+            posts: [post],
+            prepareRecordsOnly: false,
+        });
+
+        const listener = jest.fn();
+        const subscription = DeviceEventEmitter.addListener(Events.POST_DELETED_FOR_CHANNEL, listener);
+
+        const {models, error} = await deletePostsForChannel(serverUrl, channelId);
+        subscription.remove();
+
+        expect(error).toBeFalsy();
+        expect(models.length).toBeGreaterThan(0);
+        expect(listener).toHaveBeenCalledTimes(1);
+        expect(listener).toHaveBeenCalledWith({serverUrl, channelId, teamId: channel.team_id});
+
+        const myChannel = await getMyChannel(operator.database, channelId);
+        expect(myChannel?.lastFetchedAt).toBe(0);
+    });
+
+    it('prepareRecordsOnly true - no write and no emit', async () => {
+        const post = TestHelper.fakePost({id: 'postid2', channel_id: channelId, root_id: ''});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [post.id],
+            posts: [post],
+            prepareRecordsOnly: false,
+        });
+
+        const listener = jest.fn();
+        const subscription = DeviceEventEmitter.addListener(Events.POST_DELETED_FOR_CHANNEL, listener);
+
+        const {models, error} = await deletePostsForChannel(serverUrl, channelId, true);
+        subscription.remove();
+
+        expect(error).toBeFalsy();
+        expect(models.length).toBeGreaterThan(0);
+        expect(listener).not.toHaveBeenCalled();
+
+        const myChannel = await getMyChannel(operator.database, channelId);
+        expect(myChannel?._preparedState).toBe('update');
+
+        // Batch the records to avoid the invariant error
+        await operator.batchRecords([...models], 'test');
+    });
+});
+
+describe('deletePostsForChannelsWithAutotranslation', () => {
+    const serverUrl = 'baseHandler.test.com';
+    let operator: ServerDataOperator;
+
+    const channelId = 'channelid1';
+    const teamId = 'tId1';
+    const channel: Channel = TestHelper.fakeChannel({
+        id: channelId,
+        team_id: teamId,
+        total_msg_count: 0,
+        autotranslation: true,
+    });
+
+    beforeEach(async () => {
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+    });
+
+    it('no myChannels with autotranslation - no deletes', async () => {
+        const channelMember: ChannelMembership = TestHelper.fakeChannelMember({
+            id: 'id',
+            channel_id: channelId,
+            msg_count: 0,
+            autotranslation_disabled: true,
+        });
+        const post = TestHelper.fakePost({id: 'postid1', channel_id: channelId, root_id: ''});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [post.id],
+            posts: [post],
+            prepareRecordsOnly: false,
+        });
+
+        const {models, error} = await deletePostsForChannelsWithAutotranslation(serverUrl);
+        expect(error).toBeUndefined();
+        expect(models).toEqual([]);
+
+        const databasePost = await getPostById(operator.database, post.id);
+        expect(databasePost).toBeDefined();
+    });
+
+    it('myChannels with autotranslation - delete posts', async () => {
+        const channelMember: ChannelMembership = TestHelper.fakeChannelMember({
+            id: 'id',
+            channel_id: channelId,
+            msg_count: 0,
+            autotranslation_disabled: false,
+        });
+        const post = TestHelper.fakePost({id: 'postid1', channel_id: channelId, root_id: ''});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await operator.handleMyChannel({channels: [channel], myChannels: [channelMember], prepareRecordsOnly: false});
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [post.id],
+            posts: [post],
+            prepareRecordsOnly: false,
+        });
+
+        const {models, error} = await deletePostsForChannelsWithAutotranslation(serverUrl);
+        expect(error).toBeUndefined();
+        expect(models.length).toBeGreaterThan(0);
+        const databasePost = await getPostById(operator.database, post.id);
+        expect(databasePost).toBeUndefined();
+    });
+
+    it('handle error', async () => {
+        jest.spyOn(DatabaseManager, 'getServerDatabaseAndOperator').mockImplementationOnce(() => {
+            throw new Error('DB error');
+        });
+        const {models, error} = await deletePostsForChannelsWithAutotranslation(serverUrl);
+        expect(models).toEqual([]);
+        expect(error).toBeTruthy();
     });
 });

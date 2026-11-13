@@ -1,14 +1,15 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {BottomSheetFlatList} from '@gorhom/bottom-sheet';
+import {useBottomSheetScrollableCreator} from '@gorhom/bottom-sheet';
 import React, {useCallback, useMemo} from 'react';
 import {useIntl} from 'react-intl';
-import {FlatList, StyleSheet, View, type ListRenderItemInfo} from 'react-native';
+import {StyleSheet, View, type ListRenderItemInfo, FlatList} from 'react-native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
+import {TutorialProvider} from '@context/tutorial';
 import {BUTTON_HEIGHT} from '@screens/bottom_sheet';
 import BottomSheetContent from '@screens/bottom_sheet/content';
 import {addNewServer} from '@utils/server';
@@ -30,22 +31,19 @@ const styles = StyleSheet.create({
     contentContainer: {
         marginVertical: 4,
     },
-    serverList: {
-        marginBottom: BUTTON_HEIGHT,
-    },
 });
 
 const keyExtractor = (item: ServersModel) => item.url;
 
 const ServerList = ({servers}: Props) => {
     const intl = useIntl();
-    const isTablet = useIsTablet();
     const serverUrl = useServerUrl();
     const theme = useTheme();
+    const {bottom} = useSafeAreaInsets();
 
     const onAddServer = useCallback(async () => {
         addNewServer(theme);
-    }, [servers]);
+    }, [theme]);
 
     const renderServer = useCallback(({item: t, index}: ListRenderItemInfo<ServersModel>) => {
         return (
@@ -55,29 +53,34 @@ const ServerList = ({servers}: Props) => {
                 server={t}
             />
         );
-    }, []);
+    }, [serverUrl]);
 
-    const List = useMemo(() => (isTablet ? FlatList : BottomSheetFlatList), [isTablet]);
+    const BottomSheetScrollableCreator = useBottomSheetScrollableCreator();
+
+    const serverListStyle = useMemo(() => ({paddingBottom: 2 * (BUTTON_HEIGHT + bottom)}), [bottom]);
 
     return (
         <BottomSheetContent
             buttonIcon='plus'
             buttonText={intl.formatMessage({id: 'servers.create_button', defaultMessage: 'Add a server'})}
             onPress={onAddServer}
-            showButton={isTablet}
-            showTitle={!isTablet}
+            showButton={false}
+            showTitle={true}
             testID='server_list'
             title={intl.formatMessage({id: 'your.servers', defaultMessage: 'Your servers'})}
         >
-            <View style={[styles.container, {marginTop: isTablet ? 12 : 0}]}>
-                <List
-                    data={servers}
-                    style={styles.serverList}
-                    renderItem={renderServer}
-                    keyExtractor={keyExtractor}
-                    contentContainerStyle={styles.contentContainer}
-                />
-            </View>
+            <TutorialProvider>
+                <View style={styles.container}>
+                    <FlatList
+                        data={servers}
+                        renderItem={renderServer}
+                        keyExtractor={keyExtractor}
+                        contentContainerStyle={[styles.contentContainer, serverListStyle]}
+                        renderScrollComponent={BottomSheetScrollableCreator}
+                        testID='server_list.flat_list'
+                    />
+                </View>
+            </TutorialProvider>
         </BottomSheetContent>
     );
 };

@@ -8,7 +8,7 @@ import {StyleSheet, Text, TouchableOpacity, View, type StyleProp, type ViewStyle
 import CompassIcon from '@components/compass_icon';
 import CustomStatusEmoji from '@components/custom_status/custom_status_emoji';
 import ProfilePicture from '@components/profile_picture';
-import {BotTag, GuestTag} from '@components/tag';
+import {AgentTag, BotTag, GuestTag} from '@components/tag';
 import {useTheme} from '@context/theme';
 import {nonBreakingString} from '@utils/strings';
 import {makeStyleSheetFromTheme, changeOpacity} from '@utils/theme';
@@ -17,12 +17,12 @@ import {displayUsername, getUserCustomStatus, isBot, isCustomStatusExpired, isDe
 
 import type UserModel from '@typings/database/models/servers/user';
 
-type Props = {
+export type UserItemProps = {
     FooterComponent?: ReactNode;
     user?: UserProfile | UserModel;
     containerStyle?: StyleProp<ViewStyle>;
     currentUserId: string;
-    includeMargin?: boolean;
+    isAgent?: boolean;
     size?: number;
     testID?: string;
     isCustomStatusEnabled: boolean;
@@ -35,7 +35,6 @@ type Props = {
     onLayout?: () => void;
     disabled?: boolean;
     viewRef?: React.LegacyRef<View>;
-    padding?: number;
     hideGuestTags: boolean;
 }
 
@@ -63,28 +62,22 @@ const getThemedStyles = makeStyleSheetFromTheme((theme: Theme) => {
 
 const nonThemedStyles = StyleSheet.create({
     row: {
-        height: 40,
         paddingBottom: 8,
         paddingTop: 4,
         flexDirection: 'row',
         alignItems: 'center',
     },
-    margin: {marginVertical: 8},
     rowInfoBaseContainer: {
         flex: 1,
     },
     rowInfoContainer: {
         flex: 1,
         flexDirection: 'row',
-    },
-    icon: {
-        marginLeft: 4,
+        alignItems: 'center',
+        gap: 4,
     },
     profile: {
         marginRight: 12,
-    },
-    tag: {
-        marginLeft: 6,
     },
     flex: {
         flex: 1,
@@ -96,6 +89,7 @@ const UserItem = ({
     user,
     containerStyle,
     currentUserId,
+    isAgent = false,
     size = 24,
     testID,
     isCustomStatusEnabled,
@@ -108,10 +102,8 @@ const UserItem = ({
     onUserLongPress,
     disabled = false,
     viewRef,
-    padding,
-    includeMargin,
     hideGuestTags,
-}: Props) => {
+}: UserItemProps) => {
     const theme = useTheme();
     const style = getThemedStyles(theme);
     const intl = useIntl();
@@ -138,11 +130,9 @@ const UserItem = ({
             nonThemedStyles.row,
             {
                 opacity: disabled ? 0.32 : 1,
-                paddingHorizontal: padding || undefined,
             },
-            includeMargin && nonThemedStyles.margin,
         ];
-    }, [disabled, padding, includeMargin]);
+    }, [disabled]);
 
     const onPress = useCallback(() => {
         if (user) {
@@ -162,11 +152,11 @@ const UserItem = ({
             onLongPress={onLongPress}
             disabled={!(onUserPress || onUserLongPress)}
             onLayout={onLayout}
+            testID={userItemTestId}
         >
             <View
                 ref={viewRef}
-                style={[containerViewStyle, containerStyle]}
-                testID={userItemTestId}
+                style={[...containerViewStyle, containerStyle]}
             >
                 <ProfilePicture
                     author={user}
@@ -200,30 +190,23 @@ const UserItem = ({
                                 </Text>
                             )}
                         </Text>
-                        {showBadges && bot && (
-                            <BotTag
-                                testID={`${userItemTestId}.bot.tag`}
-                                style={nonThemedStyles.tag}
-                            />
+                        {showBadges && isAgent && (
+                            <AgentTag testID={`${userItemTestId}.agent.tag`}/>
+                        )}
+                        {showBadges && bot && !isAgent && (
+                            <BotTag testID={`${userItemTestId}.bot.tag`}/>
                         )}
                         {showBadges && guest && !hideGuestTags && (
-                            <GuestTag
-                                testID={`${userItemTestId}.guest.tag`}
-                                style={nonThemedStyles.tag}
-                            />
+                            <GuestTag testID={`${userItemTestId}.guest.tag`}/>
                         )}
                         {Boolean(isCustomStatusEnabled && !bot && customStatus?.emoji && !customStatusExpired) && (
-                            <CustomStatusEmoji
-                                customStatus={customStatus!}
-                                style={nonThemedStyles.icon}
-                            />
+                            <CustomStatusEmoji customStatus={customStatus!}/>
                         )}
                         {shared && (
                             <CompassIcon
                                 name={'circle-multiple-outline'}
                                 size={16}
                                 color={theme.centerChannelColor}
-                                style={nonThemedStyles.icon}
                             />
                         )}
                         <View style={nonThemedStyles.flex}/>

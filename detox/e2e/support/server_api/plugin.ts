@@ -3,6 +3,11 @@
 
 import path from 'path';
 
+import {
+    DEMO_PLUGIN_FIXTURE_FILENAME,
+    DEMO_PLUGIN_ID,
+} from '../../../shared/demo-plugin-fixture';
+
 import client from './client';
 import {apiUploadFile, getResponseFromError} from './common';
 
@@ -36,6 +41,41 @@ const prepackagedPlugins = new Set([
 ]);
 
 /**
+ * Get the latest release version from GitHub releases
+ * @param {string} repo - GitHub repository in format 'owner/repo'
+ * @return {Promise<string>} returns latest version string without 'v' prefix
+ */
+export const apiGetLatestPluginVersion = async (repo: string): Promise<string> => {
+    try {
+        const response = await client.get(`https://api.github.com/repos/${repo}/releases/latest`);
+        const tagName = response.data.tag_name;
+
+        // Remove 'v' prefix if present (e.g., 'v0.10.2' -> '0.10.2')
+        return tagName.startsWith('v') ? tagName.substring(1) : tagName;
+    } catch (err) {
+        // Fallback to hardcoded version if API fails
+        return '0.10.3';
+    }
+};
+
+// Agents Plugin Constants
+export const AgentsPlugin = {
+    id: 'mattermost-ai',
+} as const;
+
+// Calls Plugin Constants
+export const CallsPlugin = {
+    id: 'com.mattermost.calls',
+    url: 'https://github.com/mattermost/mattermost-plugin-calls/releases/download/v1.5.0/com.mattermost.calls-1.5.0.tar.gz',
+} as const;
+
+// Demo Plugin Constants
+export const DemoPlugin = {
+    id: DEMO_PLUGIN_ID,
+    filename: DEMO_PLUGIN_FIXTURE_FILENAME,
+} as const;
+
+/**
  * Disable non-prepackaged plugins.
  * @param {string} baseUrl - the base server URL
  */
@@ -45,7 +85,7 @@ export const apiDisableNonPrepackagedPlugins = async (baseUrl: string): Promise<
         return;
     }
     plugins.active.forEach(async (plugin: any) => {
-        if (!prepackagedPlugins.has(plugin.id)) {
+        if (plugin.id !== DemoPlugin.id && !prepackagedPlugins.has(plugin.id)) {
             await apiDisablePluginById(baseUrl, plugin.id);
         }
     });
@@ -135,12 +175,161 @@ export const apiRemovePluginById = async (baseUrl: string, pluginId: string): Pr
  * See https://api.mattermost.com/#operation/UploadPlugin
  * @param {string} baseUrl - the base server URL
  * @param {string} filename - the filename of plugin to be uploaded
+ * @param {boolean} force - overwrite an existing plugin install
  * @return {Object} returns response on success or {error, status} on error
  */
-export const apiUploadPlugin = async (baseUrl: string, filename: string): Promise<any> => {
+export const apiUploadPlugin = async (baseUrl: string, filename: string, force = false): Promise<any> => {
     try {
         const absFilePath = path.resolve(__dirname, `../../support/fixtures/${filename}`);
-        return await apiUploadFile('plugin', absFilePath, {url: `${baseUrl}/api/v4/plugins`, method: 'POST'});
+        const forceQuery = force ? '?force=true' : '';
+        return await apiUploadFile('plugin', absFilePath, {url: `${baseUrl}/api/v4/plugins${forceQuery}`, method: 'POST'});
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Get plugin status - whether it's installed and/or active.
+ * @param {string} baseUrl - the base server URL
+ * @param {string} pluginId - the plugin ID
+ * @param {string} version - the expected plugin version
+ * @return {Object} returns {isInstalled, isActive, plugin} on success or {error, status} on error
+ */
+export const apiGetPluginStatus = async (baseUrl: string, pluginId: string, version?: string): Promise<any> => {
+    const allPluginsResult = await apiGetAllPlugins(baseUrl);
+    if (allPluginsResult.error) {
+        return allPluginsResult;
+    }
+
+    const {plugins} = allPluginsResult;
+    if (!plugins) {
+        return {isInstalled: false, isActive: false};
+    }
+
+    try {
+        // Check if plugin is installed (in either active or inactive list)
+        let plugin = plugins.active?.find((p: any) => p.id === pluginId);
+        if (plugin) {
+            const isVersionMatch = !version || plugin.version === version;
+            return {
+                isInstalled: true,
+                isActive: true,
+                plugin,
+                isVersionMatch,
+            };
+        }
+
+        plugin = plugins.inactive?.find((p: any) => p.id === pluginId);
+        if (plugin) {
+            const isVersionMatch = !version || plugin.version === version;
+            return {
+                isInstalled: true,
+                isActive: false,
+                plugin,
+                isVersionMatch,
+            };
+        }
+
+        return {isInstalled: false, isActive: false};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Install a plugin from the Marketplace.
+ * See https://api.mattermost.com/#operation/InstallMarketplacePlugin
+ * @param {string} baseUrl - the base server URL
+ * @param {string} pluginId - the plugin ID to install from Marketplace
+ * @return {Object} returns {plugin} on success or {error, status} on error
+ */
+export const apiInstallPluginFromMarketplace = async (baseUrl: string, pluginId: string): Promise<any> => {
+    try {
+        const response = await client.post(`${baseUrl}/api/v4/plugins/marketplace`, {id: pluginId});
+        return {plugin: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Ensure a plugin is installed and active, installing from Marketplace if needed.
+ * @param {string} baseUrl - the base server URL
+ * @param {string} pluginId - the plugin ID
+ * @return {Object} returns {isInstalled, isActive} status
+ */
+export const apiEnsurePluginInstalled = async (baseUrl: string, pluginId: string): Promise<any> => {
+    // Check if already installed
+    const status = await apiGetPluginStatus(baseUrl, pluginId);
+    if (status.isActive) {
+        return status;
+    }
+
+    if (status.isInstalled && !status.isActive) {
+        // eslint-disable-next-line no-console
+        console.log(`[apiEnsurePluginInstalled] Plugin ${pluginId} installed but inactive, enabling...`);
+        await apiEnablePluginById(baseUrl, pluginId);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        return apiGetPluginStatus(baseUrl, pluginId);
+    }
+
+    // Not installed — try Marketplace
+    // eslint-disable-next-line no-console
+    console.log(`[apiEnsurePluginInstalled] Plugin ${pluginId} not installed, installing from Marketplace...`);
+    const installResult = await apiInstallPluginFromMarketplace(baseUrl, pluginId);
+    if (installResult.error) {
+        // eslint-disable-next-line no-console
+        console.warn(`[apiEnsurePluginInstalled] Marketplace install failed for ${pluginId}:`, installResult.error.message || installResult.error);
+        return {isInstalled: false, isActive: false};
+    }
+
+    // Enable after install
+    await apiEnablePluginById(baseUrl, pluginId);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const finalStatus = await apiGetPluginStatus(baseUrl, pluginId);
+    // eslint-disable-next-line no-console
+    console.log(`[apiEnsurePluginInstalled] Plugin ${pluginId}: installed=${finalStatus.isInstalled}, active=${finalStatus.isActive}`);
+    return finalStatus;
+};
+
+/**
+ * Submit the demo plugin file-upload interactive dialog (populates plugin KV for re-open hydration).
+ * @param {string} baseUrl - the base server URL
+ * @param {Object} params - dialog submit payload
+ * @return {Object} returns {status} on success or {error, status} on error
+ */
+export const apiSubmitDemoPluginFileUploadDialog = async (
+    baseUrl: string,
+    {
+        userId,
+        channelId,
+        teamId,
+        submission,
+        fileIds = [],
+    }: {
+        userId: string;
+        channelId: string;
+        teamId: string;
+        submission: Record<string, string>;
+        fileIds?: string[];
+    },
+): Promise<any> => {
+    try {
+        const response = await client.post(
+            `${baseUrl}/plugins/${DemoPlugin.id}/dialog/file-upload`,
+            {
+                user_id: userId,
+                channel_id: channelId,
+                team_id: teamId,
+                submission,
+                file_ids: fileIds,
+                cancelled: false,
+                state: 'somestate',
+            },
+        );
+
+        return {status: response.status};
     } catch (err) {
         return getResponseFromError(err);
     }
@@ -150,10 +339,15 @@ export const Plugin = {
     apiDisableNonPrepackagedPlugins,
     apiDisablePluginById,
     apiEnablePluginById,
+    apiEnsurePluginInstalled,
     apiGetAllPlugins,
+    apiGetLatestPluginVersion,
+    apiGetPluginStatus,
+    apiInstallPluginFromMarketplace,
     apiInstallPluginFromUrl,
     apiRemovePluginById,
     apiUploadPlugin,
+    apiSubmitDemoPluginFileUploadDialog,
 };
 
 export default Plugin;

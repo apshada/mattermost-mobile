@@ -1,0 +1,275 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {updateDmGmDisplayName} from '@actions/local/channel';
+import {reconcilePersistenceFlag} from '@actions/local/ephemeral_mode/wipe';
+import {invalidateRedactionGlobally, RedactionInvalidationReason} from '@actions/local/redaction';
+import {storeConfig} from '@actions/local/systems';
+import {invalidateRedactionForCurrentUser} from '@actions/websocket/access_control';
+import {SYSTEM_IDENTIFIERS} from '@constants/database';
+import DatabaseManager from '@database/manager';
+import SessionAttributesManager from '@managers/session_attributes_manager';
+import {getConfig, getLicense} from '@queries/servers/system';
+import RenderPermissionsStore from '@store/render_permissions_store';
+
+import {handleLicenseChangedEvent, handleConfigChangedEvent} from './system';
+
+import type ServerDataOperator from '@database/operator/server_data_operator';
+
+jest.mock('@actions/local/channel');
+jest.mock('@actions/local/ephemeral_mode/wipe');
+jest.mock('@actions/local/systems');
+jest.mock('@actions/local/redaction', () => ({
+    ...jest.requireActual('@actions/local/redaction'),
+    invalidateRedactionGlobally: jest.fn(),
+}));
+jest.mock('@actions/websocket/access_control');
+jest.mock('@database/manager');
+jest.mock('@managers/session_attributes_manager', () => ({
+    __esModule: true,
+    default: {
+        refreshManifest: jest.fn().mockResolvedValue(undefined),
+        removeServer: jest.fn(),
+    },
+}));
+jest.mock('@queries/servers/system');
+
+describe('WebSocket System Actions', () => {
+    const serverUrl = 'baseHandler.test.com';
+
+    let operator: ServerDataOperator;
+    let handleSystem: jest.SpyInstance;
+
+    beforeEach(async () => {
+        jest.clearAllMocks();
+
+        await DatabaseManager.init([serverUrl]);
+        operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+        handleSystem = jest.spyOn(operator, 'handleSystem');
+    });
+
+    afterEach(async () => {
+        await DatabaseManager.destroyServerDatabase(serverUrl);
+        jest.restoreAllMocks();
+    });
+
+    describe('handleLicenseChangedEvent', () => {
+        it('should handle missing operator', async () => {
+            DatabaseManager.serverDatabases = {};
+            const msg = {
+                data: {
+                    license: {
+                        LockTeammateNameDisplay: true,
+                    },
+                },
+            } as WebSocketMessage;
+            await handleLicenseChangedEvent(serverUrl, msg);
+            expect(handleSystem).not.toHaveBeenCalled();
+        });
+
+        it('should handle license update with no display name change', async () => {
+            const mockLicense = {
+                LockTeammateNameDisplay: false,
+            };
+
+            jest.mocked(getLicense).mockResolvedValue({
+                LockTeammateNameDisplay: 'false',
+            } as ClientLicense);
+
+            const msg = {
+                data: {
+                    license: mockLicense,
+                },
+            } as WebSocketMessage;
+
+            await handleLicenseChangedEvent(serverUrl, msg);
+
+            expect(handleSystem).toHaveBeenCalledWith({
+                systems: [{
+                    id: SYSTEM_IDENTIFIERS.LICENSE,
+                    value: JSON.stringify(mockLicense),
+                }],
+                prepareRecordsOnly: false,
+            });
+            expect(updateDmGmDisplayName).not.toHaveBeenCalled();
+        });
+
+        it('should handle license update with display name change', async () => {
+            const mockLicense = {
+                LockTeammateNameDisplay: true,
+            };
+
+            jest.mocked(getLicense).mockResolvedValue({
+                LockTeammateNameDisplay: 'false',
+            } as ClientLicense);
+
+            const msg = {
+                data: {
+                    license: mockLicense,
+                },
+            } as WebSocketMessage;
+
+            await handleLicenseChangedEvent(serverUrl, msg);
+
+            expect(handleSystem).toHaveBeenCalled();
+            expect(updateDmGmDisplayName).toHaveBeenCalledWith(serverUrl);
+        });
+
+        it('should invalidate file decisions only when the license crosses the ABAC tier', async () => {
+            // Below Enterprise Advanced the ABAC engine refuses to evaluate and every decision denies.
+            const advanced = {IsLicensed: 'true', SkuShortName: 'advanced'} as ClientLicense;
+            const professional = {IsLicensed: 'true', SkuShortName: 'professional'} as ClientLicense;
+
+            jest.mocked(getLicense).mockResolvedValue(advanced);
+            await handleLicenseChangedEvent(serverUrl, {data: {license: {...advanced, Users: '100'}}} as WebSocketMessage);
+            expect(invalidateRedactionForCurrentUser).not.toHaveBeenCalled();
+
+            await handleLicenseChangedEvent(serverUrl, {data: {license: professional}} as WebSocketMessage);
+            expect(invalidateRedactionForCurrentUser).toHaveBeenCalledTimes(1);
+            expect(invalidateRedactionForCurrentUser).toHaveBeenCalledWith(serverUrl, RedactionInvalidationReason.LicenseChanged);
+        });
+    });
+
+    describe('handleConfigChangedEvent', () => {
+        it('should handle missing operator', async () => {
+            DatabaseManager.serverDatabases = {};
+            const msg = {
+                data: {
+                    config: {
+                        LockTeammateNameDisplay: true,
+                    },
+                },
+            } as WebSocketMessage;
+            await handleConfigChangedEvent(serverUrl, msg);
+            expect(storeConfig).not.toHaveBeenCalled();
+        });
+
+        it('should invalidate file decisions in both directions of an ABAC enforcement change', async () => {
+            // On: nothing cached before enforcement may be trusted. Off: cached denials must be re-checked.
+            const enforced = {FeatureFlagPermissionPolicies: 'true', EnableAttributeBasedAccessControl: 'true'} as ClientConfig;
+            const notEnforced = {FeatureFlagPermissionPolicies: 'true', EnableAttributeBasedAccessControl: 'false'} as ClientConfig;
+
+            jest.mocked(getConfig).mockResolvedValue(notEnforced);
+            await handleConfigChangedEvent(serverUrl, {data: {config: enforced}} as WebSocketMessage);
+            expect(invalidateRedactionForCurrentUser).toHaveBeenCalledWith(serverUrl, RedactionInvalidationReason.ConfigChanged);
+            expect(invalidateRedactionGlobally).not.toHaveBeenCalled();
+
+            jest.mocked(getConfig).mockResolvedValue(enforced);
+            await handleConfigChangedEvent(serverUrl, {data: {config: notEnforced}} as WebSocketMessage);
+            expect(invalidateRedactionGlobally).toHaveBeenCalledWith(serverUrl, RedactionInvalidationReason.ConfigChanged);
+        });
+
+        it('should expire cached decisions only when the ChannelPermissionActions flag changes', async () => {
+            const expireServer = jest.spyOn(RenderPermissionsStore, 'expireServer');
+            const flagOn = {FeatureFlagChannelPermissionActions: 'true'} as ClientConfig;
+            const flagOff = {FeatureFlagChannelPermissionActions: 'false'} as ClientConfig;
+
+            jest.mocked(getConfig).mockResolvedValue(flagOn);
+            await handleConfigChangedEvent(serverUrl, {data: {config: flagOn}} as WebSocketMessage);
+            expect(expireServer).not.toHaveBeenCalled();
+
+            await handleConfigChangedEvent(serverUrl, {data: {config: flagOff}} as WebSocketMessage);
+            expect(expireServer).toHaveBeenCalledTimes(1);
+            expect(expireServer).toHaveBeenCalledWith(serverUrl);
+        });
+
+        it('should handle config update with no display name change', async () => {
+            const mockConfig = {
+                LockTeammateNameDisplay: false,
+            };
+
+            jest.mocked(getConfig).mockResolvedValue({
+                LockTeammateNameDisplay: 'false',
+            } as ClientConfig);
+
+            const msg = {
+                data: {
+                    config: mockConfig,
+                },
+            } as WebSocketMessage;
+
+            await handleConfigChangedEvent(serverUrl, msg);
+
+            expect(storeConfig).toHaveBeenCalledWith(serverUrl, mockConfig);
+            expect(updateDmGmDisplayName).not.toHaveBeenCalled();
+        });
+
+        it('should handle config update with display name change', async () => {
+            const mockConfig = {
+                LockTeammateNameDisplay: true,
+            };
+
+            jest.mocked(getConfig).mockResolvedValue({
+                LockTeammateNameDisplay: 'false',
+            } as ClientConfig);
+
+            const msg = {
+                data: {
+                    config: mockConfig,
+                },
+            } as WebSocketMessage;
+
+            await handleConfigChangedEvent(serverUrl, msg);
+
+            expect(storeConfig).toHaveBeenCalledWith(serverUrl, mockConfig);
+            expect(updateDmGmDisplayName).toHaveBeenCalledWith(serverUrl);
+        });
+
+        it('should re-init session attributes when feature flag is enabled', async () => {
+            jest.mocked(getConfig).mockResolvedValue({
+                FeatureFlagSessionAttributes: 'false',
+            } as ClientConfig);
+
+            const msg = {
+                data: {
+                    config: {
+                        FeatureFlagSessionAttributes: 'true',
+                    },
+                },
+            } as WebSocketMessage;
+
+            await handleConfigChangedEvent(serverUrl, msg);
+
+            expect(SessionAttributesManager.refreshManifest).toHaveBeenCalledWith(serverUrl);
+
+            // The session attributes sent with each request are part of the ABAC subject.
+            expect(invalidateRedactionForCurrentUser).toHaveBeenCalledWith(serverUrl, RedactionInvalidationReason.SessionAttributes);
+        });
+
+        it('should stop sending session attributes when feature flag is disabled', async () => {
+            jest.mocked(getConfig).mockResolvedValue({
+                FeatureFlagSessionAttributes: 'true',
+            } as ClientConfig);
+
+            const msg = {
+                data: {
+                    config: {
+                        FeatureFlagSessionAttributes: 'false',
+                    },
+                },
+            } as WebSocketMessage;
+
+            await handleConfigChangedEvent(serverUrl, msg);
+
+            expect(SessionAttributesManager.removeServer).toHaveBeenCalledWith(serverUrl);
+        });
+
+        it('should reconcile the persistence flag against the new config so a live MEM-cleanup change clears zero-persistence', async () => {
+            const mockConfig = {
+                MobileEphemeralModeEnabled: 'true',
+                MobileEphemeralModeAutoCacheCleanupDays: '5',
+            };
+
+            jest.mocked(getConfig).mockResolvedValue({
+                MobileEphemeralModeEnabled: 'true',
+                MobileEphemeralModeAutoCacheCleanupDays: '0',
+            } as ClientConfig);
+
+            const msg = {data: {config: mockConfig}} as WebSocketMessage;
+
+            await handleConfigChangedEvent(serverUrl, msg);
+
+            expect(reconcilePersistenceFlag).toHaveBeenCalledWith(serverUrl, mockConfig);
+        });
+    });
+});

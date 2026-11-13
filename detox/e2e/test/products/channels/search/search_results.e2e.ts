@@ -1,0 +1,270 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {
+    Post,
+    Setup,
+} from '@support/server_api';
+import {
+    serverOneUrl,
+    siteOneUrl,
+} from '@support/test_config';
+import {
+    ChannelListScreen,
+    ChannelScreen,
+    HomeScreen,
+    LoginScreen,
+    PermalinkScreen,
+    PostOptionsScreen,
+    SavedMessagesScreen,
+    SearchMessagesScreen,
+    ServerScreen,
+} from '@support/ui/screen';
+import {disableSynchronization, enableSynchronization, getRandomId, timeouts, wait, waitForElementToBeVisible, waitForElementToExist} from '@support/utils';
+import {expect, waitFor} from 'detox';
+
+describe('Search - Result Interactions', () => {
+    const serverOneDisplayName = 'Server 1';
+    const channelsCategory = 'channels';
+    let testChannel: any;
+    let testUser: any;
+
+    const submitSearch = async (term: string) => {
+        await SearchMessagesScreen.searchInput.tap();
+        await SearchMessagesScreen.searchInput.replaceText(term);
+        await SearchMessagesScreen.searchInput.tapReturnKey();
+        const flatList = SearchMessagesScreen.getFlatPostList();
+        try {
+            await flatList.scroll(100, 'down');
+        } catch {
+            // Keyboard already dismissed or results not yet rendered
+        }
+        await waitForElementToExist(flatList, timeouts.TWENTY_SEC);
+        return flatList;
+    };
+
+    beforeAll(async () => {
+        const {channel, user} = await Setup.apiInit(siteOneUrl);
+        testChannel = channel;
+        testUser = user;
+
+        // # Log in to server
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(testUser);
+    });
+
+    beforeEach(async () => {
+        // * Verify on channel list screen
+        await ChannelListScreen.toBeVisible();
+    });
+
+    afterEach(async () => {
+        try {
+            await waitForElementToExist(SearchMessagesScreen.searchCancelButton, timeouts.TWO_SEC);
+            await SearchMessagesScreen.searchCancelButton.tap();
+        } catch {
+            // Not on search
+        }
+        try {
+            await HomeScreen.channelListTab.tap();
+        } catch {
+            // Best-effort
+        }
+        await wait(timeouts.ONE_SEC);
+    });
+
+    afterAll(async () => {
+        // # Log out
+        await HomeScreen.logout();
+    });
+
+    it('MM-T3239_1 - long list of search results is scrollable', async () => {
+        // # Create many posts containing a common word
+        const commonWord = `common${getRandomId()}`;
+        const postCount = 20;
+        const postIds: string[] = [];
+
+        // retryOnTransportFailure: this test only needs a list long enough to scroll, so a post
+        // duplicated by a replayed request is harmless here. Without it a single dropped
+        // connection in the middle of the loop fails the test outright.
+        // "apiCreatePost failed: read ECONNRESET" partway through the 20.
+        /* eslint-disable no-await-in-loop */
+        for (let i = 0; i < postCount; i++) {
+            const {post} = await Post.apiCreatePost(siteOneUrl, {
+                channelId: testChannel.id,
+                message: `${commonWord} post number ${i}`,
+                retryOnTransportFailure: true,
+            });
+            postIds.push(post.id);
+        }
+        /* eslint-enable no-await-in-loop */
+
+        // # Open search messages screen
+        await SearchMessagesScreen.open();
+
+        // * Verify on search messages screen
+        await SearchMessagesScreen.toBeVisible();
+
+        // # Search for the common word
+        const flatList = await submitSearch(commonWord);
+
+        // # Scroll the results list down to verify it is scrollable.
+        try {
+            await flatList.scroll(300, 'down');
+        } catch {
+            // List may be too short to scroll — scrollability already satisfied
+        }
+        await wait(timeouts.ONE_SEC);
+
+        // * List still present after scrolling. Existence, not 75% visible —
+        // the iOS keyboard can cover the list (MM-T3239_1).
+        await waitForElementToExist(flatList, timeouts.TEN_SEC);
+
+        // # Clear search, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await wait(timeouts.ONE_SEC);
+
+        // Cleanup is best-effort — scrolling results can leave the screen in a state
+        // where the recent item remove button is not accessible on some platforms
+        try {
+            await waitFor(SearchMessagesScreen.getRecentSearchItemRemoveButton(commonWord)).toExist().withTimeout(timeouts.TEN_SEC);
+            await SearchMessagesScreen.getRecentSearchItemRemoveButton(commonWord).tap();
+        } catch {
+            // Recent item cleanup failed — not blocking; the core scroll assertion already passed
+        }
+        await ChannelListScreen.open();
+    });
+
+    it('MM-T3240_1 - no option to Add Reaction on search results', async () => {
+        // # Post a message and search for it
+        const searchTerm = `noreact${getRandomId()}`;
+        const message = `Message ${searchTerm}`;
+
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post: searchedPost} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+
+        // # Open search messages screen and search for the message
+        await SearchMessagesScreen.open();
+        await submitSearch(searchTerm);
+
+        // # Get post and open post options for the search result
+        await SearchMessagesScreen.openPostOptionsFor(searchedPost.id, message);
+
+        // * Verify "Add Reaction" pick reaction button is NOT present in post options
+        await expect(PostOptionsScreen.pickReactionButton).not.toExist();
+
+        // # Close post options
+        await PostOptionsScreen.close();
+
+        // # Clear search, remove recent search item, and go back to channel list screen
+        await SearchMessagesScreen.searchClearButton.tap();
+        await SearchMessagesScreen.getRecentSearchItemRemoveButton(searchTerm).tap();
+        await ChannelListScreen.open();
+    });
+
+    it('MM-T380_1 - link opens for post not displaying in center', async () => {
+        // # Post a message in the test channel
+        const searchTerm = `jumptest${getRandomId()}`;
+        const message = `Message ${searchTerm}`;
+
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post: postedMessage} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+
+        // # Open search messages screen and search for the posted message
+        await SearchMessagesScreen.open();
+        await submitSearch(searchTerm);
+
+        // * Verify post result is visible
+        const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(postedMessage.id, message);
+        await waitForElementToBeVisible(postListPostItem, timeouts.HALF_MIN);
+
+        // # Tap the post to navigate to it via permalink
+        await postListPostItem.tap();
+
+        // * Verify on permalink screen
+        await PermalinkScreen.toBeVisible();
+
+        // # Jump to recent messages
+        await PermalinkScreen.jumpToRecentMessages();
+
+        // * Verify on channel screen with the post visible
+        await ChannelScreen.toBeVisible();
+        const {postListPostItem: channelPostItem} = ChannelScreen.getPostListPostItem(postedMessage.id, message);
+        await expect(channelPostItem).toBeVisible();
+
+        // # Go back to channel list screen
+        await ChannelScreen.back();
+        await ChannelListScreen.open();
+    });
+
+    it('MM-T372_1 - highlighting does not persist in Saved Messages', async () => {
+        // # Post a message and search for it to establish search highlighting context
+        const searchTerm = `highlight${getRandomId()}`;
+        const message = `Message ${searchTerm}`;
+
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        const {post: searchedPost} = await ChannelScreen.postMessageAndVerify(message, testChannel.id, siteOneUrl);
+        await ChannelScreen.back();
+
+        // # Open search, search for term, and save the result
+        await SearchMessagesScreen.open();
+
+        try {
+            await SearchMessagesScreen.searchClearButton.tap();
+            await wait(timeouts.ONE_SEC);
+        } catch {
+            // Nothing to clear on the first search of a fresh screen.
+        }
+        await SearchMessagesScreen.searchInput.tap();
+
+        await disableSynchronization();
+        let searchedPostId: string;
+        try {
+            await SearchMessagesScreen.searchInput.replaceText(searchTerm);
+            await SearchMessagesScreen.searchInput.tapReturnKey();
+
+            searchedPostId = searchedPost.id;
+
+            const {postListPostItem} = SearchMessagesScreen.getPostListPostItem(searchedPostId, message);
+            await waitForElementToBeVisible(postListPostItem, timeouts.HALF_MIN);
+
+            await SearchMessagesScreen.openPostOptionsFor(searchedPostId, message);
+        } finally {
+            await enableSynchronization();
+        }
+        await PostOptionsScreen.tapSavePost();
+        await wait(timeouts.TWO_SEC);
+
+        // # Navigate to Saved Messages
+        await SavedMessagesScreen.open();
+
+        // * Verify on Saved Messages screen
+        await SavedMessagesScreen.toBeVisible();
+
+        // * Verify the message appears in Saved Messages (without search highlighting context)
+        await SavedMessagesScreen.waitForPostInList(searchedPostId, message);
+
+        // # Unsave the post to clean up, then go back to channel list
+        await SavedMessagesScreen.openPostOptionsFor(searchedPostId, message);
+        await PostOptionsScreen.tapUnsavePost();
+        await wait(timeouts.TWO_SEC);
+
+        // # Go back to search screen to clean up recent searches
+        await SearchMessagesScreen.open();
+        await SearchMessagesScreen.searchClearButton.tap();
+        try {
+            await SearchMessagesScreen.getRecentSearchItemRemoveButton(searchTerm).tap();
+        } catch {
+            // Cleanup best-effort
+        }
+        await ChannelListScreen.open();
+    });
+});

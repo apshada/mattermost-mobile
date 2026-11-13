@@ -4,21 +4,21 @@
 import React, {useCallback, useEffect, useState} from 'react';
 import {Pressable, type PressableStateCallbackType, type StyleProp, Text, type ViewStyle} from 'react-native';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
 import {useTheme} from '@context/theme';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 type OptionBoxProps = {
-    activeIconName?: string;
+    activeIconName?: CompassIconName;
     activeText?: string;
     containerStyle?: StyleProp<ViewStyle>;
-    iconName: string;
+    iconName: CompassIconName;
     isActive?: boolean;
     onPress: () => void;
     testID?: string;
     text: string;
-    destructiveIconName?: string;
+    destructiveIconName?: CompassIconName;
     destructiveText?: string;
     isDestructive?: boolean;
 }
@@ -81,7 +81,7 @@ const OptionBox = ({
         }
 
         return style;
-    }, [activated, containerStyle, theme, isDestructive]);
+    }, [styles, containerStyle, isDestructive, theme.dndIndicator, theme.buttonBg, activated]);
 
     const handleOnPress = useCallback(() => {
         if (activeIconName || activeText) {

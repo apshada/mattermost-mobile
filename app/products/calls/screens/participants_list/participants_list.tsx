@@ -1,11 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {BottomSheetFlatList} from '@gorhom/bottom-sheet';
+import {useBottomSheetScrollableCreator} from '@gorhom/bottom-sheet';
+import {FlashList, type ListRenderItemInfo} from '@shopify/flash-list';
 import React, {useCallback, useMemo} from 'react';
 import {useIntl} from 'react-intl';
-import {type ListRenderItemInfo, Text, TouchableOpacity, useWindowDimensions, View} from 'react-native';
-import {FlatList} from 'react-native-gesture-handler';
+import {Text, TouchableOpacity, useWindowDimensions, View} from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {hostMuteOthers} from '@calls/actions/calls';
@@ -17,7 +17,6 @@ import CompassIcon from '@components/compass_icon';
 import FormattedText from '@components/formatted_text';
 import {Screens} from '@constants';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
 import BottomSheet from '@screens/bottom_sheet';
 import {bottomSheetSnapPoint} from '@utils/helpers';
 import {makeStyleSheetFromTheme} from '@utils/theme';
@@ -30,7 +29,6 @@ const HEADER_HEIGHT = 62;
 const MIN_ROWS = 5;
 
 type Props = {
-    closeButtonId: string;
     sessionsDict: Dictionary<CallSession>;
     teammateNameDisplay: string;
     callServerUrl?: string;
@@ -68,7 +66,6 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
 }));
 
 export const ParticipantsList = ({
-    closeButtonId,
     sessionsDict,
     teammateNameDisplay,
     callServerUrl,
@@ -79,16 +76,15 @@ export const ParticipantsList = ({
     const theme = useTheme();
     const {onPress} = useHostMenus();
     const hostControlsAvailable = useHostControlsAvailable();
-    const {bottom} = useSafeAreaInsets();
     const {height} = useWindowDimensions();
-    const isTablet = useIsTablet();
-    const List = useMemo(() => (isTablet ? FlatList : BottomSheetFlatList), [isTablet]);
+    const {bottom} = useSafeAreaInsets();
     const styles = getStyleSheet(theme);
+    const BottomSheetScrollable = useBottomSheetScrollableCreator();
 
     const sessions = sortSessions(intl.locale, teammateNameDisplay, sessionsDict);
-    const snapPoint1 = bottomSheetSnapPoint(Math.min(sessions.length, MIN_ROWS), ROW_HEIGHT, bottom) + HEADER_HEIGHT;
+    const snapPoint1 = bottomSheetSnapPoint(Math.min(sessions.length, MIN_ROWS), ROW_HEIGHT) + HEADER_HEIGHT;
     const snapPoint2 = height * 0.8;
-    const snapPoints = [1, Math.min(snapPoint1, snapPoint2)];
+    const snapPoints = [1, Math.min(snapPoint1, snapPoint2) + bottom];
     if (sessions.length > MIN_ROWS && snapPoint1 < snapPoint2) {
         snapPoints.push(snapPoint2);
     }
@@ -136,12 +132,11 @@ export const ParticipantsList = ({
                         </TouchableOpacity>
                     }
                 </View>
-                <List
+                <FlashList
                     data={sessions}
                     renderItem={renderItem}
-                    overScrollMode={'auto'}
+                    renderScrollComponent={BottomSheetScrollable}
                 />
-                <View style={{height: bottom}}/>
             </>
         );
     };
@@ -149,8 +144,7 @@ export const ParticipantsList = ({
     return (
         <BottomSheet
             renderContent={renderContent}
-            closeButtonId={closeButtonId}
-            componentId={Screens.CALL_PARTICIPANTS}
+            screen={Screens.CALL_PARTICIPANTS}
             snapPoints={snapPoints}
         />
     );

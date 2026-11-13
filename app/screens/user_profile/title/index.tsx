@@ -13,6 +13,8 @@ import {useTheme} from '@context/theme';
 import {useIsTablet} from '@hooks/device';
 import {useGalleryItem} from '@hooks/gallery';
 import {openGalleryAtIndex} from '@utils/gallery';
+import {urlSafeBase64Encode} from '@utils/security';
+import {nonBreakingString} from '@utils/strings';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 import {displayUsername} from '@utils/user';
@@ -48,6 +50,8 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => ({
     details: {
         marginLeft: 24,
         justifyContent: 'center',
+        alignItems: 'flex-start',
+        gap: 4,
         flex: 1,
     },
     displayName: {
@@ -99,6 +103,14 @@ const UserProfileTitle = ({
         }
 
         if (imageUrl) {
+            // Match the cache key pattern used by UserProfileAvatar component
+            let cacheKey;
+            if (enablePostIconOverride && userIconOverride) {
+                cacheKey = `user-override-icon-${urlSafeBase64Encode(userIconOverride)}`;
+            } else {
+                cacheKey = `user-${user.id}-${user.lastPictureUpdate}`;
+            }
+
             const item: GalleryItemType = {
                 id: user.id,
                 uri: imageUrl,
@@ -109,6 +121,7 @@ const UserProfileTitle = ({
                 mime_type: 'image/png',
                 authorId: user.id,
                 type: 'avatar',
+                cacheKey,
             };
             openGalleryAtIndex(galleryIdentifier, 0, [item]);
         }
@@ -160,7 +173,7 @@ const UserProfileTitle = ({
                         style={styles.displayName}
                         testID='user_profile.display_name'
                     >
-                        {`${prefix}${displayName}`}
+                        {nonBreakingString(`${prefix}${displayName}`)}
                     </Text>
                     {!hideUsername &&
                     <Text

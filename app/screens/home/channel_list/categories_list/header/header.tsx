@@ -3,40 +3,48 @@
 
 import React, {useCallback, useEffect} from 'react';
 import {useIntl} from 'react-intl';
-import {type Insets, Text, TouchableWithoutFeedback, View} from 'react-native';
+import {type Insets, Pressable, type PressableStateCallbackType, type StyleProp, Text, View, type ViewStyle} from 'react-native';
 import Animated, {useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {logout} from '@actions/remote/session';
 import CompassIcon from '@components/compass_icon';
 import {ITEM_HEIGHT} from '@components/slide_up_panel_item';
 import TouchableWithFeedback from '@components/touchable_with_feedback';
 import {PUSH_PROXY_STATUS_NOT_AVAILABLE, PUSH_PROXY_STATUS_VERIFIED} from '@constants/push_proxy';
+import {SNACK_BAR_TYPE} from '@constants/snack_bar';
 import {HOME_PADDING} from '@constants/view';
 import {useServerDisplayName, useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
+import {usePreventDoubleTap} from '@hooks/utils';
 import {bottomSheet} from '@screens/navigation';
 import {bottomSheetSnapPoint} from '@utils/helpers';
 import {alertPushProxyError, alertPushProxyUnknown} from '@utils/push_proxy';
 import {alertServerLogout} from '@utils/server';
-import {preventDoubleTap} from '@utils/tap';
+import {showSnackBar} from '@utils/snack_bar';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 import LoadingUnreads from './loading_unreads';
 import PlusMenu from './plus_menu';
 import {SEPARATOR_HEIGHT} from './plus_menu/separator';
+import TeamMenu from './team_menu';
 
 const PLUS_BUTTON_SIZE = 28;
+const CHEVRON_SIZE = 24;
 
 type Props = {
     canCreateChannels: boolean;
     canJoinChannels: boolean;
     canInvitePeople: boolean;
+    canJoinOtherTeams: boolean;
+    currentTeamId: string;
     displayName?: string;
+    hasMoreThanOneTeam: boolean;
     iconPad?: boolean;
-    onHeaderPress?: () => void;
+    ephemeralModeEnabled: boolean;
+    ephemeralModePurgeHours: number;
+    ephemeralModeCleanupDays: number;
+    isZeroPersistenceMode: boolean;
     pushProxyStatus: string;
 }
 
@@ -54,25 +62,50 @@ const getStyles = makeStyleSheetFromTheme((theme: Theme) => ({
         alignItems: 'center',
         justifyContent: 'space-between',
     },
-    chevronButton: {
-        marginLeft: 4,
+    teamPressable: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        flexShrink: 1,
+    },
+    teamPressed: {
+        opacity: 0.72,
     },
     chevronIcon: {
-        color: changeOpacity(theme.sidebarText, 0.8),
-        fontSize: 24,
+        color: changeOpacity(theme.sidebarText, 0.64),
+        marginLeft: 4,
     },
     plusButton: {
         backgroundColor: changeOpacity(theme.sidebarText, 0.08),
         height: PLUS_BUTTON_SIZE,
         width: PLUS_BUTTON_SIZE,
         borderRadius: PLUS_BUTTON_SIZE / 2,
-        marginTop: PLUS_BUTTON_SIZE / 4,
         justifyContent: 'center',
         alignItems: 'center',
     },
     plusIcon: {
         color: changeOpacity(theme.sidebarText, 0.8),
         fontSize: 18,
+    },
+    headerActions: {
+        flexDirection: 'row',
+        flexShrink: 0,
+        gap: 8,
+        marginTop: PLUS_BUTTON_SIZE / 4,
+    },
+    ephemeralModeButton: {
+        backgroundColor: changeOpacity(theme.sidebarTextActiveBorder, 0.16),
+        height: PLUS_BUTTON_SIZE,
+        width: PLUS_BUTTON_SIZE,
+        borderRadius: PLUS_BUTTON_SIZE / 2,
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    ephemeralModePressed: {
+        opacity: 0.72,
+    },
+    ephemeralModeIcon: {
+        color: theme.sidebarTextActiveBorder,
+        fontSize: 16,
     },
     pushAlert: {
         marginLeft: 5,
@@ -98,24 +131,30 @@ const getStyles = makeStyleSheetFromTheme((theme: Theme) => ({
     },
     firstBox: {
         width: '85%', // ratio derived from the design
+        flexShrink: 1,
     },
 }));
 
 const hitSlop: Insets = {top: 10, bottom: 30, left: 20, right: 20};
+const teamHitSlop: Insets = {top: 8, bottom: 8, left: 8, right: 8};
 
 const ChannelListHeader = ({
     canCreateChannels,
     canJoinChannels,
     canInvitePeople,
+    canJoinOtherTeams,
+    currentTeamId,
     displayName,
+    hasMoreThanOneTeam,
     iconPad,
-    onHeaderPress,
+    ephemeralModeEnabled,
+    ephemeralModePurgeHours,
+    ephemeralModeCleanupDays,
+    isZeroPersistenceMode,
     pushProxyStatus,
 }: Props) => {
     const theme = useTheme();
-    const isTablet = useIsTablet();
     const intl = useIntl();
-    const {bottom} = useSafeAreaInsets();
     const serverDisplayName = useServerDisplayName();
     const marginLeft = useSharedValue(iconPad ? 50 : 0);
     const styles = getStyles(theme);
@@ -125,9 +164,11 @@ const ChannelListHeader = ({
     const serverUrl = useServerUrl();
     useEffect(() => {
         marginLeft.value = iconPad ? 50 : 0;
-    }, [iconPad]);
+    }, [iconPad, marginLeft]);
 
-    const onPress = useCallback(preventDoubleTap(() => {
+    const hasTeamMenuItems = canJoinOtherTeams || hasMoreThanOneTeam;
+
+    const onPress = usePreventDoubleTap(useCallback(() => {
         const renderContent = () => {
             return (
                 <PlusMenu
@@ -138,7 +179,6 @@ const ChannelListHeader = ({
             );
         };
 
-        const closeButtonId = 'close-plus-menu';
         let items = 1;
         let separators = 0;
 
@@ -155,14 +195,26 @@ const ChannelListHeader = ({
             separators += 1;
         }
 
-        bottomSheet({
-            closeButtonId,
+        bottomSheet(renderContent, [1, bottomSheetSnapPoint(items, ITEM_HEIGHT) + (separators * SEPARATOR_HEIGHT)]);
+    }, [canCreateChannels, canInvitePeople, canJoinChannels]));
+
+    const onTeamPress = usePreventDoubleTap(useCallback(() => {
+        const rowCount = (canJoinOtherTeams ? 1 : 0) + (hasMoreThanOneTeam ? 1 : 0);
+
+        const renderContent = () => (
+            <TeamMenu
+                canJoinOtherTeams={canJoinOtherTeams}
+                hasMoreThanOneTeam={hasMoreThanOneTeam}
+                currentTeamId={currentTeamId}
+                currentTeamDisplayName={displayName ?? ''}
+            />
+        );
+
+        bottomSheet(
             renderContent,
-            snapPoints: [1, bottomSheetSnapPoint(items, ITEM_HEIGHT, bottom) + (separators * SEPARATOR_HEIGHT)],
-            theme,
-            title: intl.formatMessage({id: 'home.header.plus_menu', defaultMessage: 'Options'}),
-        });
-    }), [intl, bottom, isTablet, theme]);
+            [1, bottomSheetSnapPoint(rowCount, ITEM_HEIGHT)],
+        );
+    }, [canJoinOtherTeams, hasMoreThanOneTeam, currentTeamId, displayName]));
 
     const onPushAlertPress = useCallback(() => {
         if (pushProxyStatus === PUSH_PROXY_STATUS_NOT_AVAILABLE) {
@@ -173,8 +225,27 @@ const ChannelListHeader = ({
     }, [pushProxyStatus, intl]);
 
     const onLogoutPress = useCallback(() => {
-        alertServerLogout(serverDisplayName, () => logout(serverUrl), intl);
-    }, []);
+        alertServerLogout(serverDisplayName, () => logout(serverUrl, intl), intl);
+    }, [intl, serverDisplayName, serverUrl]);
+
+    const teamPressableStyle = useCallback(({pressed}: PressableStateCallbackType): StyleProp<ViewStyle> => {
+        return [styles.teamPressable, pressed && hasTeamMenuItems && styles.teamPressed];
+    }, [hasTeamMenuItems, styles.teamPressable, styles.teamPressed]);
+
+    const ephemeralModePressableStyle = useCallback(({pressed}: PressableStateCallbackType): StyleProp<ViewStyle> => {
+        return [styles.ephemeralModeButton, pressed && styles.ephemeralModePressed];
+    }, [styles.ephemeralModeButton, styles.ephemeralModePressed]);
+
+    const onEphemeralModePress = useCallback(() => {
+        if (isZeroPersistenceMode) {
+            showSnackBar({barType: SNACK_BAR_TYPE.EPHEMERAL_MODE_ZERO_PERSISTENCE_ACTIVE});
+            return;
+        }
+        showSnackBar({
+            barType: SNACK_BAR_TYPE.EPHEMERAL_MODE_ENABLED,
+            descriptionValues: {hours: ephemeralModePurgeHours, days: ephemeralModeCleanupDays},
+        });
+    }, [isZeroPersistenceMode, ephemeralModePurgeHours, ephemeralModeCleanupDays]);
 
     let header;
     if (displayName) {
@@ -182,20 +253,30 @@ const ChannelListHeader = ({
             <View style={styles.outsideBox}>
                 <View style={styles.firstBox}>
                     <View style={styles.headerRow}>
-                        <TouchableWithoutFeedback
-                            onPress={onHeaderPress}
+                        <Pressable
+                            onPress={hasTeamMenuItems ? onTeamPress : undefined}
+                            disabled={!hasTeamMenuItems}
+                            hitSlop={teamHitSlop}
+                            style={teamPressableStyle}
+                            testID='channel_list_header.team.button'
                         >
-                            <View style={styles.headerRow}>
-                                <Text
-                                    numberOfLines={2}
-                                    ellipsizeMode='tail'
-                                    style={styles.headingStyles}
-                                    testID='channel_list_header.team_display_name'
-                                >
-                                    {displayName}
-                                </Text>
-                            </View>
-                        </TouchableWithoutFeedback>
+                            <Text
+                                numberOfLines={2}
+                                ellipsizeMode='tail'
+                                style={styles.headingStyles}
+                                testID='channel_list_header.team_display_name'
+                            >
+                                {displayName}
+                            </Text>
+                            {hasTeamMenuItems && (
+                                <CompassIcon
+                                    name='chevron-down'
+                                    size={CHEVRON_SIZE}
+                                    style={styles.chevronIcon}
+                                    testID='channel_list_header.team.chevron'
+                                />
+                            )}
+                        </Pressable>
                     </View>
                     <View style={styles.subHeadingView}>
                         <Text
@@ -223,18 +304,32 @@ const ChannelListHeader = ({
                         <LoadingUnreads/>
                     </View>
                 </View>
-                <TouchableWithFeedback
-                    hitSlop={hitSlop}
-                    onPress={onPress}
-                    style={styles.plusButton}
-                    testID='channel_list_header.plus.button'
-                    type='opacity'
-                >
-                    <CompassIcon
-                        style={styles.plusIcon}
-                        name={'plus'}
-                    />
-                </TouchableWithFeedback>
+                <View style={styles.headerActions}>
+                    {ephemeralModeEnabled && (
+                        <Pressable
+                            onPress={onEphemeralModePress}
+                            style={ephemeralModePressableStyle}
+                            testID='channel_list_header.ephemeral_mode'
+                        >
+                            <CompassIcon
+                                style={styles.ephemeralModeIcon}
+                                name='shield-lock-outline'
+                            />
+                        </Pressable>
+                    )}
+                    <TouchableWithFeedback
+                        hitSlop={hitSlop}
+                        onPress={onPress}
+                        style={styles.plusButton}
+                        testID='channel_list_header.plus.button'
+                        type='opacity'
+                    >
+                        <CompassIcon
+                            style={styles.plusIcon}
+                            name={'plus'}
+                        />
+                    </TouchableWithFeedback>
+                </View>
             </View>
         );
     } else {
@@ -257,7 +352,7 @@ const ChannelListHeader = ({
                 >
                     <Text
                         style={styles.noTeamHeadingStyles}
-                        testID='channel_list_header.team_display_name'
+                        testID='channel_list_header.logout.label'
                     >
                         {intl.formatMessage({id: 'account.logout', defaultMessage: 'Log out'})}
                     </Text>

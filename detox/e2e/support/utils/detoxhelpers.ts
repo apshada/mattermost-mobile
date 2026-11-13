@@ -1,0 +1,70 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+import {by, element, waitFor} from 'detox';
+
+export async function waitForPartialText(text: string, timeout = 10000): Promise<void> {
+    // Detox does not support partial text matching directly; use exact match or implement a workaround.
+    await waitFor(element(by.text(new RegExp(text, 'i')))).toBeVisible().withTimeout(timeout);
+}
+
+export async function expectPartialText(text: string, timeout = 10000): Promise<void> {
+    // Detox does not support partial text matching directly; use exact match or implement a workaround.
+    await waitFor(element(by.text(new RegExp(text, 'i')))).toBeVisible().withTimeout(timeout);
+}
+
+export async function scrollUntilVisible(testID: string, text: string): Promise<void> {
+    // Detox does not support partial text matching directly; use exact match or implement a workaround.
+    await waitFor(element(by.text(new RegExp(text, 'i')))).
+        toBeVisible().
+        whileElement(by.id(testID)).
+        scroll(100, 'down');
+}
+
+export async function waitForLoadingSpinner(testID: string, timeout = 10000): Promise<void> {
+    await waitFor(element(by.id(testID))).not.toBeVisible().withTimeout(timeout);
+}
+
+// Tap the native-stack back chevron. Prefer NavigationHeader testID when present;
+// iOS 26 native headers often omit the "Back" accessibility label.
+export async function tapNativeBackButton(timeout = 10_000): Promise<void> {
+    const headerBack = element(by.id('navigation.header.back'));
+    try {
+        await waitFor(headerBack).toExist().withTimeout(Math.min(timeout, 3_000));
+        await headerBack.tap();
+        return;
+    } catch {
+        // Native stack header without the shared testID.
+    }
+
+    const label = device.getPlatform() === 'ios' ? 'Back' : 'Navigate up';
+    const backButton = element(by.label(label)).atIndex(0);
+    await waitFor(backButton).toBeVisible().withTimeout(timeout);
+    await backButton.tap();
+}
+
+// Retry visibility checks with linear backoff during navigation transitions.
+export async function waitForVisibilityWithRetry(
+    elementToCheck: Detox.NativeElement,
+    timeout?: number,
+    maxAttempts = 3,
+): Promise<void> {
+    const effectiveTimeout = timeout ?? (device.getPlatform() === 'android' ? 20000 : 10000);
+
+    /* eslint-disable no-await-in-loop, no-console */
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            await waitFor(elementToCheck).toBeVisible().withTimeout(effectiveTimeout);
+            return;
+        } catch (error) {
+            if (attempt === maxAttempts) {
+                throw error;
+            }
+
+            console.warn(`[waitForVisibilityWithRetry] Attempt ${attempt}/${maxAttempts} failed, retrying...`);
+
+            // Linear backoff: 1s, 2s, 3s
+            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+        }
+    }
+    /* eslint-enable no-await-in-loop, no-console */
+}

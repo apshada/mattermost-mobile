@@ -4,11 +4,10 @@
 import React, {useCallback} from 'react';
 import {useIntl} from 'react-intl';
 import {Pressable, type StyleProp, Text, type TextStyle, View, type ViewStyle} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {setPreferredAudioRoute} from '@calls/actions/calls';
-import {AudioDevice, type CurrentCall} from '@calls/types/calls';
-import CompassIcon from '@components/compass_icon';
+import {AudioDevice, type AudioDeviceType, type CurrentCall} from '@calls/types/calls';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
 import SlideUpPanelItem, {ITEM_HEIGHT} from '@components/slide_up_panel_item';
 import {Device} from '@constants';
 import {useTheme} from '@context/theme';
@@ -16,11 +15,14 @@ import {bottomSheet, dismissBottomSheet} from '@screens/navigation';
 import {bottomSheetSnapPoint} from '@utils/helpers';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 
+import {messages} from './messages';
+
 type Props = {
     pressableStyle: StyleProp<ViewStyle>;
-    iconStyle: StyleProp<ViewStyle>;
+    iconStyle: StyleProp<TextStyle>;
     buttonTextStyle: StyleProp<TextStyle>;
     currentCall: CurrentCall;
+    disabled?: boolean;
 }
 
 const getStyleFromTheme = makeStyleSheetFromTheme((theme: Theme) => ({
@@ -29,17 +31,15 @@ const getStyleFromTheme = makeStyleSheetFromTheme((theme: Theme) => ({
     },
 }));
 
-export const AudioDeviceButton = ({pressableStyle, iconStyle, buttonTextStyle, currentCall}: Props) => {
+export const AudioDeviceButton = ({pressableStyle, iconStyle, buttonTextStyle, currentCall, disabled = false}: Props) => {
     const intl = useIntl();
     const theme = useTheme();
     const style = getStyleFromTheme(theme);
-    const {bottom} = useSafeAreaInsets();
     const isTablet = Device.IS_TABLET; // not `useIsTablet` because even if we're in splitView, we're still using a tablet.
-    const color = theme.awayIndicator;
     const audioDeviceInfo = currentCall.audioDeviceInfo;
     const phoneLabel = intl.formatMessage({id: 'mobile.calls_phone', defaultMessage: 'Phone'});
     const tabletLabel = intl.formatMessage({id: 'mobile.calls_tablet', defaultMessage: 'Tablet'});
-    const speakerLabel = intl.formatMessage({id: 'mobile.calls_speaker', defaultMessage: 'SpeakerPhone'});
+    const speakerLabel = intl.formatMessage(messages.speaker);
     const bluetoothLabel = intl.formatMessage({id: 'mobile.calls_bluetooth', defaultMessage: 'Bluetooth'});
     const headsetLabel = intl.formatMessage({id: 'mobile.calls_headset', defaultMessage: 'Headset'});
 
@@ -49,8 +49,8 @@ export const AudioDeviceButton = ({pressableStyle, iconStyle, buttonTextStyle, c
         if (available.includes(AudioDevice.WiredHeadset)) {
             available = available.filter((d) => d !== AudioDevice.Earpiece);
         }
-        const selectDevice = (device: AudioDevice) => {
-            setPreferredAudioRoute(device);
+        const selectDevice = (device: AudioDeviceType) => {
+            setPreferredAudioRoute(device, true);
             dismissBottomSheet();
         };
 
@@ -106,16 +106,10 @@ export const AudioDeviceButton = ({pressableStyle, iconStyle, buttonTextStyle, c
             );
         };
 
-        bottomSheet({
-            closeButtonId: 'close-other-actions',
-            renderContent,
-            snapPoints: [1, bottomSheetSnapPoint(available.length + 1, ITEM_HEIGHT, bottom)],
-            title: intl.formatMessage({id: 'mobile.calls_audio_device', defaultMessage: 'Select audio device'}),
-            theme,
-        });
-    }, [setPreferredAudioRoute, audioDeviceInfo, color]);
+        bottomSheet(renderContent, [1, bottomSheetSnapPoint(available.length + 1, ITEM_HEIGHT)]);
+    }, [audioDeviceInfo.selectedAudioDevice, audioDeviceInfo.availableAudioDeviceList, isTablet, tabletLabel, style.checkIcon, phoneLabel, speakerLabel, bluetoothLabel, headsetLabel]);
 
-    let icon = 'volume-high';
+    let icon: CompassIconName = 'volume-high';
     let label = speakerLabel;
     switch (audioDeviceInfo.selectedAudioDevice) {
         case AudioDevice.Earpiece:
@@ -136,6 +130,7 @@ export const AudioDeviceButton = ({pressableStyle, iconStyle, buttonTextStyle, c
         <Pressable
             style={pressableStyle}
             onPress={deviceSelector}
+            disabled={disabled}
         >
             <CompassIcon
                 name={icon}

@@ -1,11 +1,15 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {removeLastViewedTeamIdAndServer} from '@actions/app/global';
 import DatabaseManager from '@database/manager';
+import {getLastViewedTeamIdAndServer} from '@queries/app/global';
 import {prepareDeleteTeam, getMyTeamById, queryTeamSearchHistoryByTeamId, removeTeamFromTeamHistory, getTeamSearchHistoryById, getTeamById} from '@queries/servers/team';
 import {logError} from '@utils/log';
 
 import type Model from '@nozbe/watermelondb/Model';
+
+export const MAX_TEAM_SEARCHES = 15;
 
 export async function removeUserFromTeam(serverUrl: string, teamId: string) {
     try {
@@ -16,7 +20,7 @@ export async function removeUserFromTeam(serverUrl: string, teamId: string) {
             if (!team) {
                 throw new Error('Team not found');
             }
-            const models = await prepareDeleteTeam(team);
+            const models = await prepareDeleteTeam(serverUrl, team);
             const system = await removeTeamFromTeamHistory(operator, team.id, true);
             if (system) {
                 models.push(...system);
@@ -24,6 +28,11 @@ export async function removeUserFromTeam(serverUrl: string, teamId: string) {
             if (models.length) {
                 await operator.batchRecords(models, 'removeUserFromTeam');
             }
+        }
+
+        const lastViewedTeam = await getLastViewedTeamIdAndServer();
+        if (lastViewedTeam?.server_url === serverUrl && lastViewedTeam.team_id === teamId) {
+            await removeLastViewedTeamIdAndServer();
         }
 
         return {error: undefined};
@@ -34,7 +43,6 @@ export async function removeUserFromTeam(serverUrl: string, teamId: string) {
 }
 
 export async function addSearchToTeamSearchHistory(serverUrl: string, teamId: string, terms: string) {
-    const MAX_TEAM_SEARCHES = 15;
     try {
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const newSearch: TeamSearchHistory = {

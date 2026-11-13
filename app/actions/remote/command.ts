@@ -12,10 +12,10 @@ import IntegrationsManager from '@managers/integrations_manager';
 import NetworkManager from '@managers/network_manager';
 import {getChannelById} from '@queries/servers/channel';
 import {getConfig, getCurrentTeamId} from '@queries/servers/system';
-import {showAppForm} from '@screens/navigation';
 import {handleDeepLink, matchDeepLink} from '@utils/deep_link';
 import {getFullErrorMessage} from '@utils/errors';
 import {logDebug} from '@utils/log';
+import {openAppsForm} from '@utils/navigation';
 import {tryOpenURL} from '@utils/url';
 
 import type {Client} from '@client/rest';
@@ -75,14 +75,14 @@ export const executeCommand = async (serverUrl: string, intl: IntlShape, message
         return {error};
     }
 
-    if (data?.trigger_id) { //eslint-disable-line camelcase
+    if (data?.trigger_id) {
         IntegrationsManager.getManager(serverUrl)?.setTriggerId(data.trigger_id);
     }
 
     return {data};
 };
 
-const executeAppCommand = async (serverUrl: string, intl: IntlShape, parser: AppCommandParser, msg: string, args: CommandArgs) => {
+export const executeAppCommand = async (serverUrl: string, intl: IntlShape, parser: AppCommandParser, msg: string, args: CommandArgs) => {
     const {creq, errorMessage} = await parser.composeCommandSubmitCall(msg);
     const createErrorMessage = (errMessage: string) => {
         return {error: {message: errMessage}};
@@ -97,7 +97,7 @@ const executeAppCommand = async (serverUrl: string, intl: IntlShape, parser: App
         const errorResponse = res.error;
         return createErrorMessage(errorResponse.text || intl.formatMessage({
             id: 'apps.error.unknown',
-            defaultMessage: 'Unknown error.',
+            defaultMessage: 'Unknown error occurred.',
         }));
     }
     const callResp = res.data;
@@ -110,7 +110,7 @@ const executeAppCommand = async (serverUrl: string, intl: IntlShape, parser: App
             return {data: {}};
         case AppCallResponseTypes.FORM:
             if (callResp.form) {
-                showAppForm(callResp.form, creq.context);
+                openAppsForm(callResp.form, creq.context);
             }
             return {data: {}};
         case AppCallResponseTypes.NAVIGATE:
@@ -143,7 +143,7 @@ export const handleGotoLocation = async (serverUrl: string, intl: IntlShape, loc
     const match = matchDeepLink(location, serverUrl, config?.SiteURL);
 
     if (match) {
-        handleDeepLink(match.url, intl, location);
+        handleDeepLink(match, intl, location);
     } else {
         const {formatMessage} = intl;
         const onError = () => Alert.alert(

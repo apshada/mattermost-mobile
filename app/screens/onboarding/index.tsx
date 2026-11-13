@@ -1,25 +1,25 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useRef} from 'react';
+import React, {useCallback, useRef} from 'react';
 import {
     View,
-    useWindowDimensions,
-    SafeAreaView,
     ScrollView,
     StyleSheet,
-    Platform,
     type NativeSyntheticEvent,
     type NativeScrollEvent,
     BackHandler,
 } from 'react-native';
-import {Navigation} from 'react-native-navigation';
-import Animated, {ReduceMotion, useAnimatedStyle, useDerivedValue, useSharedValue, withTiming} from 'react-native-reanimated';
+import Animated, {useDerivedValue, useSharedValue} from 'react-native-reanimated';
+import {SafeAreaView} from 'react-native-safe-area-context';
 
 import {storeOnboardingViewedValue} from '@actions/app/global';
 import {Screens} from '@constants';
+import {useWindowDimensions} from '@hooks/device';
+import useDidMount from '@hooks/did_mount';
+import {useScreenTransitionAnimation} from '@hooks/screen_transition_animation';
 import Background from '@screens/background';
-import {goToScreen, loginAnimationOptions} from '@screens/navigation';
+import {navigateToScreen} from '@screens/navigation';
 
 import FooterButtons from './footer_buttons';
 import Paginator from './paginator';
@@ -59,9 +59,6 @@ const Onboarding = ({
 
     const scrollX = useSharedValue(0);
 
-    // used to smothly animate the whole onboarding screen during the appear event scenario (from server screen back to onboarding screen)
-    const translateX = useSharedValue(width);
-
     const currentIndex = useDerivedValue(() => Math.round(scrollX.value / width));
 
     const moveToSlide = useCallback((slideIndexToMove: number) => {
@@ -75,8 +72,8 @@ const Onboarding = ({
         // mark the onboarding as already viewed
         storeOnboardingViewedValue();
 
-        goToScreen(Screens.SERVER, '', {animated: true, theme, ...props}, loginAnimationOptions());
-    }, []);
+        navigateToScreen(Screens.SERVER, {theme, ...props});
+    }, [props, theme]);
 
     const nextSlide = useCallback(() => {
         const nextSlideIndex = currentIndex.value + 1;
@@ -85,34 +82,17 @@ const Onboarding = ({
         } else if (slidesRef.current && currentIndex.value === LAST_SLIDE_INDEX) {
             signInHandler();
         }
-    }, [currentIndex, moveToSlide, signInHandler]);
+    }, [LAST_SLIDE_INDEX, currentIndex.value, moveToSlide, signInHandler]);
 
     const scrollHandler = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
         scrollX.value = event.nativeEvent.contentOffset.x;
+
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    useEffect(() => {
-        const listener = {
-            componentDidAppear: () => {
-                translateX.value = 0;
-            },
-            componentDidDisappear: () => {
-                translateX.value = -width;
-            },
-        };
-        const unsubscribe = Navigation.events().registerComponentListener(listener, Screens.ONBOARDING);
+    const animatedStyles = useScreenTransitionAnimation();
 
-        return () => unsubscribe.remove();
-    }, [width]);
-
-    const transform = useAnimatedStyle(() => {
-        const duration = Platform.OS === 'android' ? 250 : 350;
-        return {
-            transform: [{translateX: withTiming(translateX.value, {duration, reduceMotion: ReduceMotion.Never})}],
-        };
-    }, []);
-
-    useEffect(() => {
+    useDidMount(() => {
         const listener = BackHandler.addEventListener('hardwareBackPress', () => {
             if (!currentIndex.value) {
                 return false;
@@ -123,11 +103,7 @@ const Onboarding = ({
         });
 
         return () => listener.remove();
-    }, []);
-
-    useEffect(() => {
-        translateX.value = 0;
-    }, []);
+    });
 
     return (
         <View
@@ -136,7 +112,7 @@ const Onboarding = ({
         >
             <Background theme={theme}/>
             <AnimatedSafeArea
-                style={[styles.scrollContainer, transform]}
+                style={[styles.scrollContainer, animatedStyles]}
                 key={'onboarding_content'}
             >
                 <ScrollView

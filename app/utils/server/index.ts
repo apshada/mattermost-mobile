@@ -3,12 +3,10 @@
 
 import {Alert, type AlertButton} from 'react-native';
 
-import CompassIcon from '@components/compass_icon';
 import {Screens, Sso, SupportedServer, Launch} from '@constants';
-import {dismissBottomSheet, showModal} from '@screens/navigation';
+import {navigateToScreen} from '@screens/navigation';
 import {getErrorMessage} from '@utils/errors';
 import {isMinimumServerVersion} from '@utils/helpers';
-import {changeOpacity} from '@utils/theme';
 import {tryOpenURL} from '@utils/url';
 
 import type ServersModel from '@typings/database/models/app/servers';
@@ -21,9 +19,8 @@ export function isSupportedServer(currentVersion: string) {
 
 export function unsupportedServer(serverDisplayName: string, isSystemAdmin: boolean, intl: IntlShape, onPress?: () => void) {
     if (isSystemAdmin) {
-        return unsupportedServerAdminAlert(serverDisplayName, intl, onPress);
+        unsupportedServerAdminAlert(serverDisplayName, intl, onPress);
     }
-    return unsupportedServerAlert(serverDisplayName, intl, onPress);
 }
 
 export function semverFromServerVersion(value: string) {
@@ -41,19 +38,16 @@ export function semverFromServerVersion(value: string) {
 }
 
 export async function addNewServer(theme: Theme, serverUrl?: string, displayName?: string, deepLinkProps?: DeepLinkWithData) {
-    await dismissBottomSheet();
-    const closeButtonId = 'close-server';
     const props = {
-        closeButtonId,
         displayName,
         launchType: deepLinkProps ? Launch.AddServerFromDeepLink : Launch.AddServer,
         serverUrl,
         theme,
         extra: deepLinkProps,
+        isModal: true,
+        isStackRoot: true,
     };
-    const options = buildServerModalOptions(theme, closeButtonId);
-
-    showModal(Screens.SERVER, '', props, options);
+    navigateToScreen(Screens.SERVER, props);
 }
 
 export function loginOptions(config: ClientConfig, license: ClientLicense) {
@@ -82,7 +76,7 @@ export function loginOptions(config: ClientConfig, license: ClientLicense) {
         [Sso.OFFICE365]: {enabled: o365Enabled},
         [Sso.OPENID]: {enabled: openIdEnabled, text: config.OpenIdButtonText},
     };
-    const enabledSSOs = Object.keys(ssoOptions).filter((key) => ssoOptions[key]);
+    const enabledSSOs = Object.keys(ssoOptions).filter((key) => ssoOptions[key].enabled);
     const numberSSOs = enabledSSOs.length;
 
     return {
@@ -93,12 +87,25 @@ export function loginOptions(config: ClientConfig, license: ClientLicense) {
     };
 }
 
+/**
+ * With no login form and a single SSO provider there is nothing to choose, so the login screen is
+ * skipped. Shared so the add-server and re-login flows cannot disagree.
+ */
+export function getLoginScreen(enabledSSOs: string[], hasLoginForm: boolean) {
+    if (!hasLoginForm && enabledSSOs.length === 1) {
+        return {screen: Screens.SSO, ssoType: enabledSSOs[0]};
+    }
+
+    return {screen: Screens.LOGIN, ssoType: undefined};
+}
+
 export async function loginToServer(theme: Theme, serverUrl: string, displayName: string, config: ClientConfig, license: ClientLicense) {
-    await dismissBottomSheet();
-    const closeButtonId = 'close-server';
-    const {enabledSSOs, hasLoginForm, numberSSOs, ssoOptions} = loginOptions(config, license);
-    const props = {
-        closeButtonId,
+    const {enabledSSOs, hasLoginForm, ssoOptions} = loginOptions(config, license);
+    const {screen, ssoType} = getLoginScreen(enabledSSOs, hasLoginForm);
+
+    // Re-login and add-server both resolve pre-auth secrets outside nav params (keychain or
+    // EphemeralStore) so they are never JSON-serialized into Expo Router.
+    navigateToScreen(screen, {
         config,
         hasLoginForm,
         launchType: Launch.AddServer,
@@ -106,31 +113,20 @@ export async function loginToServer(theme: Theme, serverUrl: string, displayName
         serverDisplayName: displayName,
         serverUrl,
         ssoOptions,
+        ssoType,
         theme,
-    };
-
-    const redirectSSO = !hasLoginForm && numberSSOs === 1;
-    const screen = redirectSSO ? Screens.SSO : Screens.LOGIN;
-    if (redirectSSO) {
-        // @ts-expect-error ssoType not in definition
-        props.ssoType = enabledSSOs[0];
-    }
-
-    const options = buildServerModalOptions(theme, closeButtonId);
-
-    showModal(screen, '', props, options);
+        isModal: true,
+        isStackRoot: true,
+    });
 }
 
-export async function editServer(theme: Theme, server: ServersModel) {
-    const closeButtonId = 'close-server-edit';
+export async function editServer(theme: Theme, serverId: string) {
     const props = {
-        closeButtonId,
-        server,
+        serverId,
         theme,
     };
-    const options = buildServerModalOptions(theme, closeButtonId);
 
-    showModal(Screens.EDIT_SERVER, '', props, options);
+    navigateToScreen(Screens.EDIT_SERVER, props);
 }
 
 export async function alertServerLogout(displayName: string, onPress: () => void, intl: IntlShape) {
@@ -243,55 +239,4 @@ function unsupportedServerAdminAlert(serverDisplayName: string, intl: IntlShape,
     const options = {cancelable: false};
 
     Alert.alert(title, message, buttons, options);
-}
-
-function unsupportedServerAlert(serverDisplayName: string, intl: IntlShape, onPress?: () => void) {
-    const title = intl.formatMessage({id: 'unsupported_server.title', defaultMessage: 'Unsupported server version'});
-
-    const message = intl.formatMessage({
-        id: 'unsupported_server.message',
-        defaultMessage: 'Your server, {serverDisplayName}, is running an unsupported server version. You may experience compatibility issues that cause crashes or severe bugs breaking core functionality of the app. Please contact your System Administrator to upgrade your Mattermost server.',
-    }, {serverDisplayName});
-
-    const okButton: AlertButton = {
-        text: intl.formatMessage({id: 'mobile.server_upgrade.button', defaultMessage: 'OK'}),
-        style: 'default',
-        onPress,
-    };
-
-    const buttons: AlertButton[] = [okButton];
-    const options = {cancelable: false};
-
-    Alert.alert(title, message, buttons, options);
-}
-
-function buildServerModalOptions(theme: Theme, closeButtonId: string) {
-    const closeButton = CompassIcon.getImageSourceSync('close', 24, changeOpacity(theme.centerChannelColor, 0.56));
-    const closeButtonTestId = `${closeButtonId.replace('close-', 'close.').replace(/-/g, '_')}.button`;
-    return {
-        layout: {
-            backgroundColor: theme.centerChannelBg,
-            componentBackgroundColor: theme.centerChannelBg,
-        },
-        topBar: {
-            visible: true,
-            drawBehind: true,
-            translucient: true,
-            noBorder: true,
-            elevation: 0,
-            background: {color: 'transparent'},
-            leftButtons: [{
-                id: closeButtonId,
-                icon: closeButton,
-                testID: closeButtonTestId,
-            }],
-            leftButtonColor: undefined,
-            title: {color: theme.sidebarHeaderTextColor},
-            scrollEdgeAppearance: {
-                active: true,
-                noBorder: true,
-                translucid: true,
-            },
-        },
-    };
 }

@@ -1,11 +1,10 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {debounce, type DebouncedFunc} from 'lodash';
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {useIntl} from 'react-intl';
-import {Alert, FlatList, type ListRenderItemInfo, StyleSheet, View} from 'react-native';
-import Animated, {FadeInDown, FadeOutUp} from 'react-native-reanimated';
+import {Alert, FlatList, type ListRenderItemInfo, Platform, StyleSheet, View} from 'react-native';
+import Animated, {FadeInDown, FadeOutUp, useAnimatedStyle, type SharedValue} from 'react-native-reanimated';
 
 import {switchToGlobalThreads} from '@actions/local/thread';
 import {joinChannelIfNeeded, makeDirectChannel, searchAllChannels, switchToChannelById} from '@actions/remote/channel';
@@ -17,6 +16,7 @@ import ThreadsButton from '@components/threads_button';
 import UserItem from '@components/user_item';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
+import {useDebounce} from '@hooks/utils';
 import {sortChannelsByDisplayName} from '@utils/channel';
 import {displayUsername} from '@utils/user';
 
@@ -38,7 +38,6 @@ type Props = {
     channelsMatchStart: ChannelModel[];
     currentTeamId: string;
     isCRTEnabled: boolean;
-    keyboardOverlap: number;
     loading: boolean;
     onLoading: (loading: boolean) => void;
     restrictDirectMessage: boolean;
@@ -49,6 +48,7 @@ type Props = {
     usersMatch: UserModel[];
     usersMatchStart: UserModel[];
     testID?: string;
+    keyboardHeight: SharedValue<number>;
 }
 
 const style = StyleSheet.create({
@@ -58,6 +58,7 @@ const style = StyleSheet.create({
         alignItems: 'center',
         justifyContent: 'center',
     },
+    list: {flexGrow: 1},
 });
 
 export const MAX_RESULTS = 20;
@@ -75,20 +76,18 @@ const sortByUserOrChannel = <T extends Channel |UserModel>(locale: string, teamm
 
 const FilteredList = ({
     archivedChannels, close, channelsMatch, channelsMatchStart, currentTeamId,
-    isCRTEnabled, keyboardOverlap, loading, onLoading, restrictDirectMessage, showTeamName,
+    isCRTEnabled, keyboardHeight, loading, onLoading, restrictDirectMessage, showTeamName,
     teamIds, teammateDisplayNameSetting, term, usersMatch, usersMatchStart, testID,
 }: Props) => {
-    const bounce = useRef<DebouncedFunc<() => void>>();
     const mounted = useRef(false);
     const serverUrl = useServerUrl();
     const theme = useTheme();
     const {locale, formatMessage} = useIntl();
-    const flatListStyle = useMemo(() => ({flexGrow: 1, paddingBottom: keyboardOverlap}), [keyboardOverlap]);
     const [remoteChannels, setRemoteChannels] = useState<RemoteChannels>({archived: [], startWith: [], matches: []});
 
     const totalLocalResults = channelsMatchStart.length + channelsMatch.length + usersMatchStart.length;
 
-    const search = async () => {
+    const search = useDebounce(useCallback(async () => {
         onLoading(true);
         if (mounted.current) {
             setRemoteChannels({archived: [], startWith: [], matches: []});
@@ -140,7 +139,7 @@ const FilteredList = ({
         }
 
         onLoading(false);
-    };
+    }, [archivedChannels, channelsMatch, channelsMatchStart, currentTeamId, locale, onLoading, restrictDirectMessage, serverUrl, teamIds, term, totalLocalResults]), 500);
 
     const onJoinChannel = useCallback(async (c: Channel | ChannelModel) => {
         const res = await joinChannelIfNeeded(serverUrl, c.id);
@@ -158,7 +157,7 @@ const FilteredList = ({
 
         await close();
         switchToChannelById(serverUrl, c.id, undefined, true);
-    }, [serverUrl, close, locale]);
+    }, [serverUrl, close, formatMessage]);
 
     const onOpenDirectMessage = useCallback(async (u: UserProfile | UserModel) => {
         const displayName = displayUsername(u, locale, teammateDisplayNameSetting);
@@ -176,7 +175,7 @@ const FilteredList = ({
 
         await close();
         switchToChannelById(serverUrl, data.id);
-    }, [serverUrl, close, locale, teammateDisplayNameSetting]);
+    }, [locale, teammateDisplayNameSetting, serverUrl, close, formatMessage]);
 
     const onSwitchToChannel = useCallback(async (c: Channel | ChannelModel) => {
         await close();
@@ -254,14 +253,14 @@ const FilteredList = ({
                 testID='find_channels.filtered_list.remote_channel_item'
             />
         );
-    }, [onJoinChannel, onOpenDirectMessage, onSwitchToChannel, showTeamName, teammateDisplayNameSetting]);
+    }, [onJoinChannel, onOpenDirectMessage, onSwitchToChannel, onSwitchToThreads, showTeamName]);
 
     const threadLabel = useMemo(
         () => formatMessage({
             id: 'threads',
             defaultMessage: 'Threads',
         }).toLowerCase(),
-        [locale],
+        [formatMessage],
     );
 
     const data = useMemo(() => {
@@ -316,6 +315,10 @@ const FilteredList = ({
         return [...new Set(items)].slice(0, MAX_RESULTS + 1);
     }, [archivedChannels, channelsMatchStart, channelsMatch, isCRTEnabled, remoteChannels, usersMatch, usersMatchStart, locale, teammateDisplayNameSetting, term, threadLabel]);
 
+    const flatListStyle = useAnimatedStyle(() => ({
+        marginBottom: keyboardHeight.value,
+    }));
+
     useEffect(() => {
         mounted.current = true;
         return () => {
@@ -324,23 +327,20 @@ const FilteredList = ({
     }, []);
 
     useEffect(() => {
-        bounce.current = debounce(search, 500);
-        bounce.current();
-        return () => {
-            if (bounce.current) {
-                bounce.current.cancel();
-            }
-        };
+        search();
+
+        // We only want to search if the term changes
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [term]);
 
     return (
         <Animated.View
             entering={FadeInDown.duration(100)}
-            exiting={FadeOutUp.duration(100)}
-            style={style.flex}
+            exiting={Platform.select({ios: FadeOutUp.duration(100)}) /* https://mattermost.atlassian.net/browse/MM-63814?focusedCommentId=178584 */}
+            style={[style.flex, flatListStyle]}
         >
             <FlatList
-                contentContainerStyle={flatListStyle}
+                contentContainerStyle={style.list}
                 keyboardDismissMode='interactive'
                 keyboardShouldPersistTaps='handled'
                 ListEmptyComponent={renderEmpty}

@@ -4,14 +4,13 @@
 import {Q} from '@nozbe/watermelondb';
 import {withDatabase, withObservables} from '@nozbe/watermelondb/react';
 import {of as of$} from 'rxjs';
-import {switchMap} from 'rxjs/operators';
+import {distinctUntilChanged, map, switchMap} from 'rxjs/operators';
 
 import {queryAllCustomEmojis} from '@queries/servers/custom_emoji';
-import {queryPostsById} from '@queries/servers/post';
+import {observeSavedPostsByIds, queryPostsById} from '@queries/servers/post';
 import {querySavedPostsPreferences} from '@queries/servers/preference';
 import {observeCurrentUser} from '@queries/servers/user';
 import {mapCustomEmojiNames} from '@utils/emoji/helpers';
-import {getTimezone} from '@utils/user';
 
 import SavedMessagesScreen from './saved_messages';
 
@@ -22,22 +21,39 @@ function getPostIDs(preferences: PreferenceModel[]) {
     return preferences.map((preference) => preference.name);
 }
 
-const enhance = withObservables([], ({database}: WithDatabaseArgs) => {
-    const currentUser = observeCurrentUser(database);
+function sameIds(previous: string[], next: string[]) {
+    return previous.length === next.length && previous.every((id, index) => id === next[index]);
+}
 
+const enhance = withObservables([], ({database}: WithDatabaseArgs) => {
     return {
+
+        // observeSavedPostsByIds emits a fresh Set on every emission of either of
+        // its two sources, so without the distinctUntilChanged guards below the
+        // switchMap tore down and rebuilt the posts query on changes that left the
+        // saved-post ids identical. That churn is what made the list flicker.
         posts: querySavedPostsPreferences(database, undefined, 'true').observeWithColumns(['name']).pipe(
-            switchMap((rows) => {
-                if (!rows.length) {
+            map(getPostIDs),
+            distinctUntilChanged(sameIds),
+            switchMap((ids) => {
+                if (!ids.length) {
+                    return of$(new Set<string>());
+                }
+                return observeSavedPostsByIds(database, ids);
+            }),
+
+            // Sorted so the comparison below is order-insensitive; queryPostsById
+            // applies the real ordering.
+            map((savedPostIds) => [...savedPostIds].sort()),
+            distinctUntilChanged(sameIds),
+            switchMap((ids) => {
+                if (!ids.length) {
                     return of$([]);
                 }
-                return of$(getPostIDs(rows));
-            }),
-            switchMap((ids) => {
                 return queryPostsById(database, ids, Q.asc).observe();
             }),
         ),
-        currentTimezone: currentUser.pipe((switchMap((user) => of$(getTimezone(user?.timezone))))),
+        currentUser: observeCurrentUser(database),
         customEmojiNames: queryAllCustomEmojis(database).observe().pipe(
             switchMap((customEmojis) => of$(mapCustomEmojiNames(customEmojis))),
         ),

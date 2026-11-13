@@ -1,26 +1,24 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {type RefObject, useEffect, useState} from 'react';
-import {Platform} from 'react-native';
-import {KeyboardTrackingView, type KeyboardTrackingViewRef} from 'react-native-keyboard-tracking-view';
+import React, {useEffect, useState} from 'react';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import Autocomplete from '@components/autocomplete';
-import {View as ViewConstants} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useAutocompleteDefaultAnimatedValues} from '@hooks/autocomplete';
-import {useIsTablet, useKeyboardHeight} from '@hooks/device';
 import {useDefaultHeaderHeight} from '@hooks/header';
+import {useFetchRenderPermissions} from '@hooks/render_permissions';
 
 import Archived from './archived';
 import DraftHandler from './draft_handler';
 import ReadOnly from './read_only';
 
+import type {AvailableScreens} from '@typings/screens/navigation';
+
 const AUTOCOMPLETE_ADJUST = -5;
 type Props = {
     testID?: string;
-    accessoriesContainerID?: string;
     canPost: boolean;
     channelId: string;
     channelIsArchived?: boolean;
@@ -30,18 +28,17 @@ type Props = {
     isSearch?: boolean;
     message?: string;
     rootId?: string;
-    scrollViewNativeID?: string;
-    keyboardTracker: RefObject<KeyboardTrackingViewRef>;
     containerHeight: number;
     isChannelScreen: boolean;
     canShowPostPriority?: boolean;
+    location: AvailableScreens;
+    onPostCreated?: (postId: string) => void;
+    portalName?: string;
+    writeDenied: boolean;
 }
-
-const {KEYBOARD_TRACKING_OFFSET} = ViewConstants;
 
 function PostDraft({
     testID,
-    accessoriesContainerID,
     canPost,
     channelId,
     channelIsArchived,
@@ -51,36 +48,38 @@ function PostDraft({
     isSearch,
     message = '',
     rootId = '',
-    scrollViewNativeID,
-    keyboardTracker,
     containerHeight,
     isChannelScreen,
     canShowPostPriority,
+    location,
+    onPostCreated,
+    portalName,
+    writeDenied,
 }: Props) {
     const [value, setValue] = useState(message);
     const [cursorPosition, setCursorPosition] = useState(message.length);
     const [postInputTop, setPostInputTop] = useState(0);
     const [isFocused, setIsFocused] = useState(false);
-    const isTablet = useIsTablet();
-    const keyboardHeight = useKeyboardHeight(keyboardTracker);
-    const insets = useSafeAreaInsets();
     const headerHeight = useDefaultHeaderHeight();
     const serverUrl = useServerUrl();
+    const {bottom} = useSafeAreaInsets();
+
+    // Above the read-only return, so a locked composer keeps revalidating and unlocks once the policy
+    // is lifted. No decision can unlock an archived or deactivated channel.
+    useFetchRenderPermissions(channelIsArchived || deactivatedChannel ? undefined : channelId);
 
     // Update draft in case we switch channels or threads
     useEffect(() => {
         setValue(message);
         setCursorPosition(message.length);
+
+        // message is intentionally excluded — including it would reset the input on every parent re-render,
+        // overwriting what the user is currently typing. We only want to reset when switching channels/threads.
+        //eslint-disable-next-line react-hooks/exhaustive-deps
     }, [channelId, rootId]);
 
-    const keyboardAdjustment = (isTablet && isChannelScreen) ? KEYBOARD_TRACKING_OFFSET : 0;
-    const insetsAdjustment = (isTablet && isChannelScreen) ? 0 : insets.bottom;
-    const autocompletePosition = AUTOCOMPLETE_ADJUST + Platform.select({
-        ios: (keyboardHeight ? keyboardHeight - keyboardAdjustment : (postInputTop + insetsAdjustment)),
-        default: postInputTop + insetsAdjustment,
-    });
+    const autocompletePosition = (postInputTop - bottom) + AUTOCOMPLETE_ADJUST;
     const autocompleteAvailableSpace = containerHeight - autocompletePosition - (isChannelScreen ? headerHeight : 0);
-
     const [animatedAutocompletePosition, animatedAutocompleteAvailableSpace] = useAutocompleteDefaultAnimatedValues(autocompletePosition, autocompleteAvailableSpace);
 
     if (channelIsArchived || deactivatedChannel) {
@@ -90,6 +89,7 @@ function PostDraft({
             <Archived
                 testID={archivedTestID}
                 deactivated={deactivatedChannel}
+                location={location}
             />
         );
     }
@@ -100,6 +100,7 @@ function PostDraft({
         return (
             <ReadOnly
                 testID={readOnlyTestID}
+                writeDenied={writeDenied}
             />
         );
     }
@@ -117,6 +118,8 @@ function PostDraft({
             updateValue={setValue}
             value={value}
             setIsFocused={setIsFocused}
+            onPostCreated={onPostCreated}
+            location={location}
         />
     );
 
@@ -129,32 +132,17 @@ function PostDraft({
             cursorPosition={cursorPosition}
             value={value}
             isSearch={isSearch}
-            hasFilesAttached={Boolean(files?.length)}
-            inPost={true}
+            shouldDirectlyReact={!Boolean(files?.length)}
             availableSpace={animatedAutocompleteAvailableSpace}
             serverUrl={serverUrl}
+            usePortal={true}
+            portalName={portalName}
         />
     ) : null;
 
-    if (Platform.OS === 'android') {
-        return (
-            <>
-                {draftHandler}
-                {autoComplete}
-            </>
-        );
-    }
-
     return (
         <>
-            <KeyboardTrackingView
-                accessoriesContainerID={accessoriesContainerID}
-                ref={keyboardTracker}
-                scrollViewNativeID={scrollViewNativeID}
-                viewInitialOffsetY={isTablet && !rootId ? KEYBOARD_TRACKING_OFFSET : 0}
-            >
-                {draftHandler}
-            </KeyboardTrackingView>
+            {draftHandler}
             {autoComplete}
         </>
     );

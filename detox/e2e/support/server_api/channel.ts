@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 
 import {capitalize, getRandomId} from '@support/utils';
+import {withTransportRetry} from '@support/utils/transport_retry';
 
 import client from './client';
 import {getResponseFromError} from './common';
@@ -49,16 +50,38 @@ export const apiAddUserToChannel = async (baseUrl: string, userId: string, chann
  * @param {Object} option.channel - channel object to be created
  * @return {Object} returns {channel} on success or {error, status} on error
  */
-export const apiCreateChannel = async (baseUrl: string, {teamId = null, type = 'O', prefix = 'channel', channel = null}: any = {}): Promise<any> => {
-    try {
-        const response = await client.post(
-            `${baseUrl}/api/v4/channels`,
-            channel || generateRandomChannel(teamId, type, prefix),
-        );
+export const apiCreateChannel = async (baseUrl: string, {teamId = null, type = 'O', prefix = 'channel', channel = null, propertyValues = undefined}: any = {}): Promise<any> => {
+    // No retry loop here. Creating a channel is not idempotent, and apiInit's
+    // retryTransient is the single retry owner for this call — a local loop on top of
+    // it multiplied one stalled request into more than a whole beforeAll budget. The
+    // empty-body check stays: a 200 with no id is a real failure, not a transport one.
+    const channelData = channel || generateRandomChannel(teamId, type, prefix);
 
-        return {channel: response.data};
+    // A create whose response is lost still leaves the channel on the server, and the caller
+    // then reads `.channel` as undefined and dies on `.id` many lines later. Read the name back
+    // before reporting a failure, rather than replaying a non-idempotent write. Only for
+    // failures where the write may still have landed: a 4xx is the server rejecting it, so
+    // that answer is final and is returned as-is.
+    const recoverByName = async (failure: any) => {
+        const status = failure?.status ?? 0;
+        const mayHaveLanded = status === 0 || status >= 500;
+        if (!mayHaveLanded || !teamId || !channelData?.name) {
+            return failure;
+        }
+
+        const {channel: existing} = await apiGetChannelByName(baseUrl, teamId, channelData.name);
+        return existing?.id ? {channel: existing} : failure;
+    };
+
+    try {
+        const body = propertyValues === undefined ? channelData : {...channelData, property_values: propertyValues};
+        const response = await client.post(`${baseUrl}/api/v4/channels`, body);
+        if (response.data?.id) {
+            return {channel: response.data};
+        }
+        return recoverByName({error: {message: 'empty channel in create response'}, status: response.status ?? 0});
     } catch (err) {
-        return getResponseFromError(err);
+        return recoverByName(getResponseFromError(err));
     }
 };
 
@@ -70,16 +93,26 @@ export const apiCreateChannel = async (baseUrl: string, {teamId = null, type = '
  * @return {Object} returns {channel} on success or {error, status} on error
  */
 export const apiCreateDirectChannel = async (baseUrl: string, userIds: string[] = []): Promise<any> => {
-    try {
-        const response = await client.post(
-            `${baseUrl}/api/v4/channels/direct`,
-            userIds,
-        );
+    // Idempotent: the endpoint calls App.GetOrCreateDirectChannel, so replaying a request whose
+    // response was lost returns the same channel rather than creating a second one. Worth
+    // retrying because a lost response here surfaces far from its cause -- the caller reads
+    // `.channel` as undefined and dies with "Cannot read properties of undefined" many lines
+    // later, which reads like a UI defect (MM-T4929_3).
+    return withTransportRetry(async () => {
+        try {
+            const response = await client.post(
+                `${baseUrl}/api/v4/channels/direct`,
+                userIds,
+            );
 
-        return {channel: response.data};
-    } catch (err) {
-        return getResponseFromError(err);
-    }
+            if (response.data?.id) {
+                return {channel: response.data};
+            }
+            return {error: {message: 'empty channel in create direct response'}, status: response.status ?? 0};
+        } catch (err) {
+            return getResponseFromError(err);
+        }
+    }, {idempotent: true, label: 'apiCreateDirectChannel'});
 };
 
 /**
@@ -90,16 +123,23 @@ export const apiCreateDirectChannel = async (baseUrl: string, userIds: string[] 
  * @return {Object} returns {channel} on success or {error, status} on error
  */
 export const apiCreateGroupChannel = async (baseUrl: string, userIds: string[] = []): Promise<any> => {
-    try {
-        const response = await client.post(
-            `${baseUrl}/api/v4/channels/group`,
-            userIds,
-        );
+    // Idempotent for the same reason as the direct channel above: App.CreateGroupChannel
+    // returns the existing channel on ChannelExistsError instead of failing.
+    return withTransportRetry(async () => {
+        try {
+            const response = await client.post(
+                `${baseUrl}/api/v4/channels/group`,
+                userIds,
+            );
 
-        return {channel: response.data};
-    } catch (err) {
-        return getResponseFromError(err);
-    }
+            if (response.data?.id) {
+                return {channel: response.data};
+            }
+            return {error: {message: 'empty channel in create group response'}, status: response.status ?? 0};
+        } catch (err) {
+            return getResponseFromError(err);
+        }
+    }, {idempotent: true, label: 'apiCreateGroupChannel'});
 };
 
 /**
@@ -247,6 +287,50 @@ export const apiViewChannel = async (baseUrl: string, userId: string, channelId:
     }
 };
 
+/**
+ * Update a channel member's scheme roles (promote to or demote from channel admin).
+ * See https://api.mattermost.com/#operation/UpdateChannelMemberSchemeRoles
+ * @param {string} baseUrl - the base server URL
+ * @param {string} userId - The user ID
+ * @param {string} channelId - The channel ID
+ * @param {boolean} schemeAdmin - true to grant channel admin; false to revoke
+ * @return {Object} returns {} on success or {error, status} on error
+ */
+export const apiUpdateChannelMemberSchemeRoles = async (baseUrl: string, userId: string, channelId: string, schemeAdmin: boolean): Promise<any> => {
+    try {
+        await client.put(
+            `${baseUrl}/api/v4/channels/${channelId}/members/${userId}/schemeRoles`,
+            {scheme_admin: schemeAdmin, scheme_user: true},
+        );
+        return {};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+/**
+ * Share channel with a remote (connected workspace).
+ * POST /api/v4/remotecluster/{remoteId}/channels/{channelId}/invite
+ * @param {string} baseUrl - the base server URL
+ * @param {string} channelId - The channel ID to share with the remote
+ * @param {string} remoteId - The remote cluster ID (connected workspace)
+ * @return {Object} returns {} on success or {error, status} on error
+ */
+export const apiShareChannelWithRemote = async (
+    baseUrl: string,
+    channelId: string,
+    remoteId: string,
+): Promise<{error?: {message: string}; status?: number}> => {
+    try {
+        await client.post(
+            `${baseUrl}/api/v4/remotecluster/${encodeURIComponent(remoteId)}/channels/${channelId}/invite`,
+        );
+        return {};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
 export const generateRandomChannel = (teamId: string, type: string, prefix: string) => {
     const randomId = getRandomId();
 
@@ -271,6 +355,8 @@ export const Channel = {
     apiGetUnreadMessages,
     apiRestoreChannel,
     apiRemoveUserFromChannel,
+    apiShareChannelWithRemote,
+    apiUpdateChannelMemberSchemeRoles,
     apiViewChannel,
     generateRandomChannel,
 };

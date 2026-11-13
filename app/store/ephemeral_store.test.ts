@@ -1,0 +1,366 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {CLASSIFICATION_BANNER_CACHE_TTL, CLASSIFICATION_BANNER_FAILURE_BACKOFF} from '@constants/classification';
+import {toMilliseconds} from '@utils/datetime';
+
+import EphemeralStore from './ephemeral_store';
+
+describe('EphemeralStore', () => {
+    afterEach(() => {
+        jest.resetModules();
+    });
+
+    it('theme observable', () => {
+        const {Preferences} = require('@constants');
+
+        // Initial value should be the default theme
+        const initialTheme = EphemeralStore.getTheme();
+        expect(initialTheme).toBeDefined();
+
+        // Set theme
+        const theme = Preferences.THEMES.denim;
+        EphemeralStore.setTheme(theme);
+        expect(EphemeralStore.getTheme()).toBe(theme);
+
+        // Observable should emit values
+        const mockCallback = jest.fn();
+        const subscription = EphemeralStore.observeTheme().subscribe(mockCallback);
+
+        // Should immediately get current value
+        expect(mockCallback).toHaveBeenCalledWith(theme);
+
+        // Should get new values when theme changes
+        const newTheme = Preferences.THEMES.sapphire;
+        EphemeralStore.setTheme(newTheme);
+        expect(mockCallback).toHaveBeenCalledWith(newTheme);
+        expect(mockCallback).toHaveBeenCalledTimes(2);
+
+        // Clean up
+        subscription.unsubscribe();
+
+        // After unsubscribe, callback should not be called
+        EphemeralStore.setTheme(theme);
+        expect(mockCallback).toHaveBeenCalledTimes(2);
+    });
+
+    it('playbooks sync', () => {
+        // Expect false if not yet set
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id')).toBe(false);
+
+        // Expect true if set
+        EphemeralStore.setChannelPlaybooksSynced('server-url', 'channel-id');
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id')).toBe(true);
+
+        // Same id, different server
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url-2', 'channel-id')).toBe(false);
+
+        // Set for different server
+        EphemeralStore.setChannelPlaybooksSynced('server-url-2', 'channel-id');
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url-2', 'channel-id')).toBe(true);
+
+        // Expect false if cleared
+        EphemeralStore.clearChannelPlaybooksSynced('server-url');
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id')).toBe(false);
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url-2', 'channel-id')).toBe(true); // The other server is not cleared
+
+        // Expect false if unset
+        EphemeralStore.setChannelPlaybooksSynced('server-url', 'channel-id');
+        EphemeralStore.setChannelPlaybooksSynced('server-url', 'channel-id-2');
+        EphemeralStore.setChannelPlaybooksSynced('server-url', 'channel-id-3');
+
+        EphemeralStore.unsetChannelPlaybooksSynced('server-url', 'channel-id');
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id')).toBe(false);
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id-2')).toBe(true);
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id-3')).toBe(true);
+
+        // Expect false if cleared
+        EphemeralStore.clearChannelPlaybooksSynced('server-url');
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id')).toBe(false);
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id-2')).toBe(false);
+        expect(EphemeralStore.getChannelPlaybooksSynced('server-url', 'channel-id-3')).toBe(false);
+    });
+
+    describe('viewable items', () => {
+        afterEach(() => {
+            EphemeralStore.clearViewableItems();
+        });
+
+        it('should report items reported by any mounted list', () => {
+            EphemeralStore.setViewableItems('Channel', {'Channel-post-1': true});
+            EphemeralStore.setViewableItems('Thread', {'Thread-post-2': true});
+
+            expect(EphemeralStore.isItemInViewPort('Channel-post-1')).toBe(true);
+            expect(EphemeralStore.isItemInViewPort('Thread-post-2')).toBe(true);
+        });
+
+        it('should replace only the entries of the list that reported them', () => {
+            EphemeralStore.setViewableItems('Channel', {'Channel-post-1': true});
+            EphemeralStore.setViewableItems('Thread', {'Thread-post-2': true});
+
+            EphemeralStore.setViewableItems('Thread', {'Thread-post-3': true});
+
+            expect(EphemeralStore.isItemInViewPort('Channel-post-1')).toBe(true);
+            expect(EphemeralStore.isItemInViewPort('Thread-post-2')).toBe(false);
+            expect(EphemeralStore.isItemInViewPort('Thread-post-3')).toBe(true);
+        });
+
+        it('should drop every list when cleared', () => {
+            EphemeralStore.setViewableItems('Channel', {'Channel-post-1': true});
+            EphemeralStore.setViewableItems('Thread', {'Thread-post-2': true});
+
+            EphemeralStore.clearViewableItems();
+
+            expect(EphemeralStore.isItemInViewPort('Channel-post-1')).toBe(false);
+            expect(EphemeralStore.isItemInViewPort('Thread-post-2')).toBe(false);
+        });
+    });
+
+    describe('classification banner cache', () => {
+        const serverUrl = 'classification-server';
+        const otherServerUrl = 'classification-server-2';
+
+        afterEach(() => {
+            EphemeralStore.clearClassificationCache(serverUrl);
+            EphemeralStore.clearClassificationCache(otherServerUrl);
+            jest.useRealTimers();
+        });
+
+        it('should need a fetch until marked, then respect the TTL', () => {
+            jest.useFakeTimers({doNotFake: ['nextTick']});
+
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(true);
+
+            EphemeralStore.setClassificationBannerFetched(serverUrl);
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(false);
+
+            jest.advanceTimersByTime(CLASSIFICATION_BANNER_CACHE_TTL);
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(true);
+        });
+
+        it('should track freshness independently per server', () => {
+            EphemeralStore.setClassificationBannerFetched(serverUrl);
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(false);
+            expect(EphemeralStore.shouldFetchClassificationBanner(otherServerUrl)).toBe(true);
+        });
+
+        it('should retry after failure backoff even when a prior success was fresh', () => {
+            jest.useFakeTimers({doNotFake: ['nextTick']});
+            EphemeralStore.setClassificationBannerFetched(serverUrl);
+            EphemeralStore.setClassificationBannerFailed(serverUrl);
+
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(false);
+
+            jest.advanceTimersByTime(CLASSIFICATION_BANNER_FAILURE_BACKOFF);
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(true);
+        });
+
+        it('should guard field sync attempts scoped per server and option', () => {
+            expect(EphemeralStore.getClassificationFieldSyncAttempted(serverUrl, 'opt-1')).toBe(false);
+
+            EphemeralStore.setClassificationFieldSyncAttempted(serverUrl, 'opt-1');
+            expect(EphemeralStore.getClassificationFieldSyncAttempted(serverUrl, 'opt-1')).toBe(true);
+            expect(EphemeralStore.getClassificationFieldSyncAttempted(serverUrl, 'opt-2')).toBe(false);
+            expect(EphemeralStore.getClassificationFieldSyncAttempted(otherServerUrl, 'opt-1')).toBe(false);
+        });
+
+        it('should reset both freshness and the field sync guard on clearClassificationCache', () => {
+            EphemeralStore.setClassificationBannerFetched(serverUrl);
+            EphemeralStore.setClassificationFieldSyncAttempted(serverUrl, 'opt-1');
+
+            EphemeralStore.clearClassificationCache(serverUrl);
+
+            expect(EphemeralStore.shouldFetchClassificationBanner(serverUrl)).toBe(true);
+            expect(EphemeralStore.getClassificationFieldSyncAttempted(serverUrl, 'opt-1')).toBe(false);
+        });
+    });
+
+    describe('linked post fetch attempts', () => {
+        const serverUrl = 'linked-post-server';
+        const otherServerUrl = 'linked-post-server-2';
+
+        afterEach(() => {
+            EphemeralStore.clearLinkedPostFetchAttempts(serverUrl);
+            EphemeralStore.clearLinkedPostFetchAttempts(otherServerUrl);
+        });
+
+        it('should clear only the given server, so a new session can fetch again', () => {
+            EphemeralStore.addLinkedPostFetchAttempt(serverUrl, 'post-1|missing|2');
+            EphemeralStore.addLinkedPostFetchAttempt(otherServerUrl, 'post-1|missing|2');
+
+            EphemeralStore.clearLinkedPostFetchAttempts(serverUrl);
+
+            expect(EphemeralStore.hasLinkedPostFetchAttempt(serverUrl, 'post-1|missing|2')).toBe(false);
+            expect(EphemeralStore.hasLinkedPostFetchAttempt(otherServerUrl, 'post-1|missing|2')).toBe(true);
+        });
+    });
+
+    describe('pendingPreauthSecret', () => {
+        const serverUrl = 'https://example.com';
+
+        afterEach(() => {
+            EphemeralStore.clearPendingPreauthSecret(serverUrl);
+        });
+
+        it('should store and return a pending add-server secret', () => {
+            expect(EphemeralStore.getPendingPreauthSecret(serverUrl)).toBeUndefined();
+
+            EphemeralStore.setPendingPreauthSecret(serverUrl, 'candidate-secret');
+            expect(EphemeralStore.getPendingPreauthSecret(serverUrl)).toBe('candidate-secret');
+        });
+
+        it('should clear a pending secret for a server', () => {
+            EphemeralStore.setPendingPreauthSecret(serverUrl, 'candidate-secret');
+            EphemeralStore.clearPendingPreauthSecret(serverUrl);
+
+            expect(EphemeralStore.getPendingPreauthSecret(serverUrl)).toBeUndefined();
+        });
+    });
+
+    describe('recently unsaved saved posts', () => {
+        const serverUrl = 'server-url';
+        const otherServerUrl = 'server-url-2';
+        const postId = 'post-id';
+
+        beforeEach(() => {
+            jest.useFakeTimers({doNotFake: ['nextTick']});
+        });
+
+        afterEach(() => {
+            // Clear any pending timers so they don't leak across tests
+            EphemeralStore.clearRecentlyUnsavedSavedPost(serverUrl, postId);
+            EphemeralStore.clearRecentlyUnsavedSavedPost(otherServerUrl, postId);
+            jest.useRealTimers();
+        });
+
+        it('marks a post as recently unsaved and isolates by server', () => {
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(false);
+
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, postId);
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(true);
+
+            // A different server with the same postId is unaffected
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(otherServerUrl, postId)).toBe(false);
+        });
+
+        it('clears the flag automatically after the TTL', () => {
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, postId);
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(true);
+
+            jest.advanceTimersByTime(toMilliseconds({minutes: 2}));
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(false);
+        });
+
+        it('clearRecentlyUnsavedSavedPost cancels the pending TTL immediately', () => {
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, postId);
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(true);
+
+            EphemeralStore.clearRecentlyUnsavedSavedPost(serverUrl, postId);
+            expect(EphemeralStore.isRecentlyUnsavedSavedPost(serverUrl, postId)).toBe(false);
+        });
+
+        it('observeRecentlyUnsavedSavedPost emits the unsaved state changes', () => {
+            const mockCallback = jest.fn();
+            const subscription = EphemeralStore.observeRecentlyUnsavedSavedPost(serverUrl, postId).subscribe(mockCallback);
+
+            // Immediately gets the current (false) value
+            expect(mockCallback).toHaveBeenCalledWith(false);
+
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, postId);
+            expect(mockCallback).toHaveBeenCalledWith(true);
+
+            // After the TTL expires it should emit false again
+            jest.advanceTimersByTime(toMilliseconds({minutes: 2}));
+            expect(mockCallback).toHaveBeenLastCalledWith(false);
+
+            subscription.unsubscribe();
+        });
+
+        it('observeRecentlyUnsavedSavedPosts emits the set of unsaved posts', () => {
+            const mockCallback = jest.fn();
+            const subscription = EphemeralStore.observeRecentlyUnsavedSavedPosts(serverUrl).subscribe(mockCallback);
+
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, postId);
+            EphemeralStore.addRecentlyUnsavedSavedPost(serverUrl, 'post-id-2');
+
+            const calls = mockCallback.mock.calls;
+            const lastSet = calls[calls.length - 1][0] as Set<string>;
+            expect(lastSet.size).toBe(2);
+            expect(lastSet.has(postId)).toBe(true);
+            expect(lastSet.has('post-id-2')).toBe(true);
+
+            EphemeralStore.clearRecentlyUnsavedSavedPost(serverUrl, 'post-id-2');
+            const afterClearSet = calls[calls.length - 1][0] as Set<string>;
+            expect(afterClearSet.size).toBe(1);
+            expect(afterClearSet.has(postId)).toBe(true);
+            expect(afterClearSet.has('post-id-2')).toBe(false);
+
+            subscription.unsubscribe();
+        });
+    });
+
+    describe('runExclusive', () => {
+        const key = 'server-url:channel-id';
+
+        const deferred = () => {
+            let resolve: () => void = () => undefined;
+            let reject: (error: Error) => void = () => undefined;
+            const promise = new Promise<void>((res, rej) => {
+                resolve = res;
+                reject = rej;
+            });
+            return {promise, resolve, reject};
+        };
+
+        it('should run tasks for the same key one at a time in call order', async () => {
+            const order: string[] = [];
+            const first = deferred();
+
+            const firstRun = EphemeralStore.runExclusive(key, async () => {
+                order.push('first:start');
+                await first.promise;
+                order.push('first:end');
+            });
+            const secondRun = EphemeralStore.runExclusive(key, async () => {
+                order.push('second');
+            });
+            const otherKeyRun = EphemeralStore.runExclusive('server-url:other-channel', async () => {
+                order.push('other-key');
+            });
+
+            await otherKeyRun;
+            expect(order).toEqual(['first:start', 'other-key']);
+
+            first.resolve();
+            await Promise.all([firstRun, secondRun]);
+            expect(order).toEqual(['first:start', 'other-key', 'first:end', 'second']);
+        });
+
+        it('should run the next task for a key after the previous one rejects', async () => {
+            const failing = deferred();
+            const next = jest.fn().mockResolvedValue('done');
+
+            const failedRun = EphemeralStore.runExclusive(key, () => failing.promise);
+            const nextRun = EphemeralStore.runExclusive(key, next);
+
+            failing.reject(new Error('network'));
+
+            await expect(failedRun).rejects.toThrow('network');
+            await expect(nextRun).resolves.toBe('done');
+            expect(next).toHaveBeenCalledTimes(1);
+        });
+
+        it('should remove the queue entry once the last task for a key settles', async () => {
+            // Private, and only observable this way; dot access would not type-check.
+            // eslint-disable-next-line dot-notation
+            const queue = EphemeralStore['propertyWriteQueue'];
+
+            const run = EphemeralStore.runExclusive(key, async () => undefined);
+            expect(queue.has(key)).toBe(true);
+
+            await run;
+            await new Promise(process.nextTick);
+            expect(queue.has(key)).toBe(false);
+        });
+    });
+});

@@ -5,39 +5,57 @@ import React, {useEffect, useState} from 'react';
 import {DeviceEventEmitter} from 'react-native';
 
 import {Navigation, Screens} from '@constants';
+import ParticipantPlaybooks from '@playbooks/screens/participant_playbooks';
 import Channel from '@screens/channel';
+import GlobalDraftsAndScheduledPosts from '@screens/global_drafts';
 import GlobalThreads from '@screens/global_threads';
+
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type SelectedView = {
     id: string;
     Component: any;
+    params?: unknown;
 }
+
+type SelectedScreens = Extract<AvailableScreens, 'CHANNEL' | 'GLOBAL_DRAFTS' | 'GLOBAL_THREADS'>;
 
 type Props = {
     onTeam: boolean;
-    currentChannelId: string;
-    isCRTEnabled: boolean;
+    intialView: SelectedScreens;
 }
 
 const ComponentsList: Record<string, React.ComponentType<any>> = {
     [Screens.CHANNEL]: Channel,
     [Screens.GLOBAL_THREADS]: GlobalThreads,
+    [Screens.GLOBAL_DRAFTS]: GlobalDraftsAndScheduledPosts,
+    [Screens.PARTICIPANT_PLAYBOOKS]: ParticipantPlaybooks,
 };
 
 const channelScreen: SelectedView = {id: Screens.CHANNEL, Component: Channel};
-const globalScreen: SelectedView = {id: Screens.GLOBAL_THREADS, Component: GlobalThreads};
+const globalThreadsScreen: SelectedView = {id: Screens.GLOBAL_THREADS, Component: GlobalThreads};
+const globalDraftsScreen: SelectedView = {id: Screens.GLOBAL_DRAFTS, Component: GlobalDraftsAndScheduledPosts};
+const participantsPlaybooksScreen: SelectedView = {id: Screens.PARTICIPANT_PLAYBOOKS, Component: ParticipantPlaybooks};
 
-const AdditionalTabletView = ({onTeam, currentChannelId, isCRTEnabled}: Props) => {
-    const [selected, setSelected] = useState<SelectedView>(isCRTEnabled && !currentChannelId ? globalScreen : channelScreen);
+const views = new Map([
+    [Screens.CHANNEL, channelScreen],
+    [Screens.GLOBAL_THREADS, globalThreadsScreen],
+    [Screens.GLOBAL_DRAFTS, globalDraftsScreen],
+    [Screens.PARTICIPANT_PLAYBOOKS, participantsPlaybooksScreen],
+]);
+
+const AdditionalTabletView = ({onTeam, intialView}: Props) => {
+    const [selected, setSelected] = useState<SelectedView>(views.get(intialView) || channelScreen);
     const [initiaLoad, setInitialLoad] = useState(true);
 
     useEffect(() => {
-        const listener = DeviceEventEmitter.addListener(Navigation.NAVIGATION_HOME, (id: string) => {
+        const listener = DeviceEventEmitter.addListener(Navigation.NAVIGATION_HOME, (id: string, params?: unknown) => {
             const component = ComponentsList[id];
             if (component) {
                 setSelected({
                     Component: component,
                     id,
+                    params,
                 });
             }
         });
@@ -57,7 +75,7 @@ const AdditionalTabletView = ({onTeam, currentChannelId, isCRTEnabled}: Props) =
         return null;
     }
 
-    return React.createElement(selected.Component, {componentId: selected.id, isTabletView: true});
+    return React.createElement(selected.Component, {isTabletView: true, ...(selected.params || {})});
 };
 
 export default AdditionalTabletView;

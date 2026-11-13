@@ -2,22 +2,29 @@
 // See LICENSE.txt for license information.
 
 import {NotificationSettingsScreen} from '@support/ui/screen';
-import {timeouts} from '@support/utils';
-import {expect} from 'detox';
+import {isIos, tapNativeBackButton, timeouts} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class AutoResponderNotificationSettingsScreen {
     testID = {
         autoResponderNotificationSettingsScreen: 'auto_responder_notification_settings.screen',
-        backButton: 'screen.back.button',
+        backButton: 'navigation.header.back',
         scrollView: 'auto_responder_notification_settings.scroll_view',
-        enableAutomaticRepliesOptionToggledOff: 'auto_responder_notification_settings.enable_automatic_replies.option.toggled.false',
-        enableAutomaticRepliesOptionToggledOn: 'auto_responder_notification_settings.enable_automatic_replies.option.toggled.true',
+        enableAutomaticRepliesOptionToggledOff: 'auto_responder_notification_settings.enable_automatic_replies.option.toggled.false.button',
+        enableAutomaticRepliesOptionToggledOn: 'auto_responder_notification_settings.enable_automatic_replies.option.toggled.true.button',
         messageInput: 'auto_responder_notification_settings.message.input',
         messageInputDescription: 'auto_responder_notification_settings.message.input.description',
     };
 
     autoResponderNotificationSettingsScreen = element(by.id(this.testID.autoResponderNotificationSettingsScreen));
-    backButton = element(by.id(this.testID.backButton));
+
+    // Native-stack back chevron via accessibility label.
+    get backButton(): Detox.NativeElement {
+        return isIos()
+            ? element(by.label('Back')).atIndex(0)
+            : element(by.label('Navigate up')).atIndex(0);
+    }
+
     scrollView = element(by.id(this.testID.scrollView));
     enableAutomaticRepliesOptionToggledOff = element(by.id(this.testID.enableAutomaticRepliesOptionToggledOff));
     enableAutomaticRepliesOptionToggledOn = element(by.id(this.testID.enableAutomaticRepliesOptionToggledOn));
@@ -38,8 +45,9 @@ class AutoResponderNotificationSettingsScreen {
     };
 
     back = async () => {
-        await this.backButton.tap();
-        await expect(this.autoResponderNotificationSettingsScreen).not.toBeVisible();
+        // Native-stack back chevron.
+        await tapNativeBackButton();
+        await waitFor(this.autoResponderNotificationSettingsScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
     toggleEnableAutomaticRepliesOptionOn = async () => {

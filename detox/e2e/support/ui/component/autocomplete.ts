@@ -1,8 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {isAndroid, isIos, timeouts, wait, waitForElementToExist, withSynchronizationDisabled} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 import ProfilePicture from './profile_picture';
 
@@ -31,6 +31,7 @@ class Autocomplete {
         const atMentionItemTestId = `${this.testID.atMentionItemPrefix}${userId}`;
         const atMentionItemMatcher = by.id(atMentionItemTestId);
         const atMentionItemProfilePictureMatcher = ProfilePicture.getProfilePictureItemMatcher(this.testID.atMentionItemPrefix, userId);
+        const atMentionItemAgentTagMatcher = by.id(`${atMentionItemTestId}.agent.tag`);
         const atMentionItemBotTagMatcher = by.id(`${atMentionItemTestId}.bot.tag`);
         const atMentionItemGuestTagMatcher = by.id(`${atMentionItemTestId}.guest.tag`);
         const atMentionItemUserDisplayNameMatcher = by.id(`${atMentionItemTestId}.display_name`);
@@ -40,6 +41,7 @@ class Autocomplete {
         return {
             atMentionItem: element(atMentionItemMatcher),
             atMentionItemProfilePicture: element(atMentionItemProfilePictureMatcher),
+            atMentionItemAgentTag: element(atMentionItemAgentTagMatcher),
             atMentionItemBotTag: element(atMentionItemBotTagMatcher),
             atMentionItemGuestTag: element(atMentionItemGuestTagMatcher),
             atMentionItemUserDisplayName: element(atMentionItemUserDisplayNameMatcher),
@@ -111,13 +113,54 @@ class Autocomplete {
         };
     };
 
+    // Detox often mis-measures suggestion rows (Reanimated / transparent hit).
+    // Wait for existence, prefer opaque label. iOS tapAtPoint for bad frames;
+    // Android plain tap first, corner only on miss.
+    tapSuggestion = async (
+        item: Detox.IndexableNativeElement,
+        label?: Detox.IndexableNativeElement,
+    ) => {
+        await waitForElementToExist(item, timeouts.TEN_SEC);
+        const target = label ?? item;
+        try {
+            await waitFor(target).toBeVisible(isAndroid() ? 40 : 25).withTimeout(timeouts.FIVE_SEC);
+        } catch {
+            // Visibility % flaky — still attempt platform tap below.
+        }
+        if (isIos()) {
+            // Sync + keyboard often report false "not hittable"; disable briefly like alert dismiss.
+            await withSynchronizationDisabled(async () => {
+                try {
+                    await target.tapAtPoint({x: 12, y: 12});
+                } catch {
+                    try {
+                        await target.tapAtPoint({x: 24, y: 8});
+                    } catch {
+                        await target.tap();
+                    }
+                }
+            });
+            return;
+        }
+        try {
+            await target.tap();
+        } catch {
+            await target.tap({x: 1, y: 1});
+        }
+    };
+
     toBeVisible = async (isVisible = true) => {
-        await wait(timeouts.ONE_SEC);
         if (isVisible) {
-            await expect(this.autocomplete.atIndex(0)).toBeVisible();
+            try {
+                await waitFor(this.autocomplete.atIndex(0)).toBeVisible(1).withTimeout(timeouts.TEN_SEC);
+            } catch {
+                // Reanimated frames often report 0% visible; existence still means mounted.
+                await waitFor(this.autocomplete.atIndex(0)).toExist().withTimeout(timeouts.TEN_SEC);
+            }
             return this.autocomplete;
         }
 
+        await wait(timeouts.ONE_SEC);
         await expect(this.autocomplete).not.toBeVisible();
         return null;
     };

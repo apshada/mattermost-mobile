@@ -6,16 +6,16 @@ import {
     ChannelListScreen,
     ThreadOptionsScreen,
 } from '@support/ui/screen';
-import {timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {isAndroid, longPressWithRetry, timeouts, wait, waitForElementToExist} from '@support/utils';
+import {by, expect, waitFor} from 'detox';
 
 class GlobalThreadsScreen {
     testID = {
         threadItemPrefix: 'global_threads.threads_list.thread_item.',
         globalThreadsScreen: 'global_threads.screen',
-        headerAllThreadsButton: 'global_threads.threads_list.header.all_threads.button',
-        headerUnreadThreadsButton: 'global_threads.threads_list.header.unread_threads.button',
-        headerUnreadDotBadge: 'global_threads.threads_list.header.unread_dot.badge',
+        headerAllThreadsButton: 'global_threads.threads_list.header.all.button',
+        headerUnreadThreadsButton: 'global_threads.threads_list.header.unreads.button',
+        headerUnreadDotBadge: 'global_threads.threads_list.header.unreads.badge',
         headerMarkAllAsReadButton: 'global_threads.threads_list.header.mark_all_as_read.button',
         emptyThreadsList: 'global_threads.threads_list.empty_state',
         flatThreadsList: 'global_threads.threads_list.flat_list',
@@ -61,30 +61,52 @@ class GlobalThreadsScreen {
     };
 
     toBeVisible = async () => {
-        await waitFor(this.globalThreadsScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        const timeout = isAndroid() ? timeouts.TWENTY_SEC : timeouts.TEN_SEC;
+        await waitFor(this.globalThreadsScreen).toExist().withTimeout(timeout);
 
         return this.globalThreadsScreen;
     };
 
     open = async () => {
-        // # Open global threads screen
+        await ChannelListScreen.toBeVisible();
+        await waitForElementToExist(ChannelListScreen.threadsButton, timeouts.HALF_MIN);
         await ChannelListScreen.threadsButton.tap();
 
         return this.toBeVisible();
     };
 
+    waitForThreadItem = async (threadId: string) => {
+        const item = this.getThreadItem(threadId);
+        await waitFor(this.flatThreadsList).toExist().withTimeout(timeouts.TEN_SEC);
+        try {
+            await waitFor(item).toExist().withTimeout(timeouts.FIVE_SEC);
+        } catch {
+            try {
+                await waitFor(item).toExist().whileElement(by.id(this.testID.flatThreadsList)).scroll(200, 'down');
+            } catch {
+                await waitFor(item).toExist().whileElement(by.id(this.testID.flatThreadsList)).scroll(200, 'up');
+            }
+        }
+        await waitFor(item).toExist().withTimeout(timeouts.HALF_MIN);
+        return item;
+    };
+
     back = async () => {
+        try {
+            await waitForElementToExist(this.globalThreadsScreen, timeouts.ONE_SEC);
+        } catch {
+            return;
+        }
         await this.backButton.tap();
-        await expect(this.globalThreadsScreen).not.toBeVisible();
+        await waitFor(this.globalThreadsScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
     openThreadOptionsFor = async (postId: string) => {
         const threadItem = this.getThreadItem(postId);
         await expect(threadItem).toBeVisible();
 
-        // # Open thread options
-        await threadItem.longPress();
-        await ThreadOptionsScreen.toBeVisible();
+        // # Open thread options (with retry — longPress can fail on Android during animations)
+        await longPressWithRetry(threadItem, ThreadOptionsScreen.threadOptionsScreen);
         await wait(timeouts.TWO_SEC);
     };
 }

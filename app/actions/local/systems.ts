@@ -3,20 +3,109 @@
 
 import {Q} from '@nozbe/watermelondb';
 import deepEqual from 'deep-equal';
+import {DeviceEventEmitter} from 'react-native';
 
+import {removePushSigningKey, storePushSigningKey} from '@actions/app/global';
+import {Events} from '@constants';
 import {MM_TABLES, SYSTEM_IDENTIFIERS} from '@constants/database';
+import {PostTypes, BOR_POST_CLEANUP_MIN_RUN_INTERVAL} from '@constants/post';
 import DatabaseManager from '@database/manager';
 import {getServerCredentials} from '@init/credentials';
 import {queryAllChannelsForTeam} from '@queries/servers/channel';
-import {getConfig, getLicense, getGlobalDataRetentionPolicy, getGranularDataRetentionPolicies, getLastGlobalDataRetentionRun, getIsDataRetentionEnabled} from '@queries/servers/system';
+import {queryPostsByType} from '@queries/servers/post';
+import {
+    getConfig,
+    getLicense,
+    getGlobalDataRetentionPolicy,
+    getGranularDataRetentionPolicies,
+    getLastGlobalDataRetentionRun,
+    getIsDataRetentionEnabled,
+    getLastBoRPostCleanupRun,
+} from '@queries/servers/system';
 import PostModel from '@typings/database/models/servers/post';
+import SystemModel from '@typings/database/models/servers/system';
+import {isExpiredBoRPost} from '@utils/bor';
+import {isZeroPersistenceConfig} from '@utils/config';
+import {getFullErrorMessage} from '@utils/errors';
 import {logError} from '@utils/log';
 
+import {deletePostsForChannelsWithAutotranslation} from './channel';
 import {deletePosts} from './post';
 
 import type {DataRetentionPoliciesRequest} from '@actions/remote/systems';
 
-const {SERVER: {POST}} = MM_TABLES;
+const {SERVER: {POST, SYSTEM}} = MM_TABLES;
+
+export async function setDisconnectedSince(serverUrl: string, value: number | null): Promise<void> {
+    try {
+        const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        if (value === null) {
+            const record = await database.get<SystemModel>(SYSTEM).find(SYSTEM_IDENTIFIERS.DISCONNECTED_SINCE).catch(() => null);
+            if (record) {
+                await database.write(async () => {
+                    await record.destroyPermanently();
+                });
+            }
+            return;
+        }
+
+        await operator.handleSystem({
+            systems: [{id: SYSTEM_IDENTIFIERS.DISCONNECTED_SINCE, value}],
+            prepareRecordsOnly: false,
+        });
+    } catch (error) {
+        logError('setDisconnectedSince', error);
+    }
+}
+
+export async function setOfflineSince(serverUrl: string, value: number): Promise<void> {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        await operator.handleSystem({
+            systems: [{id: SYSTEM_IDENTIFIERS.OFFLINE_SINCE, value}],
+            prepareRecordsOnly: false,
+        });
+    } catch (error) {
+        logError('setOfflineSince', error);
+    }
+}
+
+export async function setLastSeenTime(serverUrl: string, value: number): Promise<void> {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        await operator.handleSystem({
+            systems: [{id: SYSTEM_IDENTIFIERS.LAST_SEEN_TIME, value}],
+            prepareRecordsOnly: false,
+        });
+    } catch (error) {
+        logError('setLastSeenTime', error);
+    }
+}
+
+export async function clearEphemeralModeState(serverUrl: string): Promise<void> {
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const records = await database.get<SystemModel>(SYSTEM).query(
+            Q.where('id', Q.oneOf([
+                SYSTEM_IDENTIFIERS.OFFLINE_SINCE,
+                SYSTEM_IDENTIFIERS.LAST_SEEN_TIME,
+            ])),
+        ).fetch();
+
+        if (records.length === 0) {
+            return;
+        }
+
+        await database.write(async () => {
+            await database.batch(...records.map((r) => r.prepareDestroyPermanently()));
+        });
+    } catch (error) {
+        logError('clearEphemeralModeState', error);
+    }
+}
 
 export async function storeConfigAndLicense(serverUrl: string, config: ClientConfig, license: ClientLicense) {
     try {
@@ -36,13 +125,17 @@ export async function storeConfigAndLicense(serverUrl: string, config: ClientCon
 
             if (systems.length) {
                 await operator.handleSystem({systems, prepareRecordsOnly: false});
+                DeviceEventEmitter.emit(Events.LICENSE_CHANGED, {serverUrl, license});
             }
 
-            await storeConfig(serverUrl, config);
+            const result = await storeConfig(serverUrl, config);
+
+            return result;
         }
     } catch (error) {
         logError('An error occurred while saving config & license', error);
     }
+    return [];
 }
 
 export async function storeConfig(serverUrl: string, config: ClientConfig | undefined, prepareRecordsOnly = false) {
@@ -55,6 +148,9 @@ export async function storeConfig(serverUrl: string, config: ClientConfig | unde
         const currentConfig = await getConfig(database);
         const configsToUpdate: IdValue[] = [];
         const configsToDelete: IdValue[] = [];
+
+        // Check if EnableAutoTranslation changed from enabled to disabled
+        const enableAutoTranslationChanged = (currentConfig?.EnableAutoTranslation === 'true') !== (config.EnableAutoTranslation === 'true');
 
         let k: keyof ClientConfig;
         for (k in config) {
@@ -74,8 +170,33 @@ export async function storeConfig(serverUrl: string, config: ClientConfig | unde
             }
         }
 
+        const wasZeroPersistence = isZeroPersistenceConfig(currentConfig);
+        const isZeroPersistence = isZeroPersistenceConfig(config);
+        const signingKeyChanged = currentConfig?.AsymmetricSigningPublicKey !== config.AsymmetricSigningPublicKey;
+        const enteringZeroPersistence = isZeroPersistence && !wasZeroPersistence;
+        const hasNoPriorConfig = Object.keys(currentConfig ?? {}).length === 0;
+
+        // signing key is stored in global storage to be used for push notifications, even when running in zero persistence mode.
+        if (isZeroPersistence && (signingKeyChanged || enteringZeroPersistence)) {
+            if (config.AsymmetricSigningPublicKey) {
+                await storePushSigningKey(serverUrl, config.AsymmetricSigningPublicKey);
+            } else {
+                await removePushSigningKey(serverUrl);
+            }
+        } else if (!isZeroPersistence && (hasNoPriorConfig || wasZeroPersistence)) {
+            await removePushSigningKey(serverUrl);
+        }
+
         if (configsToDelete.length || configsToUpdate.length) {
-            return operator.handleConfigs({configs: configsToUpdate, configsToDelete, prepareRecordsOnly});
+            const results = await operator.handleConfigs({configs: configsToUpdate, configsToDelete, prepareRecordsOnly});
+            DeviceEventEmitter.emit(Events.CONFIG_CHANGED, {serverUrl, config});
+
+            // If EnableAutoTranslation was disabled, delete posts and disable user autotranslation
+            if (enableAutoTranslationChanged) {
+                await deletePostsForChannelsWithAutotranslation(serverUrl, prepareRecordsOnly);
+            }
+
+            return results;
         }
     } catch (error) {
         logError('storeConfig', error);
@@ -123,7 +244,16 @@ export async function updateLastDataRetentionRun(serverUrl: string, value?: numb
     }
 }
 
-export async function dataRetentionCleanup(serverUrl: string) {
+export async function performVacuum(serverUrl: string) {
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        await database.unsafeVacuum();
+    } catch (vacuumError) {
+        logError('unsafeVacuum', getFullErrorMessage(vacuumError));
+    }
+}
+
+export async function dataRetentionCleanup(serverUrl: string): Promise<{error?: unknown; skipped?: boolean}> {
     try {
         const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
 
@@ -132,7 +262,7 @@ export async function dataRetentionCleanup(serverUrl: string) {
 
         // Do not run if clean up is already done today
         if (lastRunAt && lastCleanedToday) {
-            return {error: undefined};
+            return {error: undefined, skipped: true};
         }
 
         const isDataRetentionEnabled = await getIsDataRetentionEnabled(database);
@@ -141,8 +271,6 @@ export async function dataRetentionCleanup(serverUrl: string) {
         if (!result.error) {
             await updateLastDataRetentionRun(serverUrl);
         }
-
-        await database.unsafeVacuum();
 
         return result;
     } catch (error) {
@@ -233,12 +361,12 @@ async function dataRetentionWithoutPolicyCleanup(serverUrl: string) {
     }
 }
 
-async function dataRetentionCleanPosts(serverUrl: string, postIds: string[]) {
+export async function dataRetentionCleanPosts(serverUrl: string, postIds: string[]) {
     if (postIds.length) {
         const batchSize = 1000;
         const deletePromises = [];
         for (let i = 0; i < postIds.length; i += batchSize) {
-            const batch = postIds.slice(i, batchSize);
+            const batch = postIds.slice(i, i + batchSize);
             deletePromises.push(
                 deletePosts(serverUrl, batch),
             );
@@ -274,8 +402,10 @@ export async function setLastServerVersionCheck(serverUrl: string, reset = false
             }],
             prepareRecordsOnly: false,
         });
+        return {error: undefined};
     } catch (error) {
         logError('setLastServerVersionCheck', error);
+        return {error};
     }
 }
 
@@ -289,8 +419,10 @@ export async function setGlobalThreadsTab(serverUrl: string, globalThreadsTab: G
             }],
             prepareRecordsOnly: false,
         });
+        return {error: undefined};
     } catch (error) {
         logError('setGlobalThreadsTab', error);
+        return {error};
     }
 }
 
@@ -298,7 +430,61 @@ export async function dismissAnnouncement(serverUrl: string, announcementText: s
     try {
         const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         await operator.handleSystem({systems: [{id: SYSTEM_IDENTIFIERS.LAST_DISMISSED_BANNER, value: announcementText}], prepareRecordsOnly: false});
+        return {error: undefined};
     } catch (error) {
         logError('An error occurred while dismissing an announcement', error);
+        return {error};
+    }
+}
+
+export async function expiredBoRPostCleanup(serverUrl: string) {
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const lastRunAt = await getLastBoRPostCleanupRun(database);
+
+        const shouldRunNow = (Date.now() - lastRunAt) > BOR_POST_CLEANUP_MIN_RUN_INTERVAL;
+
+        if (!shouldRunNow) {
+            return;
+        }
+
+        const {error} = await removeExpiredBoRPosts(serverUrl);
+        if (!error) {
+            await updateLastBoRCleanupRun(serverUrl);
+        }
+    } catch (error) {
+        logError('An error occurred running the Burn on Read cleanup task', error);
+    }
+}
+
+async function removeExpiredBoRPosts(serverUrl: string) {
+    try {
+        const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const allBoRPosts = await queryPostsByType(database, PostTypes.BURN_ON_READ).fetch();
+        const expiredBoRPostIDs = allBoRPosts.
+            filter((post) => isExpiredBoRPost(post)).
+            map((post) => post.id);
+
+        await dataRetentionCleanPosts(serverUrl, expiredBoRPostIDs);
+        return {error: undefined};
+    } catch (error) {
+        logError('An error occurred while performing BoR post cleanup', error);
+        return {error};
+    }
+}
+
+async function updateLastBoRCleanupRun(serverUrl: string) {
+    try {
+        const {operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+
+        const systems: IdValue[] = [{
+            id: SYSTEM_IDENTIFIERS.LAST_BOR_POST_CLEANUP_RUN,
+            value: Date.now(),
+        }];
+
+        return operator.handleSystem({systems, prepareRecordsOnly: false});
+    } catch (error) {
+        logError('Failed updateLastBoRCleanupRun', error);
+        return {error};
     }
 }

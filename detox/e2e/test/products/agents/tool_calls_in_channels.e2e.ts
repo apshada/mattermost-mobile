@@ -1,0 +1,470 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// *******************************************************************
+// - [#] indicates a test step (e.g. # Go to a screen)
+// - [*] indicates an assertion (e.g. * Check the title)
+// - Use element testID when selecting an element. Create one if none.
+// *******************************************************************
+
+import {
+    AgentsPlugin,
+    Channel,
+    Plugin,
+    Setup,
+    Team,
+    User,
+} from '@support/server_api';
+import client from '@support/server_api/client';
+import {getResponseFromError} from '@support/server_api/common';
+import {
+    serverOneUrl,
+    siteOneUrl,
+} from '@support/test_config';
+import {
+    ChannelListScreen,
+    ChannelScreen,
+    CreateDirectMessageScreen,
+    HomeScreen,
+    LoginScreen,
+    ServerScreen,
+} from '@support/ui/screen';
+import {getRandomId, timeouts, wait} from '@support/utils';
+import {expect, waitFor} from 'detox';
+
+// ****************************************************************
+// Agent post helpers
+// ****************************************************************
+
+const ToolCallStatus = {
+    Pending: 0,
+    Accepted: 1,
+    Rejected: 2,
+    Error: 3,
+    Success: 4,
+} as const;
+
+interface ToolCallData {
+    id: string;
+    name: string;
+    description: string;
+    arguments: Record<string, unknown>;
+    result?: string;
+    status: number;
+}
+
+/**
+ * Generate a tool call object for test data.
+ */
+const makeToolCall = (overrides: Partial<ToolCallData> = {}): ToolCallData => ({
+    id: `tc_${getRandomId(6)}`,
+    name: 'search_documents',
+    description: 'Search for documents in the knowledge base',
+    arguments: {query: 'quarterly report'},
+    status: ToolCallStatus.Pending,
+    ...overrides,
+});
+
+/** Tool cards sit in a nested post scroll; toBeVisible fails on a present node (CI 31915934950). */
+const waitForToolElement = async (testID: string) => {
+    await waitFor(element(by.id(testID))).toExist().withTimeout(timeouts.TEN_SEC);
+};
+
+/**
+ * Create an agent post with tool calls via the REST API.
+ * Posts are created with type 'custom_llmbot' so the mobile app renders them as AgentPost.
+ */
+const apiCreateAgentPost = async (
+    baseUrl: string,
+    {channelId, requesterUserId, toolCalls, message = '', extraProps = {}}: {
+        channelId: string;
+        requesterUserId: string;
+        toolCalls: ToolCallData[];
+        message?: string;
+        extraProps?: Record<string, unknown>;
+    },
+): Promise<any> => {
+    try {
+        const response = await client.post(`${baseUrl}/api/v4/posts`, {
+            channel_id: channelId,
+            message,
+            type: 'custom_llmbot',
+            props: {
+                llm_requester_user_id: requesterUserId,
+                pending_tool_call: JSON.stringify(toolCalls),
+                ...extraProps,
+            },
+        });
+        return {post: response.data};
+    } catch (err) {
+        return getResponseFromError(err);
+    }
+};
+
+// ****************************************************************
+// Tests
+// ****************************************************************
+
+describe('Agents - Tool Calls in Channels', () => {
+    const serverOneDisplayName = 'Server 1';
+    const channelsCategory = 'channels';
+    let testChannel: any;
+    let testUser: any;
+    let testTeam: any;
+    let didLogin = false;
+
+    beforeAll(async () => {
+        const pluginStatus = await Plugin.apiGetPluginStatus(siteOneUrl, AgentsPlugin.id);
+        if (!pluginStatus.isActive) {
+            // eslint-disable-next-line no-console
+            console.warn(`Agents plugin (${AgentsPlugin.id}) is not active — skipping suite`);
+            return;
+        }
+
+        const {channel, team, user} = await Setup.apiInit(siteOneUrl);
+        testChannel = channel;
+        testUser = user;
+        testTeam = team;
+
+        // # Log in to server
+        await ServerScreen.connectToServer(serverOneUrl, serverOneDisplayName);
+        await LoginScreen.login(user);
+        didLogin = true;
+
+        // # Wait for WebSocket to connect and agents status to be fetched
+        await wait(timeouts.TEN_SEC);
+    });
+
+    beforeEach(async () => {
+        if (!didLogin) {
+            return;
+        }
+
+        // * Verify on channel list screen
+        await ChannelListScreen.toBeVisible();
+    });
+
+    afterAll(async () => {
+        if (!didLogin) {
+            return;
+        }
+
+        // # Log out
+        await HomeScreen.logout();
+    });
+
+    const itWhenLoggedIn = (name: string, fn: () => Promise<void>) => {
+        it(name, async () => {
+            if (!didLogin) {
+                return;
+            }
+            await fn();
+        });
+    };
+
+    itWhenLoggedIn('should display tool call card with tool name for pending tool calls', async () => {
+        // # Create a tool call with a known name
+        const toolCall = makeToolCall({name: 'search_documents'});
+
+        // # Create an agent post with pending tool calls (Phase 1)
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool approval set and card rendered
+        await waitForToolElement('agents.tool_approval_set');
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.name`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should show Accept and Reject buttons for pending tool calls when user is requester', async () => {
+        // # Create a pending tool call
+        const toolCall = makeToolCall();
+
+        // # Create an agent post where the test user is the requester
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify Accept and Reject buttons rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.approve`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.reject`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should not show approval buttons when user is not the requester', async () => {
+        // # Create a second user and add to the test channel
+        const {user: otherUser} = await User.apiCreateUser(siteOneUrl, {prefix: 'other'});
+        await Team.apiAddUserToTeam(siteOneUrl, otherUser.id, testTeam.id);
+        await Channel.apiAddUserToChannel(siteOneUrl, otherUser.id, testChannel.id);
+
+        // # Create a pending tool call
+        const toolCall = makeToolCall();
+
+        // # Create an agent post where the OTHER user is the requester (not the logged-in user)
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: otherUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card rendered without approval buttons (user is not the requester)
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await expect(element(by.id(`agents.tool_card.${toolCall.id}.approve`))).not.toExist();
+        await expect(element(by.id(`agents.tool_card.${toolCall.id}.reject`))).not.toExist();
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should display tool calls with success status and results', async () => {
+        // # Create a successful tool call with a result
+        const toolCall = makeToolCall({
+            name: 'fetch_data',
+            status: ToolCallStatus.Success,
+            result: JSON.stringify({data: 'Sample result data'}),
+        });
+
+        // # Create an agent post with the completed tool call
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card and name rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.name`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should display rejected status for rejected tool calls', async () => {
+        // # Create a rejected tool call
+        const toolCall = makeToolCall({
+            name: 'dangerous_action',
+            status: ToolCallStatus.Rejected,
+        });
+
+        // # Create an agent post with the rejected tool call
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+
+        // # Tap the tool card header to expand it (rejected cards are collapsed by default)
+        await element(by.id(`agents.tool_card.${toolCall.id}.header`)).tap();
+        await wait(timeouts.ONE_SEC);
+
+        // * Verify rejected status rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.status.rejected`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should show Share and Keep Private buttons during result approval phase', async () => {
+        // # Create a successful tool call (tool has executed)
+        const toolCall = makeToolCall({
+            name: 'web_search',
+            status: ToolCallStatus.Success,
+            result: JSON.stringify({results: ['result 1', 'result 2']}),
+        });
+
+        // # Create an agent post in Phase 2 (pending_tool_result = 'true')
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+            extraProps: {
+                pending_tool_result: 'true',
+            },
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card and result-approval actions rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.share`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.keep_private`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should display warning callout during result approval phase', async () => {
+        // # Create a successful tool call with result
+        const toolCall = makeToolCall({
+            name: 'code_search',
+            status: ToolCallStatus.Success,
+            result: 'Found 3 matching files in the repository',
+        });
+
+        // # Create an agent post in Phase 2 (result approval)
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+            extraProps: {
+                pending_tool_result: 'true',
+            },
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card and warning callout rendered
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.warning`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should show pending decisions counter for multiple pending tool calls', async () => {
+        // # Create multiple pending tool calls
+        const toolCall1 = makeToolCall({name: 'search_web'});
+        const toolCall2 = makeToolCall({name: 'read_file'});
+        const toolCall3 = makeToolCall({name: 'execute_query'});
+
+        // # Create an agent post with multiple tool calls
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall1, toolCall2, toolCall3],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify all tool cards and the pending-decisions bar rendered
+        await waitForToolElement(`agents.tool_card.${toolCall1.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall2.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall3.id}`);
+        await waitForToolElement('agents.tool_approval_set.pending_decisions');
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should show tool arguments when expanded in a DM channel', async () => {
+        // # Get admin user info (the server API client is logged in as admin)
+        const adminResponse = await client.get(`${siteOneUrl}/api/v4/users/me`);
+        const adminUser = adminResponse.data;
+
+        // # Create a DM channel between admin and the test user
+        const {channel: dmChannel} = await Channel.apiCreateDirectChannel(siteOneUrl, [adminUser.id, testUser.id]);
+
+        // # Create a pending tool call with known arguments
+        const toolCall = makeToolCall({
+            name: 'search_knowledge_base',
+            arguments: {query: 'quarterly results', limit: 10},
+        });
+
+        // # Create an agent post in the DM channel
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: dmChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [toolCall],
+        });
+
+        // # Open the DM channel (DMs use a different category)
+        await wait(timeouts.TWO_SEC);
+        await ChannelListScreen.toBeVisible();
+
+        // # Open create direct message screen and wait for SVG animation to clear
+        await CreateDirectMessageScreen.open();
+        await CreateDirectMessageScreen.toBeVisible();
+
+        // # Search for admin user in the DM create screen
+        await CreateDirectMessageScreen.searchInput.typeText(adminUser.username);
+        await wait(timeouts.ONE_SEC);
+        await CreateDirectMessageScreen.getUserItem(adminUser.id).tap();
+        await CreateDirectMessageScreen.startButton.tap();
+
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify tool card and arguments rendered (DM channels show arguments without redaction)
+        await waitForToolElement(`agents.tool_card.${toolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${toolCall.id}.arguments`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+
+    itWhenLoggedIn('should display mix of pending and completed tool calls', async () => {
+        // # Create a mix of tool calls in different states
+        const pendingToolCall = makeToolCall({
+            name: 'pending_action',
+            status: ToolCallStatus.Pending,
+        });
+        const completedToolCall = makeToolCall({
+            name: 'completed_action',
+            status: ToolCallStatus.Success,
+            result: 'Action completed successfully',
+        });
+        const rejectedToolCall = makeToolCall({
+            name: 'rejected_action',
+            status: ToolCallStatus.Rejected,
+        });
+
+        // # Create an agent post with mixed tool call states
+        await apiCreateAgentPost(siteOneUrl, {
+            channelId: testChannel.id,
+            requesterUserId: testUser.id,
+            toolCalls: [pendingToolCall, completedToolCall, rejectedToolCall],
+        });
+
+        // # Open the channel
+        await ChannelScreen.open(channelsCategory, testChannel.name);
+        await wait(timeouts.TWO_SEC);
+
+        // * Verify mixed tool cards and pending approval buttons rendered
+        await waitForToolElement(`agents.tool_card.${pendingToolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${completedToolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${rejectedToolCall.id}`);
+        await waitForToolElement(`agents.tool_card.${pendingToolCall.id}.approve`);
+        await waitForToolElement(`agents.tool_card.${pendingToolCall.id}.reject`);
+
+        // # Navigate back
+        await ChannelScreen.back();
+    });
+});

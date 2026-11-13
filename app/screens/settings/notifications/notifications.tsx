@@ -1,52 +1,94 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useMemo} from 'react';
-import {useIntl} from 'react-intl';
+import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import {defineMessages, useIntl} from 'react-intl';
+import {Notifications as RNNotifications} from 'react-native-notifications';
 
+import {getCallsConfig} from '@calls/state';
 import SettingContainer from '@components/settings/container';
 import SettingItem from '@components/settings/item';
 import {General, Screens} from '@constants';
+import {useServerUrl} from '@context/server';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {t} from '@i18n';
-import {popTopScreen} from '@screens/navigation';
-import {gotoSettingsScreen} from '@screens/settings/config';
-import {getEmailInterval, getEmailIntervalTexts, getNotificationProps} from '@utils/user';
+import {useAppState} from '@hooks/device';
+import useNotificationProps from '@hooks/notification_props';
+import {navigateBack, navigateToSettingsScreen} from '@screens/navigation';
+import {logError} from '@utils/log';
+import {getEmailInterval, getEmailIntervalTexts} from '@utils/user';
+
+import NotificationsDisabledNotice from './notifications_disabled_notice';
+import SendTestNotificationNotice from './send_test_notification_notice';
 
 import type UserModel from '@typings/database/models/servers/user';
-import type {AvailableScreens} from '@typings/screens/navigation';
 
-const mentionTexts = {
+const mentionTexts = defineMessages({
     crtOn: {
-        id: t('notification_settings.mentions'),
+        id: 'notification_settings.mentions',
         defaultMessage: 'Mentions',
     },
     crtOff: {
-        id: t('notification_settings.mentions_replies'),
+        id: 'notification_settings.mentions_replies',
         defaultMessage: 'Mentions and Replies',
     },
-};
+    callsOn: {
+        id: 'notification_settings.calls_on',
+        defaultMessage: 'On',
+    },
+    callsOff: {
+        id: 'notification_settings.calls_off',
+        defaultMessage: 'Off',
+    },
+});
 
-type NotificationsProps = {
-    componentId: AvailableScreens;
+export type NotificationsProps = {
     currentUser?: UserModel;
     emailInterval: string;
     enableAutoResponder: boolean;
     enableEmailBatching: boolean;
     isCRTEnabled: boolean;
     sendEmailNotifications: boolean;
+    serverVersion: string;
 }
 const Notifications = ({
-    componentId,
     currentUser,
     emailInterval,
     enableAutoResponder,
     enableEmailBatching,
     isCRTEnabled,
     sendEmailNotifications,
+    serverVersion,
 }: NotificationsProps) => {
     const intl = useIntl();
-    const notifyProps = useMemo(() => getNotificationProps(currentUser), [currentUser?.notifyProps]);
+    const serverUrl = useServerUrl();
+
+    const notifyProps = useNotificationProps(currentUser);
+    const callsRingingEnabled = useMemo(() => getCallsConfig(serverUrl).EnableRinging, [serverUrl]);
+    const [isRegistered, setIsRegistered] = useState(true);
+
+    const appState = useAppState();
+
+    useEffect(() => {
+        let isCurrent = true;
+        if (appState === 'active') {
+            const checkNotificationStatus = async () => {
+                try {
+                    const registered = await RNNotifications.isRegisteredForRemoteNotifications();
+                    if (isCurrent) {
+                        setIsRegistered(registered);
+                    }
+                } catch (error) {
+                    if (isCurrent) {
+                        logError('Error checking notification registration status:', error);
+                    }
+                }
+            };
+            checkNotificationStatus();
+        }
+        return () => {
+            isCurrent = false;
+        };
+    }, [appState]);
 
     const emailIntervalPref = useMemo(() =>
         getEmailInterval(
@@ -56,55 +98,43 @@ const Notifications = ({
         ).toString(),
     [emailInterval, enableEmailBatching, notifyProps, sendEmailNotifications]);
 
-    const goToNotificationSettingsMentions = useCallback(() => {
-        const screen = Screens.SETTINGS_NOTIFICATION_MENTION;
+    const callsNotificationsOn = useMemo(() => Boolean(notifyProps?.calls_mobile_sound ? notifyProps.calls_mobile_sound === 'true' : notifyProps?.calls_desktop_sound === 'true'),
+        [notifyProps]);
 
-        const id = isCRTEnabled ? t('notification_settings.mentions') : t('notification_settings.mentions_replies');
-        const defaultMessage = isCRTEnabled ? 'Mentions' : 'Mentions and Replies';
-        const title = intl.formatMessage({id, defaultMessage});
-        gotoSettingsScreen(screen, title);
-    }, [isCRTEnabled]);
+    const goToNotificationSettingsMentions = useCallback(() => {
+        const message = isCRTEnabled ? mentionTexts.crtOn : mentionTexts.crtOff;
+        const title = intl.formatMessage(message);
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION_MENTION, {title});
+    }, [intl, isCRTEnabled]);
 
     const goToNotificationSettingsPush = useCallback(() => {
-        const screen = Screens.SETTINGS_NOTIFICATION_PUSH;
-        const title = intl.formatMessage({
-            id: 'notification_settings.push_notification',
-            defaultMessage: 'Push Notifications',
-        });
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION_PUSH);
+    }, []);
 
-        gotoSettingsScreen(screen, title);
+    const goToNotificationSettingsCall = useCallback(() => {
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION_CALL);
     }, []);
 
     const goToNotificationAutoResponder = useCallback(() => {
-        const screen = Screens.SETTINGS_NOTIFICATION_AUTO_RESPONDER;
-        const title = intl.formatMessage({
-            id: 'notification_settings.auto_responder',
-            defaultMessage: 'Automatic Replies',
-        });
-        gotoSettingsScreen(screen, title);
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION_AUTO_RESPONDER);
     }, []);
 
     const goToEmailSettings = useCallback(() => {
-        const screen = Screens.SETTINGS_NOTIFICATION_EMAIL;
-        const title = intl.formatMessage({id: 'notification_settings.email', defaultMessage: 'Email Notifications'});
-        gotoSettingsScreen(screen, title);
+        navigateToSettingsScreen(Screens.SETTINGS_NOTIFICATION_EMAIL);
     }, []);
 
-    const close = useCallback(() => {
-        popTopScreen(componentId);
-    }, [componentId]);
-
-    useAndroidHardwareBackHandler(componentId, close);
+    useAndroidHardwareBackHandler(Screens.SETTINGS_NOTIFICATION, navigateBack);
 
     return (
         <SettingContainer testID='notification_settings'>
+            {!isRegistered &&
+                <NotificationsDisabledNotice
+                    testID='notifications-disabled-notice'
+                />}
             <SettingItem
                 onPress={goToNotificationSettingsMentions}
                 optionName='mentions'
-                label={intl.formatMessage({
-                    id: isCRTEnabled ? mentionTexts.crtOn.id : mentionTexts.crtOff.id,
-                    defaultMessage: isCRTEnabled ? mentionTexts.crtOn.defaultMessage : mentionTexts.crtOff.defaultMessage,
-                })}
+                label={intl.formatMessage(isCRTEnabled ? mentionTexts.callsOn : mentionTexts.callsOff)}
                 testID='notification_settings.mentions.option'
             />
             <SettingItem
@@ -112,6 +142,14 @@ const Notifications = ({
                 onPress={goToNotificationSettingsPush}
                 testID='notification_settings.push_notifications.option'
             />
+            {callsRingingEnabled &&
+                <SettingItem
+                    optionName='call_notification'
+                    onPress={goToNotificationSettingsCall}
+                    info={intl.formatMessage(callsNotificationsOn ? mentionTexts.callsOn : mentionTexts.callsOff)}
+                    testID='notification_settings.call_notifications.option'
+                />
+            }
             <SettingItem
                 optionName='email'
                 onPress={goToEmailSettings}
@@ -126,6 +164,10 @@ const Notifications = ({
                     testID='notification_settings.automatic_replies.option'
                 />
             )}
+            <SendTestNotificationNotice
+                serverVersion={serverVersion}
+                userId={currentUser?.id || ''}
+            />
         </SettingContainer>
     );
 };

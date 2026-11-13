@@ -2,16 +2,13 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback, useMemo} from 'react';
-import {useIntl} from 'react-intl';
 import {View, Text, TouchableOpacity, useWindowDimensions} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {acknowledgePost, unacknowledgePost} from '@actions/remote/post';
 import {fetchMissingProfilesByIds} from '@actions/remote/user';
 import CompassIcon from '@components/compass_icon';
 import FormattedText from '@components/formatted_text';
 import {useServerUrl} from '@context/server';
-import {useIsTablet} from '@hooks/device';
 import {TITLE_HEIGHT} from '@screens/bottom_sheet/content';
 import {bottomSheet} from '@screens/navigation';
 import {bottomSheetSnapPoint} from '@utils/helpers';
@@ -24,12 +21,13 @@ import {USER_ROW_HEIGHT} from './users_list/user_list_item';
 
 import type PostModel from '@typings/database/models/servers/post';
 import type UserModel from '@typings/database/models/servers/user';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type Props = {
     currentUserId: UserModel['id'];
     currentUserTimezone: UserModel['timezone'];
     hasReactions: boolean;
-    location: string;
+    location: AvailableScreens;
     post: PostModel;
     theme: Theme;
 };
@@ -73,16 +71,13 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
 });
 
 const Acknowledgements = ({currentUserId, currentUserTimezone, hasReactions, location, post, theme}: Props) => {
-    const intl = useIntl();
-    const isTablet = useIsTablet();
-    const {bottom} = useSafeAreaInsets();
     const serverUrl = useServerUrl();
     const {height} = useWindowDimensions();
 
     const style = getStyleSheet(theme);
 
     const isCurrentAuthor = post.userId === currentUserId;
-    const acknowledgements = post.metadata?.acknowledgements || [];
+    const acknowledgements = useMemo(() => post.metadata?.acknowledgements || [], [post.metadata?.acknowledgements]);
 
     const acknowledgedAt = useMemo(() => {
         if (acknowledgements.length > 0) {
@@ -93,7 +88,7 @@ const Acknowledgements = ({currentUserId, currentUserTimezone, hasReactions, loc
             }
         }
         return 0;
-    }, [acknowledgements]);
+    }, [acknowledgements, currentUserId]);
 
     const handleOnPress = useCallback(() => {
         if ((acknowledgedAt && moreThan5minAgo(acknowledgedAt)) || isCurrentAuthor) {
@@ -126,13 +121,11 @@ const Acknowledgements = ({currentUserId, currentUserTimezone, hasReactions, loc
 
         const renderContent = () => (
             <>
-                {!isTablet && (
-                    <FormattedText
-                        id='mobile.acknowledgements.header'
-                        defaultMessage={'Acknowledgements'}
-                        style={style.listHeaderText}
-                    />
-                )}
+                <FormattedText
+                    id='mobile.acknowledgements.header'
+                    defaultMessage={'Acknowledgements'}
+                    style={style.listHeaderText}
+                />
                 <UsersList
                     channelId={post.channelId}
                     location={location}
@@ -143,22 +136,15 @@ const Acknowledgements = ({currentUserId, currentUserTimezone, hasReactions, loc
             </>
         );
 
-        const snapPoint1 = bottomSheetSnapPoint(Math.min(userIds.length, 5), USER_ROW_HEIGHT, bottom) + TITLE_HEIGHT;
+        const snapPoint1 = bottomSheetSnapPoint(Math.min(userIds.length, 5), USER_ROW_HEIGHT) + TITLE_HEIGHT;
         const snapPoint2 = height * 0.8;
         const snapPoints: number[] = [1, Math.min(snapPoint1, snapPoint2)];
         if (userIds.length > 5 && snapPoint1 < snapPoint2) {
             snapPoints.push(snapPoint2);
         }
 
-        bottomSheet({
-            closeButtonId: 'close-ack-users-list',
-            renderContent,
-            initialSnapIndex: 1,
-            snapPoints,
-            title: intl.formatMessage({id: 'mobile.acknowledgements.header', defaultMessage: 'Acknowledgements'}),
-            theme,
-        });
-    }, [bottom, intl, isTablet, acknowledgements, theme, location, post.channelId, currentUserTimezone]);
+        bottomSheet(renderContent, snapPoints);
+    }, [acknowledgements, height, serverUrl, style.listHeaderText, post.channelId, location, currentUserTimezone]);
 
     return (
         <>

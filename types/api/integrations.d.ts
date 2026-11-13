@@ -49,6 +49,18 @@ type DialogSubmission = {
         [x: string]: string;
     };
     cancelled: boolean;
+    file_ids?: string[];
+};
+
+type ExecuteDialogActionRequest = {
+    url: string;
+    context?: Record<string, string>;
+    channel_id: string;
+    team_id: string;
+};
+
+type ExecuteDialogActionResponse = {
+    trigger_id?: string;
 };
 
 type DialogOption = {
@@ -64,7 +76,7 @@ type DialogElement = {
     display_name: string;
     name: string;
     type: InteractiveDialogElementType;
-    subtype: InteractiveDialogTextSubtype;
+    subtype?: InteractiveDialogTextSubtype;
     default: string | boolean;
     placeholder: string;
     help_text: string;
@@ -72,7 +84,30 @@ type DialogElement = {
     min_length: number;
     max_length: number;
     data_source: string;
+    data_source_url?: string;
     options: DialogOption[];
+    multiselect?: boolean;
+    allow_multiple?: boolean;
+    refresh?: boolean;
+
+    // Date/DateTime fields
+    min_date?: string;
+    max_date?: string;
+    time_interval?: number;
+    datetime_config?: DateTimeConfig;
+
+    // Action button fields
+    action_button?: {
+        url: string;
+        context?: Record<string, string>;
+    };
+
+    // Collapsible section fields
+    collapsible_config?: {
+        elements?: DialogElement[];
+        collapsed?: boolean;
+        borderless?: boolean;
+    };
 };
 
 type InteractiveDialogConfig = {
@@ -88,6 +123,13 @@ type InteractiveDialogConfig = {
         submit_label: string;
         notify_on_cancel: boolean;
         state: string;
+        source_url?: string;
+
+        // Name of a select element whose options render as submit buttons.
+        submit_buttons?: string;
+
+        // Re-fetch the dialog from source_url when a dialog opened on top of it closes.
+        refresh_on_return?: boolean;
     };
 };
 
@@ -105,8 +147,8 @@ type PostAction = {
 };
 
 type PostActionOption = {
-    text: string;
-    value: string;
+    text?: string;
+    value?: string;
 };
 
 type PostActionIntegration = {
@@ -114,10 +156,19 @@ type PostActionIntegration = {
     context?: Record<string, any>;
 }
 
+/** `integration_format` on the do-post-action API body — identifies which format originally had the action. */
+type PostActionIntegrationFormat =
+    | 'attachment'
+    | 'apps_binding'
+    | 'block'
+    | 'card'
+    | 'mm_block';
+
 type PostActionResponse = {
     status: string;
     trigger_id: string;
+    goto_location?: string;
 };
 
-type InteractiveDialogElementType = 'text' | 'textarea' | 'select' | 'radio' | 'bool'
+type InteractiveDialogElementType = 'text' | 'textarea' | 'select' | 'radio' | 'bool' | 'file' | 'date' | 'datetime' | 'action_button' | 'collapsible'
 type InteractiveDialogTextSubtype = 'email' | 'number' | 'tel' | 'url' | 'password'

@@ -6,8 +6,8 @@ import {
     ProfilePicture,
 } from '@support/ui/component';
 import {ChannelScreen} from '@support/ui/screen';
-import {isAndroid, timeouts, wait} from '@support/utils';
-import {expect} from 'detox';
+import {isAndroid, isIos, longPressWithRetry, timeouts, wait, waitForElementToBeVisible, waitForElementToExist, waitForElementToNotExist, withSynchronizationDisabled, withSynchronizationDisabledOnAndroid} from '@support/utils';
+import {expect, waitFor} from 'detox';
 
 class ChannelInfoScreen {
     testID = {
@@ -27,6 +27,7 @@ class ChannelInfoScreen {
         copyChannelLinkAction: 'channel_info.channel_actions.copy_channel_link.action',
         joinStartCallAction: 'channel_info.channel_actions.join_start_call.action',
         extraHeader: 'channel_info.extra.header',
+        extraHeaderContent: 'channel_info.extra.header.content',
         extraCreatedBy: 'channel_info.extra.created_by',
         extraCreatedOn: 'channel_info.extra.created_on',
         ignoreMentionsOptionToggledOff: 'channel_info.options.ignore_mentions.option.toggled.false',
@@ -35,11 +36,17 @@ class ChannelInfoScreen {
         pinnedMessagesOption: 'channel_info.options.pinned_messages.option',
         membersOption: 'channel_info.options.members.option',
         copyChannelLinkOption: 'channel_info.options.copy_channel_link.option',
-        editChannelOption: 'channel_info.options.edit_channel.option',
-        convertPrivateOption: 'channel_info.options.convert_private.option',
+        channelSettingsOption: 'channel_info.options.channel_settings.option',
         leaveChannelOption: 'channel_info.options.leave_channel.option',
-        archiveChannelOption: 'channel_info.options.archive_channel.option',
-        unarchiveChannelOption: 'channel_info.options.unarchive_channel.option',
+        attributes: 'channel_info.attributes',
+        copyHeaderTextAction: 'channel_info.extra.header.bottom_sheet.copy_header_text',
+        copyUrlAction: 'channel_info.extra.header.bottom_sheet.copy_url',
+        copyHeaderCancelAction: 'channel_info.extra.header.bottom_sheet.cancel',
+        copyPurposeAction: 'channel_info.title.public_private.bottom_sheet.copy_purpose',
+        copyPurposeCancelAction: 'channel_info.title.public_private.bottom_sheet.cancel',
+        bookmarksList: 'channel_info.bookmarks.list',
+        addBookmarkButton: 'channel_info.add_bookmark.button',
+        channelHeaderBookmarksList: 'channel_header.bookmarks.list',
     };
 
     channelInfoScreen = element(by.id(this.testID.channelInfoScreen));
@@ -57,6 +64,7 @@ class ChannelInfoScreen {
     copyChannelLinkAction = element(by.id(this.testID.copyChannelLinkAction));
     joinStartCallAction = element(by.id(this.testID.joinStartCallAction));
     extraHeader = element(by.id(this.testID.extraHeader));
+    extraHeaderContent = element(by.id(this.testID.extraHeaderContent));
     extraCreatedBy = element(by.id(this.testID.extraCreatedBy));
     extraCreatedOn = element(by.id(this.testID.extraCreatedOn));
     ignoreMentionsOptionToggledOff = element(by.id(this.testID.ignoreMentionsOptionToggledOff));
@@ -65,11 +73,12 @@ class ChannelInfoScreen {
     pinnedMessagesOption = element(by.id(this.testID.pinnedMessagesOption));
     membersOption = element(by.id(this.testID.membersOption));
     copyChannelLinkOption = element(by.id(this.testID.copyChannelLinkOption));
-    editChannelOption = element(by.id(this.testID.editChannelOption));
-    convertPrivateOption = element(by.id(this.testID.convertPrivateOption));
+    channelSettingsOption = element(by.id(this.testID.channelSettingsOption));
     leaveChannelOption = element(by.id(this.testID.leaveChannelOption));
-    archiveChannelOption = element(by.id(this.testID.archiveChannelOption));
-    unarchiveChannelOption = element(by.id(this.testID.unarchiveChannelOption));
+    attributes = element(by.id(this.testID.attributes));
+
+    getAttributeRow = (fieldName: string) => element(by.id(`${this.testID.attributes}.${fieldName}`));
+    getAttributeNotSet = (fieldName: string) => element(by.id(`${this.testID.attributes}.${fieldName}.not_set`));
 
     getDirectMessageTitle = (userId: string) => {
         const directMessageTitleTestId = `${this.testID.directMessageTitlePrefix}${userId}`;
@@ -91,83 +100,72 @@ class ChannelInfoScreen {
     };
 
     toBeVisible = async () => {
-        await waitFor(this.channelInfoScreen).toExist().withTimeout(timeouts.TEN_SEC);
+        // HALF_MIN on iOS: after unarchiving/converting a channel the stack settles
+        // slowly on iOS 26.x. Poll so a busy idle timer cannot swallow withTimeout.
+        const timeout = isAndroid() ? timeouts.TWENTY_SEC : timeouts.HALF_MIN;
+
+        // Existence is not enough for callers: the screen is in the hierarchy while the
+        // push animation is still running, so a caller that immediately asserts a child
+        // toBeVisible() fails the visibility threshold on a view that is mid-transition.
+        // Wait for the container itself to pass that threshold first.
+        await waitForElementToExist(this.channelInfoScreen, timeout);
+        await waitForElementToBeVisible(this.channelInfoScreen, timeout);
 
         return this.channelInfoScreen;
     };
 
     open = async () => {
         // # Open channel info screen
-        await waitFor(ChannelScreen.headerTitle).toBeVisible().withTimeout(timeouts.TEN_SEC);
+        if (isIos()) {
+            // Keyboard + leftover sheet animations keep Detox idle busy, so
+            // waitFor(headerTitle).toBeVisible() can sit until Jest's 300s cap.
+            await withSynchronizationDisabled(async () => {
+                await ChannelScreen.dismissKeyboard();
+                await waitForElementToExist(ChannelScreen.headerTitle, timeouts.TEN_SEC);
+                await ChannelScreen.headerTitle.tap();
+                await waitForElementToExist(this.channelInfoScreen, timeouts.HALF_MIN);
+            });
+            return this.channelInfoScreen;
+        }
+
+        await waitForElementToExist(ChannelScreen.headerTitle, timeouts.TEN_SEC);
         await ChannelScreen.headerTitle.tap();
 
         return this.toBeVisible();
     };
 
     close = async () => {
+        if (isIos()) {
+            await withSynchronizationDisabled(async () => {
+                await waitForElementToExist(this.closeButton, timeouts.TEN_SEC);
+                await this.closeButton.tap();
+                await waitForElementToNotExist(this.channelInfoScreen, timeouts.TEN_SEC);
+            });
+            return;
+        }
+
+        await waitFor(this.closeButton).toBeVisible().withTimeout(timeouts.TEN_SEC);
         await this.closeButton.tap();
-        await expect(this.channelInfoScreen).not.toBeVisible();
+        await waitFor(this.channelInfoScreen).not.toBeVisible().withTimeout(timeouts.TEN_SEC);
     };
 
-    archiveChannel = async (alertArchiveChannelTitle: Detox.NativeElement, {confirm = true} = {}) => {
-        await waitFor(this.archiveChannelOption).toBeVisible().whileElement(by.id(this.testID.scrollView)).scroll(50, 'down');
-        await this.archiveChannelOption.tap({x: 1, y: 1});
-        const {
-            noButton,
-            yesButton,
-        } = Alert;
-        await expect(alertArchiveChannelTitle).toBeVisible();
-        await expect(noButton).toBeVisible();
-        await expect(yesButton).toBeVisible();
-        if (confirm) {
-            await yesButton.tap();
-            await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).not.toExist();
-        } else {
-            await noButton.tap();
-            await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).toExist();
-        }
-    };
-
-    archivePrivateChannel = async ({confirm = true} = {}) => {
-        await this.archiveChannel(Alert.archivePrivateChannelTitle, {confirm});
-    };
-
-    archivePublicChannel = async ({confirm = true} = {}) => {
-        await this.archiveChannel(Alert.archivePublicChannelTitle, {confirm});
-    };
-
-    convertToPrivateChannel = async (channelDisplayName: string, {confirm = true} = {}) => {
-        await waitFor(this.convertPrivateOption).toExist().withTimeout(timeouts.TWO_SEC);
-        await this.convertPrivateOption.tap({x: 1, y: 1});
-        const {
-            channelNowPrivateTitle,
-            convertToPrivateChannelTitle,
-            noButton2,
-            okButton,
-            yesButton2,
-        } = Alert;
-        await expect(convertToPrivateChannelTitle(channelDisplayName)).toBeVisible();
-        await expect(noButton2).toBeVisible();
-        await expect(yesButton2).toBeVisible();
-        if (confirm) {
-            await yesButton2.tap();
-            await expect(channelNowPrivateTitle(channelDisplayName)).toBeVisible();
-            await okButton.tap();
-            await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).toExist();
-        } else {
-            await noButton2.tap();
-            await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).toExist();
-        }
+    openChannelSettings = async () => {
+        await waitFor(this.channelSettingsOption).toBeVisible().withTimeout(timeouts.TEN_SEC);
+        await this.channelSettingsOption.tap({x: 1, y: 1});
     };
 
     leaveChannel = async ({confirm = true} = {}) => {
+        await this.scrollView.tap({x: 1, y: 1});
+        try {
+            await this.scrollView.scroll(200, 'down');
+        } catch {
+            // Content may not require scrolling; proceed
+        }
         await waitFor(this.leaveChannelOption).toExist().withTimeout(timeouts.TWO_SEC);
-        if (isAndroid()) {
+        try {
             await this.scrollView.scrollTo('bottom');
+        } catch {
+            // Content may not require scrolling; proceed
         }
         await this.leaveChannelOption.tap({x: 1, y: 1});
         const {
@@ -180,11 +178,11 @@ class ChannelInfoScreen {
         await expect(leaveButton).toBeVisible();
         if (confirm) {
             await leaveButton.tap();
-            await wait(timeouts.ONE_SEC);
+            await wait(timeouts.TWO_SEC);
             await expect(this.channelInfoScreen).not.toExist();
         } else {
             await cancelButton.tap();
-            await wait(timeouts.ONE_SEC);
+            await wait(timeouts.TWO_SEC);
             await expect(this.channelInfoScreen).toExist();
         }
     };
@@ -199,33 +197,216 @@ class ChannelInfoScreen {
         await expect(this.ignoreMentionsOptionToggledOff).toBeVisible();
     };
 
-    unarchiveChannel = async (alertUnarchiveChannelTitle: Detox.NativeElement, {confirm = true} = {}) => {
-        await waitFor(this.unarchiveChannelOption).toBeVisible().whileElement(by.id(this.testID.scrollView)).scroll(50, 'down');
-        await this.unarchiveChannelOption.tap({x: 1, y: 1});
-        const {
-            noButton,
-            yesButton,
-        } = Alert;
-        await expect(alertUnarchiveChannelTitle).toBeVisible();
-        await expect(noButton).toBeVisible();
-        await expect(yesButton).toBeVisible();
-        if (confirm) {
-            await yesButton.tap();
+    // Android: sync stays off from the long press through the copy tap (Fabric idling-resource deadlock,
+    // MM-T868/T869), in one window so it is not turned on and off again between them.
+    copyChannelHeader = async () => {
+        const copyAction = element(by.id(this.testID.copyHeaderTextAction));
+        await withSynchronizationDisabledOnAndroid(async () => {
+            await longPressWithRetry(
+                this.extraHeaderContent,
+                copyAction,
+                5,
+                by.id(this.testID.scrollView),
+            );
+            await copyAction.tap();
             await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).not.toExist();
-        } else {
-            await noButton.tap();
+        });
+    };
+
+    cancelCopyChannelHeader = async () => {
+        const cancelAction = element(by.id(this.testID.copyHeaderCancelAction));
+        await withSynchronizationDisabledOnAndroid(async () => {
+            await longPressWithRetry(
+                this.extraHeaderContent,
+                element(by.id(this.testID.copyHeaderTextAction)),
+                5,
+                by.id(this.testID.scrollView),
+            );
+            await waitForElementToBeVisible(cancelAction, timeouts.FIVE_SEC);
+            await wait(timeouts.HALF_SEC);
+            await cancelAction.tap();
             await wait(timeouts.ONE_SEC);
-            await expect(this.channelInfoScreen).toExist();
+        });
+    };
+
+    copyChannelPurpose = async () => {
+        const copyAction = element(by.id(this.testID.copyPurposeAction));
+        await withSynchronizationDisabledOnAndroid(async () => {
+            await longPressWithRetry(this.publicPrivateTitlePurpose, copyAction);
+            await copyAction.tap();
+            await wait(timeouts.ONE_SEC);
+        });
+    };
+
+    cancelCopyChannelPurpose = async () => {
+        await longPressWithRetry(
+            this.publicPrivateTitlePurpose,
+            element(by.id(this.testID.copyPurposeAction)),
+        );
+        await element(by.id(this.testID.copyPurposeCancelAction)).tap();
+    };
+
+    scrollToBookmarks = async () => {
+        const bookmarksList = element(by.id(this.testID.bookmarksList));
+
+        // Channel Info preserves its scroll offset across reopens, which can leave the bookmarks
+        // list fully clipped behind the navigation header.
+        try {
+            await this.scrollView.scrollTo('top');
+        } catch {
+            // Content may not require scrolling.
         }
+
+        // Empty channels render the AddBookmark button without a bookmarks FlatList, so the
+        // button itself must also gate the early return
+        try {
+            await waitFor(element(by.id(this.testID.addBookmarkButton))).toBeVisible().withTimeout(timeouts.THREE_SEC);
+            return;
+        } catch {
+            // Bookmarks section may be below the fold — scroll channel info.
+        }
+
+        try {
+            await waitFor(bookmarksList).toBeVisible().withTimeout(timeouts.THREE_SEC);
+            return;
+        } catch {
+            // Bookmarks section may be below the fold — scroll channel info.
+        }
+
+        // A 200px scroll step does not always reach the bookmarks list on CI.
+        try {
+            await waitFor(bookmarksList).
+                toExist().
+                whileElement(by.id(this.testID.scrollView)).
+                scroll(300, 'down');
+        } catch {
+            try {
+                await this.scrollView.scrollTo('bottom');
+            } catch {
+                // Content may not require scrolling
+            }
+        }
+        await wait(timeouts.ONE_SEC);
     };
 
-    unarchivePrivateChannel = async ({confirm = true} = {}) => {
-        await this.unarchiveChannel(Alert.unarchivePrivateChannelTitle, {confirm});
+    tapAddBookmark = async () => {
+        await this.scrollToBookmarks();
+
+        const addBookmark = element(by.id(this.testID.addBookmarkButton));
+        const scrollViewMatcher = by.id(this.testID.scrollView);
+
+        try {
+            await waitFor(addBookmark).toBeVisible(100).whileElement(scrollViewMatcher).scroll(150, 'up');
+        } catch {
+            try {
+                await waitFor(addBookmark).toBeVisible(100).whileElement(scrollViewMatcher).scroll(150, 'down');
+            } catch {
+                // Already at a scroll edge; tap() still enforces its own 75% visibility constraint.
+            }
+        }
+        await wait(timeouts.HALF_SEC);
+        await addBookmark.tap();
+
+        const addLinkOption = element(by.id('channel_bookmark.type.link'));
+        await withSynchronizationDisabled(async () => {
+            await waitForElementToExist(addLinkOption, timeouts.TEN_SEC);
+        });
     };
 
-    unarchivePublicChannel = async ({confirm = true} = {}) => {
-        await this.unarchiveChannel(Alert.unarchivePublicChannelTitle, {confirm});
+    /**
+     * `totalBudget` bounds the whole call, not just the per-attempt waits. Each retry closes
+     * the sheet and calls onResync(), which re-enters the channel -- unbounded work that is not
+     * covered by `timeout`. Two calls to this helper could therefore outlive the 300s jest test
+     * timeout, and when they did the failure surfaced as
+     * `Exceeded timeout of 300000 ms for a test` pointing at the `it(...)` line, hiding which
+     * bookmark was actually missing (MM-T69455_1). Failing fast with a named assertion keeps
+     * the diagnosis in the error instead of the artifacts.
+     */
+    waitForBookmarkInChannelInfo = async (
+        bookmarkMatcher: Detox.NativeMatcher,
+        {
+            timeout = timeouts.TWENTY_SEC,
+            totalBudget = timeouts.ONE_MIN + timeouts.HALF_MIN,
+            textFallback,
+            bookmarkId,
+            onResync,
+        }: {timeout?: number; totalBudget?: number; textFallback?: string; bookmarkId?: string; onResync?: () => Promise<unknown>} = {},
+    ) => {
+        const MAX_RETRIES = 3;
+        const perAttemptTimeout = Math.ceil(timeout / MAX_RETRIES);
+        const label = textFallback ?? bookmarkId ?? 'bookmark';
+        const deadline = Date.now() + totalBudget;
+
+        /* eslint-disable no-await-in-loop -- close/reopen channel info to trigger bookmark sync */
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            await this.scrollToBookmarks();
+            try {
+                await waitFor(element(bookmarkMatcher)).toExist().withTimeout(perAttemptTimeout);
+                return;
+            } catch (error) {
+                for (let swipe = 0; swipe < 3; swipe++) {
+                    try {
+                        await element(by.id(this.testID.bookmarksList)).swipe('left', 'fast', 0.8, 0.5, 0.5);
+                        await waitFor(element(bookmarkMatcher)).toExist().withTimeout(timeouts.TWO_SEC);
+                        return;
+                    } catch {
+                        // Continue through the virtualized horizontal list.
+                    }
+                }
+
+                if (attempt === MAX_RETRIES) {
+                    if (textFallback) {
+                        const headerMatcher = by.text(textFallback).
+                            withAncestor(by.id(this.testID.channelHeaderBookmarksList));
+                        try {
+                            await waitFor(element(headerMatcher)).toExist().withTimeout(timeouts.FIVE_SEC);
+                            return;
+                        } catch {
+                            // Fall through to bookmarkId / original error.
+                        }
+                    }
+                    if (bookmarkId) {
+                        const headerMatcher = by.id(`channel_bookmark.${bookmarkId}`).
+                            withAncestor(by.id(this.testID.channelHeaderBookmarksList));
+                        try {
+                            await waitFor(element(headerMatcher)).toExist().withTimeout(timeouts.FIVE_SEC);
+                            return;
+                        } catch {
+                            // Fall through to original error.
+                        }
+                    }
+                    throw new Error(
+                        `"${label}" never appeared in channel info after ${MAX_RETRIES} attempts ` +
+                        `with resync. Original matcher failure: ${(error as Error)?.message ?? error}`,
+                    );
+                }
+
+                // Closing and reopening this sheet only re-renders local state -- bookmarks are
+                // fetched by fetchChannelBookmarks, which runs on channel switch
+                // (switchToChannelById, app/actions/remote/channel.ts). So when a bookmark
+                // never synced, reopening the sheet can never recover it: MM-T69455_1 failed
+                // in CI with channel info showing only "Tap File Bookmark" and the link
+                // bookmark absent from the device entirely. onResync lets the caller re-enter
+                // the channel, which is what actually triggers a refetch.
+                // A resync re-enters the channel and is the expensive part of this loop, so
+                // only start one that can still finish inside the budget.
+                if (Date.now() >= deadline) {
+                    throw new Error(
+                        `"${label}" never appeared in channel info within ${totalBudget}ms ` +
+                        `(${attempt} of ${MAX_RETRIES} attempts). It is absent from the device, ` +
+                        'not merely off-screen: the horizontal list was swiped on every attempt.',
+                    );
+                }
+
+                await this.close();
+                await wait(timeouts.ONE_SEC);
+                if (onResync) {
+                    await onResync();
+                }
+                await this.open();
+            }
+        }
+        /* eslint-enable no-await-in-loop */
     };
 }
 

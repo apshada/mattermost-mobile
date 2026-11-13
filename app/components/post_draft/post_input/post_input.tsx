@@ -1,25 +1,28 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {useHardwareKeyboardEvents} from '@mattermost/hardware-keyboard';
 import {useManagedConfig} from '@mattermost/react-native-emm';
-import PasteableTextInput, {type PastedFile, type PasteInputRef} from '@mattermost/react-native-paste-input';
+import PasteableTextInput, {type PastedFile} from '@mattermost/react-native-paste-input';
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {type IntlShape, useIntl} from 'react-intl';
+import {defineMessage, type IntlShape, useIntl} from 'react-intl';
 import {
-    Alert, AppState, type AppStateStatus, DeviceEventEmitter, type EmitterSubscription, Keyboard,
-    type NativeSyntheticEvent, Platform, type TextInputSelectionChangeEventData,
+    Alert, AppState, type AppStateStatus, DeviceEventEmitter,
+    Platform, type TextInputSelectionChangeEvent,
 } from 'react-native';
-import HWKeyboardEvent from 'react-native-hw-keyboard-event';
+import {useAnimatedKeyboard} from 'react-native-keyboard-controller';
+import Animated, {cancelAnimation, Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming} from 'react-native-reanimated';
 
 import {updateDraftMessage} from '@actions/local/draft';
 import {userTyping} from '@actions/websocket/users';
+import {useRewrite} from '@agents/hooks';
 import {Events, Screens} from '@constants';
+import {useKeyboardState} from '@context/keyboard_state';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
 import {useIsTablet} from '@hooks/device';
-import {useInputPropagation} from '@hooks/input';
-import {t} from '@i18n';
-import NavigationStore from '@store/navigation_store';
+import {useCurrentScreen} from '@store/navigation_store';
+import {handleDraftUpdate} from '@utils/draft';
 import {extractFileInfo} from '@utils/file';
 import {changeOpacity, makeStyleSheetFromTheme, getKeyboardAppearanceFromTheme} from '@utils/theme';
 
@@ -41,7 +44,6 @@ type Props = {
     cursorPosition: number;
     updateCursorPosition: React.Dispatch<React.SetStateAction<number>>;
     sendMessage: () => void;
-    inputRef: React.MutableRefObject<PasteInputRef | undefined>;
     setIsFocused: (isFocused: boolean) => void;
 }
 
@@ -70,9 +72,9 @@ const getPlaceHolder = (rootId?: string) => {
     let placeholder;
 
     if (rootId) {
-        placeholder = {id: t('create_post.thread_reply'), defaultMessage: 'Reply to this thread...'};
+        placeholder = defineMessage({id: 'create_post.thread_reply', defaultMessage: 'Reply to this thread...'});
     } else {
-        placeholder = {id: t('create_post.write'), defaultMessage: 'Write to {channelDisplayName}'};
+        placeholder = defineMessage({id: 'create_post.write', defaultMessage: 'Write to {channelDisplayName}'});
     }
 
     return placeholder;
@@ -112,7 +114,6 @@ export default function PostInput({
     cursorPosition,
     updateCursorPosition,
     sendMessage,
-    inputRef,
     setIsFocused,
 }: Props) {
     const intl = useIntl();
@@ -120,9 +121,45 @@ export default function PostInput({
     const theme = useTheme();
     const style = getStyleSheet(theme);
     const serverUrl = useServerUrl();
+    const currentScreen = useCurrentScreen();
     const managedConfig = useManagedConfig<ManagedConfig>();
-    const [propagateValue, shouldProcessEvent] = useInputPropagation();
+    const animatedKeyboard = useAnimatedKeyboard();
 
+    const {
+        showInputAccessoryView,
+        isEmojiSearchFocused,
+        setCursorPosition,
+        registerPostInputCallbacks,
+        inputRef,
+        stateMachine,
+        stateContext,
+    } = useKeyboardState();
+
+    // Register cursor position updates with context
+    // Always update cursorPositionRef, even when input accessory view is shown,
+    // so emoji insertion works correctly at cursor position
+    useEffect(() => {
+        if (showInputAccessoryView) {
+            return;
+        }
+        if (setCursorPosition) {
+            setCursorPosition(cursorPosition);
+        }
+    }, [setCursorPosition, cursorPosition, showInputAccessoryView]);
+
+    // Register updateValue and updateCursorPosition with context
+    useEffect(() => {
+        if (registerPostInputCallbacks) {
+            registerPostInputCallbacks(updateValue, updateCursorPosition, value);
+        }
+
+        // updateValue and updateCursorPosition are stable setState functions — no need in deps.
+        // value is intentionally excluded: we only want to seed cursorPosition once at registration
+        // time, not on every keystroke. Ongoing cursor tracking is handled by setCursorPosition.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [registerPostInputCallbacks]);
+
+    const {isProcessing} = useRewrite();
     const lastTypingEventSent = useRef(0);
 
     const lastNativeValue = useRef('');
@@ -136,22 +173,59 @@ export default function PostInput({
         return {...style.input, maxHeight};
     }, [maxHeight, style.input]);
 
-    const handleAndroidKeyboardHide = () => {
-        onBlur();
-    };
+    // Pulsing animation for when AI rewrite is processing
+    const pulseOpacity = useSharedValue(1);
+    const pulsingAnimatedStyle = useAnimatedStyle(() => ({
+        opacity: pulseOpacity.value,
+    }));
 
-    const handleAndroidKeyboardShow = () => {
-        onFocus();
-    };
+    useEffect(() => {
+        if (isProcessing) {
+            pulseOpacity.value = withRepeat(
+                withTiming(0.5, {duration: 400, easing: Easing.inOut(Easing.ease)}),
+                -1,
+                true,
+            );
+        } else {
+            pulseOpacity.value = withTiming(1, {duration: 200});
+        }
+
+        return () => {
+            cancelAnimation(pulseOpacity);
+        };
+    }, [isProcessing, pulseOpacity]);
 
     const onBlur = useCallback(() => {
-        updateDraftMessage(serverUrl, channelId, rootId, value);
+        handleDraftUpdate({
+            serverUrl,
+            channelId,
+            rootId,
+            value,
+        });
         setIsFocused(false);
-    }, [channelId, rootId, value, setIsFocused]);
+    }, [serverUrl, channelId, rootId, value, setIsFocused]);
 
     const onFocus = useCallback(() => {
+        // On Android, ignore focus events when emoji search is focused.
+        // This prevents the emoji picker from closing when the search bar gets focus.
+        if (Platform.OS === 'android' && isEmojiSearchFocused) {
+            return;
+        }
+
         setIsFocused(true);
-    }, [setIsFocused]);
+
+        // With hardware keyboard, keyboard events never fire so USER_FOCUS_INPUT is never
+        // dispatched via useKeyboardEvents. Dispatch it here to close the emoji picker.
+        // With software keyboard, useKeyboardEvents.onStart dispatches it on the UI thread.
+        const isKeyboardClosed = animatedKeyboard.height.value === 0 && animatedKeyboard.state.value === 0;
+        const asHardwareKeyboard = Platform.OS === 'ios' && isTablet && isKeyboardClosed;
+
+        // Only dispatch when the keyboard is not expected to appear (hasZeroKeyboardHeight).
+        const shouldDispatch = stateContext.hasZeroKeyboardHeight.value && stateMachine.isEmojiPickerActive();
+        if (shouldDispatch || asHardwareKeyboard) {
+            stateMachine.onUserFocusInput(asHardwareKeyboard);
+        }
+    }, [isEmojiSearchFocused, setIsFocused, stateMachine, stateContext, isTablet, animatedKeyboard]);
 
     const checkMessageLength = useCallback((newValue: string) => {
         const valueLength = newValue.trim().length;
@@ -179,16 +253,16 @@ export default function PostInput({
         }
     }, [intl, longMessageAlertShown, maxMessageLength]);
 
-    const handlePostDraftSelectionChanged = useCallback((event: NativeSyntheticEvent<TextInputSelectionChangeEventData> | null, fromHandleTextChange = false) => {
+    const handlePostDraftSelectionChanged = useCallback((event: TextInputSelectionChangeEvent | null, fromHandleTextChange = false) => {
+        if (showInputAccessoryView && !fromHandleTextChange) {
+            return;
+        }
         const cp = fromHandleTextChange ? cursorPosition : event!.nativeEvent.selection.end;
 
         updateCursorPosition(cp);
-    }, [updateCursorPosition, cursorPosition]);
+    }, [showInputAccessoryView, cursorPosition, updateCursorPosition]);
 
     const handleTextChange = useCallback((newValue: string) => {
-        if (!shouldProcessEvent(newValue)) {
-            return;
-        }
         updateValue(newValue);
         lastNativeValue.current = newValue;
 
@@ -207,9 +281,12 @@ export default function PostInput({
         updateValue,
         checkMessageLength,
         timeBetweenUserTypingUpdatesMilliseconds,
+        membersInChannel,
+        maxNotificationsPerChannel,
+        enableUserTypingMessage,
+        serverUrl,
         channelId,
         rootId,
-        (membersInChannel < maxNotificationsPerChannel) && enableUserTypingMessage,
     ]);
 
     const onPaste = useCallback(async (error: string | null | undefined, files: PastedFile[]) => {
@@ -220,32 +297,36 @@ export default function PostInput({
         addFiles(await extractFileInfo(files));
     }, [addFiles, intl]);
 
-    const handleHardwareEnterPress = useCallback((keyEvent: {pressedKey: string}) => {
-        const topScreen = NavigationStore.getVisibleScreen();
+    const handleHardwareEnterPress = useCallback(() => {
         let sourceScreen: AvailableScreens = Screens.CHANNEL;
         if (rootId) {
             sourceScreen = Screens.THREAD;
         } else if (isTablet) {
-            sourceScreen = Screens.HOME;
+            sourceScreen = Screens.CHANNEL_LIST;
         }
-        if (topScreen === sourceScreen) {
-            switch (keyEvent.pressedKey) {
-                case 'enter':
-                    sendMessage();
-                    break;
-                case 'shift-enter': {
-                    let newValue: string;
-                    updateValue((v) => {
-                        newValue = v.substring(0, cursorPosition) + '\n' + v.substring(cursorPosition);
-                        return newValue;
-                    });
-                    updateCursorPosition((pos) => pos + 1);
-                    propagateValue(newValue!);
-                    break;
-                }
-            }
+        if (currentScreen === sourceScreen) {
+            sendMessage();
         }
-    }, [sendMessage, updateValue, cursorPosition, isTablet]);
+    }, [rootId, isTablet, currentScreen, sendMessage]);
+
+    const handleHardwareShiftEnter = useCallback(() => {
+        let sourceScreen: AvailableScreens = Screens.CHANNEL;
+        if (rootId) {
+            sourceScreen = Screens.THREAD;
+        } else if (isTablet) {
+            sourceScreen = Screens.CHANNEL_LIST;
+        }
+
+        if (currentScreen === sourceScreen) {
+            let newValue: string;
+            updateValue((v) => {
+                newValue = v.substring(0, cursorPosition) + '\n' + v.substring(cursorPosition);
+                return newValue;
+            });
+
+            updateCursorPosition((pos) => pos + 1);
+        }
+    }, [rootId, isTablet, currentScreen, updateValue, updateCursorPosition, cursorPosition]);
 
     const onAppStateChange = useCallback((appState: AppStateStatus) => {
         if (appState !== 'active' && previousAppState.current === 'active') {
@@ -254,20 +335,6 @@ export default function PostInput({
 
         previousAppState.current = appState;
     }, [serverUrl, channelId, rootId, value]);
-
-    useEffect(() => {
-        let keyboardHideListener: EmitterSubscription | undefined;
-        let keyboardShowListener: EmitterSubscription | undefined;
-        if (Platform.OS === 'android') {
-            keyboardHideListener = Keyboard.addListener('keyboardDidHide', handleAndroidKeyboardHide);
-            keyboardShowListener = Keyboard.addListener('keyboardDidShow', handleAndroidKeyboardShow);
-        }
-
-        return (() => {
-            keyboardShowListener?.remove();
-            keyboardHideListener?.remove();
-        });
-    }, []);
 
     useEffect(() => {
         const listener = AppState.addEventListener('change', onAppStateChange);
@@ -284,7 +351,6 @@ export default function PostInput({
                 const draft = value ? `${value} ${text} ` : `${text} `;
                 updateValue(draft);
                 updateCursorPosition(draft.length);
-                propagateValue(draft);
                 inputRef.current?.focus();
             }
         });
@@ -292,44 +358,52 @@ export default function PostInput({
             listener.remove();
             updateDraftMessage(serverUrl, channelId, rootId, lastNativeValue.current); // safe draft on unmount
         };
-    }, [updateValue, channelId, rootId]);
+
+    // - updateValue and updateCursorPosition are stable setState/hook functions
+    // - inputRef is a ref (stable reference, doesn't need to be in deps)
+    // - serverUrl, value, lastNativeValue are either stable or we want their latest values when event fires
+    // - We need to recreate the listener when channelId/rootId changes to check the correct source screen
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [updateValue, channelId, rootId, inputRef]);
 
     useEffect(() => {
         if (value !== lastNativeValue.current) {
-            propagateValue(value);
             lastNativeValue.current = value;
         }
     }, [value]);
 
-    useEffect(() => {
-        const listener = HWKeyboardEvent.onHWKeyPressed(handleHardwareEnterPress);
-        return () => {
-            listener.remove();
-        };
-    }, [handleHardwareEnterPress]);
+    const events = useMemo(() => ({
+        onEnterPressed: handleHardwareEnterPress,
+        onShiftEnterPressed: handleHardwareShiftEnter,
+    }), [handleHardwareEnterPress, handleHardwareShiftEnter]);
+    useHardwareKeyboardEvents(events);
 
     return (
-        <PasteableTextInput
-            allowFontScaling={true}
-            disableCopyPaste={disableCopyAndPaste}
-            disableFullscreenUI={true}
-            keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
-            multiline={true}
-            onBlur={onBlur}
-            onChangeText={handleTextChange}
-            onFocus={onFocus}
-            onPaste={onPaste}
-            onSelectionChange={handlePostDraftSelectionChanged}
-            placeholder={intl.formatMessage(getPlaceHolder(rootId), {channelDisplayName})}
-            placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
-            ref={inputRef}
-            smartPunctuation='disable'
-            submitBehavior='newline'
-            style={pasteInputStyle}
-            testID={testID}
-            underlineColorAndroid='transparent'
-            textContentType='none'
-            value={value}
-        />
+        <Animated.View style={pulsingAnimatedStyle}>
+            <PasteableTextInput
+                allowFontScaling={true}
+                disableCopyPaste={disableCopyAndPaste}
+                disableFullscreenUI={true}
+                keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
+                multiline={true}
+                onBlur={onBlur}
+                onChangeText={handleTextChange}
+                onFocus={onFocus}
+                onPaste={onPaste}
+                onSelectionChange={handlePostDraftSelectionChanged}
+                placeholder={intl.formatMessage(getPlaceHolder(rootId), {channelDisplayName})}
+                placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
+                ref={inputRef}
+                smartPunctuation='disable'
+                submitBehavior='newline'
+                style={pasteInputStyle}
+                testID={testID}
+                underlineColorAndroid='transparent'
+                textContentType='none'
+                value={value}
+                autoCapitalize='sentences'
+                nativeID={testID}
+            />
+        </Animated.View>
     );
 }

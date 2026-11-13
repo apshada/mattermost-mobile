@@ -12,7 +12,7 @@ export const getCookiesFromConfig = (config: AxiosRequestConfig<any>) => {
     let mmAuthToken = '';
     let mmUserId = '';
     let mmCsrf = '';
-    config.jar?.toJSON().cookies.forEach((cookie: any) => {
+    config.jar?.toJSON()?.cookies.forEach((cookie: any) => {
         if (cookie.key === 'MMAUTHTOKEN') {
             mmAuthToken = cookie.value;
         } else if (cookie.key === 'MMUSERID') {
@@ -32,12 +32,17 @@ export const getCookiesFromConfig = (config: AxiosRequestConfig<any>) => {
 export const getResponseFromError = (err: any) => {
     const {response} = err;
     if (!response) {
-        const message = `No response from server at "${err.config.baseURL}".
-If testing against a server other than the default local instance, you may set the server URL via "SITE_URL" environment variable.
-`;
-
-        // Throw an error instead of failing silently
-        throw new Error(message);
+        // Network-level error (ECONNREFUSED, ETIMEDOUT, etc.) — no HTTP response.
+        // Return a structured error object instead of throwing so callers can
+        // inspect result.error without an unhandled exception breaking the hook chain.
+        // An AggregateError (one failed attempt per address) has an empty message; the codes say what failed.
+        const inner = Array.isArray(err?.errors) ? err.errors.map((e: any) => e?.code ?? e?.message) : [];
+        const codes = [...new Set([err?.code, ...inner].filter(Boolean))];
+        const detail = codes.length ? ` (${codes.join(', ')})` : '';
+        const message = `No response from server: ${err?.message || String(err)}${detail}. ` +
+            'If testing against a non-default server, set the SITE_URL environment variable.';
+        console.warn(`[getResponseFromError] Network error: ${message}`); // eslint-disable-line no-console
+        return {error: {message}, status: 0};
     }
 
     const {data, status} = response;

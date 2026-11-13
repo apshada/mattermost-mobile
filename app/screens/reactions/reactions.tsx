@@ -4,7 +4,6 @@
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
 
 import {Screens} from '@constants';
-import {useIsTablet} from '@hooks/device';
 import BottomSheet from '@screens/bottom_sheet';
 import {getEmojiFirstAlias} from '@utils/emoji/helpers';
 
@@ -13,17 +12,27 @@ import EmojiBar from './emoji_bar';
 import ReactorsList from './reactors_list';
 
 import type ReactionModel from '@typings/database/models/servers/reaction';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type Props = {
     initialEmoji: string;
-    location: string;
+    location: AvailableScreens;
     reactions?: ReactionModel[];
 }
 
+function getSortedReactions(reactions: ReactionModel[] | undefined, prevSortedReactions: string[]): string[] {
+    const rs = reactions?.map((r) => getEmojiFirstAlias(r.emojiName));
+    const sorted = new Set([...prevSortedReactions]);
+    const added = rs?.filter((r) => !sorted.has(r));
+    added?.forEach(sorted.add, sorted);
+    const removed = [...sorted].filter((s) => !rs?.includes(s));
+    removed.forEach(sorted.delete, sorted);
+    return Array.from(sorted);
+}
+
 const Reactions = ({initialEmoji, location, reactions}: Props) => {
-    const isTablet = useIsTablet();
     const [sortedReactions, setSortedReactions] = useState(Array.from(new Set(reactions?.map((r) => getEmojiFirstAlias(r.emojiName)))));
-    const [index, setIndex] = useState(sortedReactions.indexOf(initialEmoji));
+    const [index, setIndex] = useState(() => Math.max(0, sortedReactions.indexOf(initialEmoji)));
 
     const reactionsByName = useMemo(() => {
         return reactions?.reduce((acc, reaction) => {
@@ -45,7 +54,7 @@ const Reactions = ({initialEmoji, location, reactions}: Props) => {
 
     const renderContent = useCallback(() => {
         const emojiAlias = sortedReactions[index];
-        if (!reactionsByName) {
+        if (!emojiAlias || !reactionsByName) {
             return null;
         }
 
@@ -62,28 +71,22 @@ const Reactions = ({initialEmoji, location, reactions}: Props) => {
                     key={emojiAlias}
                     location={location}
                     reactions={reactionsByName.get(emojiAlias)!}
-                    type={isTablet ? 'FlatList' : 'BottomSheetFlatList'}
                 />
             </>
         );
-    }, [index, location, reactions, sortedReactions]);
+    }, [index, location, reactionsByName, sortedReactions]);
 
     useEffect(() => {
         // This helps keep the reactions in the same position at all times until unmounted
-        const rs = reactions?.map((r) => getEmojiFirstAlias(r.emojiName));
-        const sorted = new Set([...sortedReactions]);
-        const added = rs?.filter((r) => !sorted.has(r));
-        added?.forEach(sorted.add, sorted);
-        const removed = [...sorted].filter((s) => !rs?.includes(s));
-        removed.forEach(sorted.delete, sorted);
-        setSortedReactions(Array.from(sorted));
+        setSortedReactions((prevSortedReactions) => {
+            return getSortedReactions(reactions, prevSortedReactions);
+        });
     }, [reactions]);
 
     return (
         <BottomSheet
             renderContent={renderContent}
-            closeButtonId='close-post-reactions'
-            componentId={Screens.REACTIONS}
+            screen={Screens.REACTIONS}
             initialSnapIndex={1}
             snapPoints={[1, '50%', '80%']}
             testID='reactions'

@@ -1,45 +1,54 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import BottomSheetM, {BottomSheetBackdrop, type BottomSheetBackdropProps, type BottomSheetFooterProps} from '@gorhom/bottom-sheet';
-import React, {type ReactNode, useCallback, useEffect, useMemo, useRef} from 'react';
-import {DeviceEventEmitter, type Handle, InteractionManager, Keyboard, type StyleProp, View, type ViewStyle} from 'react-native';
+import BottomSheetM, {BottomSheetBackdrop, type BottomSheetBackdropProps} from '@gorhom/bottom-sheet';
+import React, {forwardRef, type ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, useRef} from 'react';
+import {DeviceEventEmitter, type StyleProp, View, type ViewStyle} from 'react-native';
+import {ReduceMotion, useReducedMotion, type WithSpringConfig} from 'react-native-reanimated';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import {Events} from '@constants';
 import {useTheme} from '@context/theme';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
 import {useIsTablet} from '@hooks/device';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {dismissModal} from '@screens/navigation';
+import useDidMount from '@hooks/did_mount';
+import {navigateBack} from '@screens/navigation';
+import BottomSheetStore from '@store/bottom_sheet_store';
 import {hapticFeedback} from '@utils/general';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
-import Indicator from './indicator';
+import BottomSheetButton, {BUTTON_HEIGHT} from './button';
+import EmptyBottomSheetFooter from './footer';
+import {useBottomSheetStyle} from './hooks';
 
 import type {AvailableScreens} from '@typings/screens/navigation';
-import type {WithSpringConfig} from 'react-native-reanimated';
 
-export {default as BottomSheetButton, BUTTON_HEIGHT} from './button';
 export {default as BottomSheetContent, TITLE_HEIGHT} from './content';
 
+export {BUTTON_HEIGHT, BottomSheetButton};
+
+export type BottomSheetRef = {
+    close: () => void;
+};
+
 type Props = {
-    closeButtonId?: string;
-    componentId: AvailableScreens;
+    screen: AvailableScreens;
     contentStyle?: StyleProp<ViewStyle>;
     initialSnapIndex?: number;
-    footerComponent?: React.FC<BottomSheetFooterProps>;
+    footerComponent?: React.FC<unknown>;
     renderContent: () => ReactNode;
     snapPoints?: Array<string | number>;
+    enableDynamicSizing?: boolean;
     testID?: string;
+    keyboardBehavior?: 'extend' | 'fillParent' | 'interactive';
+    keyboardBlurBehavior?: 'none' | 'restore';
 }
 
 const PADDING_TOP_MOBILE = 20;
-const PADDING_TOP_TABLET = 8;
 
 export const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
     return {
         bottomSheet: {
-            backgroundColor: theme.centerChannelBg,
             borderTopStartRadius: 24,
             borderTopEndRadius: 24,
             shadowOffset: {
@@ -50,9 +59,11 @@ export const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
             shadowRadius: 24,
             shadowColor: '#000',
             elevation: 24,
+            flexGrow: 1,
+            height: 1,
         },
         bottomSheetBackground: {
-            backgroundColor: theme.centerChannelBg,
+            backgroundColor: 'transparent',
             borderColor: changeOpacity(theme.centerChannelColor, 0.16),
         },
         content: {
@@ -60,13 +71,14 @@ export const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
             paddingHorizontal: 20,
             paddingTop: PADDING_TOP_MOBILE,
         },
-        contentTablet: {
-            paddingTop: PADDING_TOP_TABLET,
+        view: {
+            flex: 1,
         },
-        separator: {
-            height: 1,
-            borderTopWidth: 1,
-            borderColor: changeOpacity(theme.centerChannelColor, 0.08),
+        indicator: {
+            backgroundColor: 'white',
+        },
+        indicatorContainer: {
+            marginTop: 0,
         },
     };
 });
@@ -76,96 +88,89 @@ export const animatedConfig: Omit<WithSpringConfig, 'velocity'> = {
     mass: 0.3,
     stiffness: 121.6,
     overshootClamping: true,
-    restSpeedThreshold: 0.3,
-    restDisplacementThreshold: 0.3,
+    energyThreshold: 0.01,
 };
 
-const BottomSheet = ({
-    closeButtonId,
-    componentId,
+const BottomSheet = forwardRef<BottomSheetRef, Props>(({
+    screen,
     contentStyle,
     initialSnapIndex = 1,
     footerComponent,
     renderContent,
     snapPoints = [1, '50%', '80%'],
     testID,
-}: Props) => {
+    enableDynamicSizing = false,
+    keyboardBehavior = 'extend',
+    keyboardBlurBehavior = 'restore',
+}: Props, ref) => {
+    const isClosing = useRef(false);
+    const reducedMotion = useReducedMotion();
     const sheetRef = useRef<BottomSheetM>(null);
-    const isTablet = useIsTablet();
+    const insets = useSafeAreaInsets();
     const theme = useTheme();
     const styles = getStyleSheet(theme);
-    const interaction = useRef<Handle>();
-    const timeoutRef = useRef<NodeJS.Timeout>();
+    const screenStyle = useBottomSheetStyle();
+    const isTablet = useIsTablet();
 
-    useEffect(() => {
-        interaction.current = InteractionManager.createInteractionHandle();
-    }, []);
-
-    const bottomSheetBackgroundStyle = useMemo(() => [
-        styles.bottomSheetBackground,
-        {borderWidth: isTablet ? 0 : 1},
-    ], [isTablet, styles]);
+    const animationConfigs = useMemo(() => ({
+        ...animatedConfig,
+        reduceMotion: reducedMotion ? ReduceMotion.Always : ReduceMotion.Never,
+    }), [reducedMotion]);
 
     const close = useCallback(() => {
-        dismissModal({componentId});
-    }, [componentId]);
+        isClosing.current = true;
+        BottomSheetStore.reset();
+        navigateBack();
+    }, []);
 
     useEffect(() => {
-        const listener = DeviceEventEmitter.addListener(Events.CLOSE_BOTTOM_SHEET, () => {
+        const listenerfn = () => {
             if (sheetRef.current) {
                 sheetRef.current.close();
-            } else {
+            } else if (!isClosing.current) {
                 close();
             }
-        });
+        };
+        const listener = DeviceEventEmitter.addListener(Events.CLOSE_BOTTOM_SHEET, listenerfn);
 
         return () => listener.remove();
     }, [close]);
 
-    const handleAnimationStart = useCallback(() => {
-        if (!interaction.current) {
-            interaction.current = InteractionManager.createInteractionHandle();
-        }
-    }, []);
-
     const handleClose = useCallback(() => {
         if (sheetRef.current) {
             sheetRef.current.close();
-        } else {
+        } else if (!isClosing.current) {
             close();
         }
-    }, []);
+    }, [close]);
 
     const handleChange = useCallback((index: number) => {
-        timeoutRef.current = setTimeout(() => {
-            if (interaction.current) {
-                InteractionManager.clearInteractionHandle(interaction.current);
-                interaction.current = undefined;
-            }
-        });
-
-        if (index <= 0) {
+        if (index <= 0 && !isClosing.current) {
             close();
         }
-    }, []);
+    }, [close]);
 
-    useAndroidHardwareBackHandler(componentId, handleClose);
-    useNavButtonPressed(closeButtonId || '', componentId, close, [close]);
+    const onBottomSheetClose = useCallback(() => {
+        if (!isClosing.current) {
+            close();
+        }
+    }, [close]);
 
-    useEffect(() => {
+    useAndroidHardwareBackHandler(screen, handleClose);
+
+    useDidMount(() => {
         hapticFeedback();
-        Keyboard.dismiss();
+    });
 
-        return () => {
-            if (timeoutRef.current) {
-                clearTimeout(timeoutRef.current);
+    useImperativeHandle(ref, () => ({
+        close: () => {
+            if (sheetRef.current) {
+                sheetRef.current.close();
+            } else if (!isClosing.current) {
+                close();
             }
-
-            if (interaction.current) {
-                InteractionManager.clearInteractionHandle(interaction.current);
-            }
-        };
-    }, []);
+        },
+    }), [close]);
 
     const renderBackdrop = useCallback((props: BottomSheetBackdropProps) => {
         return (
@@ -180,21 +185,13 @@ const BottomSheet = ({
 
     const renderContainerContent = () => (
         <View
-            style={[styles.content, isTablet && styles.contentTablet, contentStyle]}
+            style={[styles.content, contentStyle]}
             testID={`${testID}.screen`}
+            accessibilityViewIsModal={!isTablet}
         >
             {renderContent()}
         </View>
     );
-
-    if (isTablet) {
-        return (
-            <>
-                <View style={styles.separator}/>
-                {renderContainerContent()}
-            </>
-        );
-    }
 
     return (
         <BottomSheetM
@@ -203,20 +200,26 @@ const BottomSheet = ({
             snapPoints={snapPoints}
             animateOnMount={true}
             backdropComponent={renderBackdrop}
-            onAnimate={handleAnimationStart}
             onChange={handleChange}
-            animationConfigs={animatedConfig}
-            handleComponent={Indicator}
-            style={styles.bottomSheet}
-            backgroundStyle={bottomSheetBackgroundStyle}
-            footerComponent={footerComponent}
-            keyboardBehavior='extend'
-            keyboardBlurBehavior='restore'
-            onClose={close}
+            animationConfigs={animationConfigs}
+            handleIndicatorStyle={styles.indicator}
+            handleStyle={styles.indicatorContainer}
+            backgroundStyle={styles.bottomSheetBackground}
+            footerComponent={footerComponent || EmptyBottomSheetFooter}
+            keyboardBehavior={keyboardBehavior}
+            keyboardBlurBehavior={keyboardBlurBehavior}
+            onClose={onBottomSheetClose}
+            bottomInset={footerComponent ? 0 : insets.bottom}
+            enableDynamicSizing={enableDynamicSizing}
+            accessible={false}
         >
-            {renderContainerContent()}
+            <View style={[screenStyle, styles.bottomSheet]}>
+                {renderContainerContent()}
+            </View>
         </BottomSheetM>
     );
-};
+});
+
+BottomSheet.displayName = 'BottomSheet';
 
 export default BottomSheet;

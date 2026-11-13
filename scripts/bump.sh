@@ -6,7 +6,7 @@ cd "$(dirname "$0")"/..
 log () { echo "[$(date +%Y-%m-%dT%H:%M:%S%Z)]" "$@"; }
 
 : "${BRANCH_TO_BUILD:=main}"
-: "${PR_REVIEWERS:=mattermost/core-build-engineers}"
+: "${PR_REVIEWERS:=mattermost/core-build-engineers,amyblais}"
 : "${BUMP_BUILD_NUMBER:=}"    # You can optionally specify the BUILD_NUMBER variable for selecting the next build number
                               # If you don't, then the Fastlane action will pick the next build number automatically
 : "${BUMP_VERSION_NUMBER:=}"  # If enabled, you must populate the VERSION_NUMBER variable as well
@@ -48,9 +48,9 @@ if [ -n "$BUMP_BUILD_NUMBER" ]; then
 fi
 
 log "Creating branch '${GIT_LOCAL_BRANCH}' based on branch '$BRANCH_TO_BUILD'"
-git checkout "$BRANCH_TO_BUILD"
-git pull
-git checkout -b "$GIT_LOCAL_BRANCH"
+# A same-named tag (for example release-2.44) makes `git checkout <name>` detach HEAD.
+git fetch origin "+refs/heads/${BRANCH_TO_BUILD}:refs/remotes/origin/${BRANCH_TO_BUILD}"
+git checkout --no-track -b "$GIT_LOCAL_BRANCH" "refs/remotes/origin/${BRANCH_TO_BUILD}"
 
 log "Generating env file required by Fastlane..."
 tee .env <<EOF

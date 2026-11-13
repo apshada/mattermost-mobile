@@ -1,38 +1,36 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {Platform, useWindowDimensions, View, type LayoutChangeEvent} from 'react-native';
-import {KeyboardAwareScrollView} from 'react-native-keyboard-aware-scroll-view';
-import {Navigation} from 'react-native-navigation';
-import Animated, {ReduceMotion, useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import React, {useCallback, useMemo, useState} from 'react';
+import {useIntl} from 'react-intl';
+import {Text, useWindowDimensions, View, type LayoutChangeEvent} from 'react-native';
+import {KeyboardAwareScrollView} from 'react-native-keyboard-controller';
+import Animated from 'react-native-reanimated';
 
 import FormattedText from '@components/formatted_text';
 import {Screens} from '@constants';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
 import {useIsTablet} from '@hooks/device';
 import {useDefaultHeaderHeight} from '@hooks/header';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import NetworkManager from '@managers/network_manager';
+import {useScreenTransitionAnimation} from '@hooks/screen_transition_animation';
+import {usePreventDoubleTap} from '@hooks/utils';
+import IntuneManager from '@managers/intune_manager';
 import Background from '@screens/background';
-import {dismissModal, goToScreen, loginAnimationOptions, popTopScreen} from '@screens/navigation';
-import {preventDoubleTap} from '@utils/tap';
+import {navigateBack, navigateToScreen} from '@screens/navigation';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 import Form from './form';
+import LinkSent from './link_sent';
 import LoginOptionsSeparator from './login_options_separator';
 import SsoOptions from './sso_options';
 
 import type {LaunchProps} from '@typings/launch';
-import type {AvailableScreens} from '@typings/screens/navigation';
 
 export interface LoginOptionsProps extends LaunchProps {
-    closeButtonId?: string;
-    componentId: AvailableScreens;
     config: ClientConfig;
     hasLoginForm: boolean;
+    isModal?: boolean;
     license: ClientLicense;
     serverDisplayName: string;
     serverUrl: string;
@@ -44,14 +42,10 @@ const getStyles = makeStyleSheetFromTheme((theme: Theme) => ({
     centered: {
         width: '100%',
         maxWidth: 600,
+        paddingHorizontal: 5,
     },
     container: {
-        flex: 1,
-        ...Platform.select({
-            android: {
-                marginTop: 56,
-            },
-        }),
+        flexGrow: 1,
     },
     flex: {
         flex: 1,
@@ -71,25 +65,38 @@ const getStyles = makeStyleSheetFromTheme((theme: Theme) => ({
         marginBottom: 12,
         ...typography('Body', 200, 'Regular'),
     },
+    linkSentContainer: {
+        flex: 1,
+        justifyContent: 'center',
+        paddingHorizontal: 24,
+    },
+    linkSentTitle: {
+        ...typography('Heading', 1000, 'SemiBold'),
+        color: theme.centerChannelColor,
+    },
+    linkSentDescription: {
+        ...typography('Body', 200, 'Regular'),
+        color: changeOpacity(theme.centerChannelColor, 0.72),
+    },
 }));
 
-const AnimatedSafeArea = Animated.createAnimatedComponent(SafeAreaView);
-
 const LoginOptions = ({
-    closeButtonId, componentId, config, extra,
-    hasLoginForm, launchType, launchError, license,
+    config, extra,
+    hasLoginForm, isModal, launchType, launchError, license,
     serverDisplayName, serverUrl, ssoOptions, theme,
 }: LoginOptionsProps) => {
     const styles = getStyles(theme);
-    const keyboardAwareRef = useRef<KeyboardAwareScrollView>(null);
     const dimensions = useWindowDimensions();
     const defaultHeaderHeight = useDefaultHeaderHeight();
     const isTablet = useIsTablet();
-    const translateX = useSharedValue(dimensions.width);
     const [contentFillScreen, setContentFillScreen] = useState(false);
     const numberSSOs = useMemo(() => {
         return Object.values(ssoOptions).filter((v) => v.enabled).length;
     }, [ssoOptions]);
+    const intl = useIntl();
+
+    const [magicLinkSent, setMagicLinkSent] = useState(false);
+
     const description = useMemo(() => {
         if (hasLoginForm) {
             return (
@@ -119,11 +126,11 @@ const LoginOptions = ({
                 defaultMessage="You can't log in to your account yet. At least one login option must be configured. Contact your System Admin for assistance."
             />
         );
-    }, [hasLoginForm, numberSSOs, theme]);
+    }, [hasLoginForm, numberSSOs, styles.subheader]);
 
-    const goToSso = preventDoubleTap((ssoType: string) => {
-        goToScreen(Screens.SSO, '', {config, extra, launchError, launchType, license, theme, ssoType, serverDisplayName, serverUrl}, loginAnimationOptions());
-    });
+    const goToSso = usePreventDoubleTap(useCallback((ssoType: string) => {
+        navigateToScreen(Screens.SSO, {config, extra, isModal, launchError, launchType, license, theme, ssoType, serverDisplayName, serverUrl});
+    }, [config, extra, isModal, launchError, launchType, license, serverDisplayName, serverUrl, theme]));
 
     const optionsSeparator = hasLoginForm && Boolean(numberSSOs) && (
         <LoginOptionsSeparator
@@ -131,57 +138,14 @@ const LoginOptions = ({
         />
     );
 
-    const transform = useAnimatedStyle(() => {
-        const duration = Platform.OS === 'android' ? 250 : 350;
-        return {
-            transform: [{translateX: withTiming(translateX.value, {duration, reduceMotion: ReduceMotion.Never})}],
-        };
-    }, []);
-
-    const dismiss = () => {
-        dismissModal({componentId});
-    };
-
-    const pop = useCallback(() => {
-        popTopScreen(componentId);
-    }, [componentId]);
-
     const onLayout = useCallback((e: LayoutChangeEvent) => {
         const {height} = e.nativeEvent.layout;
         setContentFillScreen(dimensions.height < height + defaultHeaderHeight);
     }, [dimensions.height, defaultHeaderHeight]);
 
-    useEffect(() => {
-        const navigationEvents = Navigation.events().registerNavigationButtonPressedListener(({buttonId}) => {
-            if (closeButtonId && buttonId === closeButtonId) {
-                NetworkManager.invalidateClient(serverUrl);
-                dismissModal({componentId});
-            }
-        });
+    const animatedStyles = useScreenTransitionAnimation(!isModal);
 
-        return () => navigationEvents.remove();
-    }, []);
-
-    useEffect(() => {
-        translateX.value = 0;
-    }, []);
-
-    useEffect(() => {
-        const listener = {
-            componentDidAppear: () => {
-                translateX.value = 0;
-            },
-            componentDidDisappear: () => {
-                translateX.value = -dimensions.width;
-            },
-        };
-        const unsubscribe = Navigation.events().registerComponentListener(listener, Screens.LOGIN);
-
-        return () => unsubscribe.remove();
-    }, [dimensions]);
-
-    useNavButtonPressed(closeButtonId || '', componentId, dismiss, []);
-    useAndroidHardwareBackHandler(componentId, pop);
+    useAndroidHardwareBackHandler(Screens.LOGIN, navigateBack);
 
     let additionalContainerStyle;
     if (!contentFillScreen && (numberSSOs < 3 || !hasLoginForm || (isTablet && dimensions.height > dimensions.width))) {
@@ -209,25 +173,36 @@ const LoginOptions = ({
         );
     }
 
+    if (magicLinkSent) {
+        return (
+            <View style={styles.linkSentContainer}>
+                <LinkSent/>
+                <Text style={styles.linkSentTitle}>
+                    {intl.formatMessage({id: 'login.magic_link.link.sent.title', defaultMessage: 'We sent you a link to login'})}
+                </Text>
+                <Text style={styles.linkSentDescription}>
+                    {intl.formatMessage({id: 'login.magic_link.link.sent.description', defaultMessage: 'Please check your email for the link to login. Your link will expire in 5 minutes.'})}
+                </Text>
+            </View>
+        );
+    }
+
     return (
         <View
             style={styles.flex}
             testID='login.screen'
         >
             <Background theme={theme}/>
-            <AnimatedSafeArea style={[styles.container, transform]}>
+            <Animated.View style={[styles.container, animatedStyles]}>
                 <KeyboardAwareScrollView
-                    bounces={true}
+                    bounces={false}
                     contentContainerStyle={[styles.innerContainer, additionalContainerStyle]}
-                    enableAutomaticScroll={true}
-                    enableOnAndroid={false}
-                    enableResetScrollToCoords={true}
-                    extraScrollHeight={0}
-                    keyboardDismissMode='interactive'
+                    bottomOffset={62}
+                    keyboardDismissMode='on-drag'
                     keyboardShouldPersistTaps='handled'
-                    ref={keyboardAwareRef}
                     scrollToOverflowEnabled={true}
                     style={styles.flex}
+                    mode='layout'
                 >
                     <View
                         onLayout={onLayout}
@@ -239,12 +214,14 @@ const LoginOptions = ({
                         <Form
                             config={config}
                             extra={extra}
+                            isModal={isModal}
                             license={license}
                             launchError={launchError}
                             launchType={launchType}
                             theme={theme}
                             serverDisplayName={serverDisplayName}
                             serverUrl={serverUrl}
+                            setMagicLinkSent={setMagicLinkSent}
                         />
                         }
                         {optionsSeparator}
@@ -254,11 +231,13 @@ const LoginOptions = ({
                             ssoOnly={!hasLoginForm}
                             ssoOptions={ssoOptions}
                             theme={theme}
+                            isIntuneEnabled={IntuneManager.isIntuneEnabledForConfigAndLicense(config, license)}
+                            intuneAuthService={config.IntuneAuthService}
                         />
                         }
                     </View>
                 </KeyboardAwareScrollView>
-            </AnimatedSafeArea>
+            </Animated.View>
         </View>
     );
 };

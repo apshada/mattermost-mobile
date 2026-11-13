@@ -1,0 +1,331 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import RNUtils from '@mattermost/rnutils';
+import {DeviceEventEmitter} from 'react-native';
+
+import {markChannelAsViewed} from '@actions/local/channel';
+import {autoCacheCleanup} from '@actions/local/ephemeral_mode/cleanup';
+import {dataRetentionCleanup, expiredBoRPostCleanup, performVacuum} from '@actions/local/systems';
+import {markChannelAsRead} from '@actions/remote/channel';
+import {entry, handleEntryAfterLoadNavigation} from '@actions/remote/entry/common';
+import {deferredAppEntryActions} from '@actions/remote/entry/deferred';
+import {flushAuditQueue} from '@actions/remote/ephemeral_mode';
+import {fetchPostsForChannel, fetchPostThread} from '@actions/remote/post';
+import {openAllUnreadChannels} from '@actions/remote/preference';
+import {invalidateRedactionOnResync} from '@actions/websocket/access_control';
+import {loadConfigAndCalls} from '@calls/actions/calls';
+import {isSupportedServerCalls} from '@calls/utils';
+import DatabaseManager from '@database/manager';
+import AppsManager from '@managers/apps_manager';
+import SessionAttributesManager from '@managers/session_attributes_manager';
+import {handlePlaybookReconnect} from '@playbooks/actions/websocket/reconnect';
+import {getActiveServerUrl} from '@queries/app/servers';
+import {getLastPostInThread} from '@queries/servers/post';
+import {getConfig, getCurrentChannelId, getCurrentTeamId, isRedactionEnforced, setLastFullSync} from '@queries/servers/system';
+import {getIsCRTEnabled} from '@queries/servers/thread';
+import {getCurrentUser} from '@queries/servers/user';
+import EphemeralStore from '@store/ephemeral_store';
+import {NavigationStore} from '@store/navigation_store';
+import TestHelper from '@test/test_helper';
+
+import {handleFirstConnect, handleReconnect} from './index';
+
+jest.mock('@actions/local/channel');
+jest.mock('@actions/local/ephemeral_mode/cleanup');
+jest.mock('@actions/local/systems');
+jest.mock('@actions/remote/channel');
+jest.mock('@actions/remote/ephemeral_mode');
+jest.mock('@actions/remote/entry/common');
+jest.mock('@actions/remote/entry/deferred');
+jest.mock('@actions/remote/post');
+jest.mock('@actions/remote/scheduled_post');
+jest.mock('@actions/remote/preference');
+jest.mock('@actions/remote/user');
+jest.mock('@actions/websocket/access_control');
+jest.mock('@calls/actions/calls');
+jest.mock('@calls/utils');
+jest.mock('@database/manager');
+jest.mock('@managers/apps_manager');
+jest.mock('@queries/app/servers');
+jest.mock('@queries/servers/post');
+jest.mock('@queries/servers/system');
+jest.mock('@queries/servers/thread');
+jest.mock('@queries/servers/user');
+jest.mock('@store/ephemeral_store');
+jest.mock('@store/navigation_store');
+jest.mock('@store/team_load_store');
+jest.mock('@utils/helpers', () => ({
+    isTablet: jest.fn().mockReturnValue(false),
+}));
+
+jest.mock('@playbooks/actions/websocket/reconnect');
+jest.mock('@managers/session_attributes_manager', () => ({
+    __esModule: true,
+    default: {
+        refreshManifest: jest.fn().mockResolvedValue(undefined),
+    },
+}));
+
+describe('WebSocket Index Actions', () => {
+    const serverUrl = 'baseHandler.test.com';
+    const currentUserId = 'current-user-id';
+    const currentTeamId = 'current-team-id';
+    const currentChannelId = 'current-channel-id';
+    const groupLabel = 'DeepLink';
+
+    beforeEach(async () => {
+        jest.clearAllMocks();
+        jest.spyOn(DeviceEventEmitter, 'emit');
+        jest.mocked(dataRetentionCleanup).mockResolvedValue({skipped: true});
+        jest.mocked(autoCacheCleanup).mockResolvedValue({skipped: true});
+        await DatabaseManager.init([serverUrl]);
+        DatabaseManager.serverDatabases[serverUrl] = {
+            operator: {
+                database: {},
+                batchRecords: jest.fn(),
+            },
+        } as any;
+        DatabaseManager.getServerDatabaseAndOperator = jest.fn().mockReturnValue({
+            database: {},
+            operator: {
+                batchRecords: jest.fn(),
+            },
+        });
+    });
+
+    describe('handleFirstConnect', () => {
+        it('should handle first connection successfully', async () => {
+            const mockEntryData = {
+                models: [],
+                initialTeamId: currentTeamId,
+                initialChannelId: currentChannelId,
+                prefData: {preferences: []},
+                teamData: {memberships: [], teams: []},
+                chData: {memberships: [], channels: []},
+                gmConverted: false,
+            };
+
+            jest.mocked(entry).mockResolvedValue(mockEntryData);
+            jest.mocked(getCurrentUser).mockResolvedValue(TestHelper.fakeUserModel({
+                id: currentUserId,
+                locale: 'en',
+            }));
+            jest.mocked(getConfig).mockResolvedValue({Version: '9.0.0'} as ClientConfig);
+            jest.mocked(isSupportedServerCalls).mockReturnValue(true);
+
+            const error = await handleFirstConnect(serverUrl, groupLabel);
+
+            expect(error).toBeUndefined();
+            expect(entry).toHaveBeenCalled();
+            expect(handleEntryAfterLoadNavigation).toHaveBeenCalled();
+            expect(setLastFullSync).toHaveBeenCalled();
+            expect(loadConfigAndCalls).toHaveBeenCalled();
+            expect(deferredAppEntryActions).toHaveBeenCalled();
+            expect(handlePlaybookReconnect).toHaveBeenCalledWith(serverUrl);
+            expect(SessionAttributesManager.refreshManifest).toHaveBeenCalledWith(serverUrl);
+        });
+
+        it('should handle error when server database not found', async () => {
+            DatabaseManager.serverDatabases = {};
+
+            const error = await handleFirstConnect(serverUrl);
+
+            expect(error).toBeInstanceOf(Error);
+            expect((error as Error).message).toBe('cannot find server database');
+        });
+    });
+
+    describe('handleReconnect', () => {
+        beforeEach(() => {
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue([]);
+            jest.mocked(getActiveServerUrl).mockResolvedValue(serverUrl);
+            jest.mocked(getCurrentChannelId).mockResolvedValue(currentChannelId);
+            jest.mocked(getCurrentTeamId).mockResolvedValue(currentTeamId);
+            jest.mocked(getIsCRTEnabled).mockResolvedValue(false);
+            jest.mocked(isRedactionEnforced).mockResolvedValue(false);
+            jest.mocked(EphemeralStore.getCurrentThreadId).mockReturnValue('');
+            jest.mocked(EphemeralStore.wasNotificationTapped).mockReturnValue(false);
+        });
+
+        it('should handle reconnection successfully', async () => {
+            const mockEntryData = {
+                models: [],
+                initialTeamId: currentTeamId,
+                initialChannelId: currentChannelId,
+                prefData: {preferences: []},
+                teamData: {memberships: [], teams: []},
+                chData: {memberships: [], channels: []},
+                gmConverted: false,
+            };
+
+            jest.mocked(entry).mockResolvedValue(mockEntryData);
+            jest.mocked(getCurrentUser).mockResolvedValue(TestHelper.fakeUserModel({
+                id: currentUserId,
+                locale: 'en',
+            }));
+            jest.mocked(getConfig).mockResolvedValue({Version: '9.0.0'} as ClientConfig);
+            jest.mocked(isSupportedServerCalls).mockReturnValue(true);
+            jest.mocked(getActiveServerUrl).mockResolvedValue(serverUrl);
+
+            const error = await handleReconnect(serverUrl);
+            await TestHelper.tick();
+
+            expect(error).toBeUndefined();
+            expect(entry).toHaveBeenCalled();
+            expect(handleEntryAfterLoadNavigation).toHaveBeenCalled();
+            expect(setLastFullSync).toHaveBeenCalled();
+            expect(loadConfigAndCalls).toHaveBeenCalled();
+            expect(deferredAppEntryActions).toHaveBeenCalled();
+            expect(openAllUnreadChannels).toHaveBeenCalled();
+            expect(dataRetentionCleanup).toHaveBeenCalled();
+            expect(expiredBoRPostCleanup).toHaveBeenCalled();
+            expect(flushAuditQueue).toHaveBeenCalledWith(serverUrl);
+            expect(AppsManager.refreshAppBindings).toHaveBeenCalled();
+            expect(handlePlaybookReconnect).toHaveBeenCalledWith(serverUrl);
+            expect(SessionAttributesManager.refreshManifest).toHaveBeenCalledWith(serverUrl);
+            expect(RNUtils.beginDatabaseActivity).toHaveBeenCalledWith(serverUrl, 'doReconnect');
+            expect(RNUtils.endDatabaseActivity).toHaveBeenCalledWith('token-1');
+        });
+
+        it('should still end the database activity when reconnect fails', async () => {
+            jest.mocked(entry).mockResolvedValueOnce({error: new Error('entry failed')});
+
+            await handleReconnect(serverUrl);
+
+            expect(RNUtils.beginDatabaseActivity).toHaveBeenCalledWith(serverUrl, 'doReconnect');
+            expect(RNUtils.endDatabaseActivity).toHaveBeenCalledWith('token-1');
+        });
+
+        it('should not end the database activity when no token was granted', async () => {
+            jest.mocked(RNUtils.beginDatabaseActivity).mockResolvedValueOnce(null);
+            jest.mocked(entry).mockResolvedValueOnce({error: new Error('entry failed')});
+
+            await handleReconnect(serverUrl);
+
+            expect(RNUtils.endDatabaseActivity).not.toHaveBeenCalled();
+        });
+
+        it('should fetch posts for channel screen', async () => {
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+            await handleReconnect(serverUrl);
+
+            expect(fetchPostsForChannel).toHaveBeenCalledWith(serverUrl, currentChannelId, false, false, 'WebSocket Reconnect', false);
+            expect(markChannelAsRead).toHaveBeenCalledWith(serverUrl, currentChannelId, false, 'WebSocket Reconnect');
+            expect(markChannelAsViewed).toHaveBeenCalledWith(serverUrl, currentChannelId, true);
+        });
+
+        it('should raise the redaction epoch on a reconnect before fetching the visible channel', async () => {
+            // A reconnect only reaches doReconnect when the server could not replay the missed events,
+            // so an ABAC change made while disconnected is known only through this invalidation.
+            jest.mocked(entry).mockResolvedValue({
+                models: [],
+                initialTeamId: currentTeamId,
+                initialChannelId: currentChannelId,
+                prefData: {preferences: []},
+                teamData: {memberships: [], teams: []},
+                chData: {memberships: [], channels: []},
+                gmConverted: false,
+            });
+            jest.mocked(getCurrentUser).mockResolvedValue(TestHelper.fakeUserModel({id: currentUserId}));
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+
+            await handleReconnect(serverUrl);
+
+            expect(invalidateRedactionOnResync).toHaveBeenCalledWith(serverUrl);
+            expect(jest.mocked(invalidateRedactionOnResync).mock.invocationCallOrder[0]).
+                toBeLessThan(jest.mocked(fetchPostsForChannel).mock.invocationCallOrder[0]);
+        });
+
+        it('should fetch thread posts when CRT enabled', async () => {
+            const threadId = 'thread-id';
+            const lastPost = TestHelper.fakePostModel({id: 'post-id', createAt: 123});
+
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['thread']);
+
+            jest.mocked(getIsCRTEnabled).mockResolvedValue(true);
+            jest.mocked(EphemeralStore.getCurrentThreadId).mockReturnValue(threadId);
+            jest.mocked(getLastPostInThread).mockResolvedValue(lastPost);
+
+            await handleReconnect(serverUrl);
+
+            expect(fetchPostThread).toHaveBeenCalledWith(
+                serverUrl,
+                threadId,
+                {
+                    fromCreateAt: lastPost.createAt,
+                    fromPost: lastPost.id,
+                    direction: 'down',
+                },
+                false,
+                'WebSocket Reconnect',
+            );
+        });
+
+        it('should handle notification tapped state', async () => {
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+
+            jest.mocked(EphemeralStore.wasNotificationTapped).mockReturnValue(true);
+
+            await handleReconnect(serverUrl);
+
+            expect(markChannelAsViewed).not.toHaveBeenCalled();
+            expect(EphemeralStore.setNotificationTapped).toHaveBeenCalledWith(false);
+        });
+
+        it('should handle error in entry data', async () => {
+            jest.mocked(entry).mockResolvedValue({error: new Error('entry error')});
+
+            const result = await handleReconnect(serverUrl);
+
+            expect(result).toBeInstanceOf(Error);
+            expect((result as Error).message).toBe('entry error');
+        });
+
+        describe('cleanup', () => {
+            beforeEach(() => {
+                jest.mocked(entry).mockResolvedValue({
+                    models: [],
+                    initialTeamId: currentTeamId,
+                    initialChannelId: currentChannelId,
+                    prefData: {preferences: []},
+                    teamData: {memberships: [], teams: []},
+                    chData: {memberships: [], channels: []},
+                    gmConverted: false,
+                });
+                jest.mocked(getCurrentUser).mockResolvedValue(TestHelper.fakeUserModel({id: currentUserId, locale: 'en'}));
+            });
+
+            // doCleanup is intentionally not awaited by doReconnect, so let its chain settle.
+            const reconnectAndSettleCleanup = async () => {
+                await handleReconnect(serverUrl);
+                await TestHelper.tick();
+            };
+
+            it('should skip the vacuum when one cleanup failed and the other was skipped', async () => {
+                jest.mocked(dataRetentionCleanup).mockResolvedValue({error: new Error('data retention error')});
+
+                await reconnectAndSettleCleanup();
+
+                expect(performVacuum).not.toHaveBeenCalled();
+            });
+
+            it('should vacuum when the data retention cleanup ran without error', async () => {
+                jest.mocked(dataRetentionCleanup).mockResolvedValue({error: undefined});
+
+                await reconnectAndSettleCleanup();
+
+                expect(performVacuum).toHaveBeenCalledWith(serverUrl);
+            });
+
+            it('should vacuum when the auto cache cleanup ran without error even if the data retention cleanup failed', async () => {
+                jest.mocked(dataRetentionCleanup).mockResolvedValue({error: new Error('data retention error')});
+                jest.mocked(autoCacheCleanup).mockResolvedValue({error: undefined});
+
+                await reconnectAndSettleCleanup();
+
+                expect(performVacuum).toHaveBeenCalledWith(serverUrl);
+            });
+        });
+    });
+});

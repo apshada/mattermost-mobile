@@ -1,6 +1,8 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import type {CompassIconName} from '@components/compass_icon';
+
 type EmojiAlias = {
     aliases: string [];
     name: string;
@@ -8,16 +10,8 @@ type EmojiAlias = {
     category?: string;
 }
 
-type EmojiSection = {
-    data: EmojiAlias[][];
-    defaultMessage?: string;
-    icon: string;
-    id: string;
-    key: string;
-}
-
 type CategoryTranslation = {
     id: string;
     defaultMessage: string;
-    icon: string;
+    icon: CompassIconName;
 }

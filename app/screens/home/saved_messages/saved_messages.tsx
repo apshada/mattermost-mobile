@@ -1,12 +1,15 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {Q, type Database} from '@nozbe/watermelondb';
 import {useIsFocused, useRoute} from '@react-navigation/native';
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {useIntl} from 'react-intl';
-import {DeviceEventEmitter, FlatList, type ListRenderItemInfo, StyleSheet, View} from 'react-native';
+import {type ListRenderItemInfo, StyleSheet, View} from 'react-native';
 import Animated, {useAnimatedStyle, useSharedValue, withTiming} from 'react-native-reanimated';
 import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
+import {of as of$} from 'rxjs';
+import {switchMap} from 'rxjs/operators';
 
 import {fetchSavedPosts} from '@actions/remote/post';
 import Loading from '@components/loading';
@@ -14,32 +17,39 @@ import NavigationHeader from '@components/navigation_header';
 import DateSeparator from '@components/post_list/date_separator';
 import PostWithChannelInfo from '@components/post_with_channel_info';
 import RoundedHeaderContext from '@components/rounded_header_context';
-import {Events, Screens} from '@constants';
+import {Screens} from '@constants';
+import {SCREENS_AS_BOTTOM_SHEET} from '@constants/screens';
+import {PostConfigProvider} from '@context/post_config';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
+import useAndroidHomeTabBackHandler from '@hooks/android_home_tab_back_handler';
 import {useCollapsibleHeader} from '@hooks/header';
+import {observeSavedPostsByIds, queryPostsById} from '@queries/servers/post';
+import {querySavedPostsPreferences} from '@queries/servers/preference';
+import {useCurrentScreen} from '@store/navigation_store';
+import {getFullErrorMessage} from '@utils/errors';
+import {logError} from '@utils/log';
 import {getDateForDateLine, selectOrderedPosts} from '@utils/post_list';
+import {emitPostsInViewport} from '@utils/post_list/viewport';
+import {getTimezone} from '@utils/user';
 
 import EmptyState from './components/empty';
 
 import type {PostListItem, PostListOtherItem, ViewableItemsChanged} from '@typings/components/post_list';
 import type PostModel from '@typings/database/models/servers/post';
+import type UserModel from '@typings/database/models/servers/user';
 
 type Props = {
-    appsEnabled: boolean;
-    currentTimezone: string | null;
+    appsEnabled?: boolean;
+    currentUser: UserModel;
     customEmojiNames: string[];
-    posts: PostModel[];
+    database: Database;
 }
 
-const AnimatedFlatList = Animated.createAnimatedComponent(FlatList);
-const edges: Edge[] = ['bottom', 'left', 'right'];
+const edges: Edge[] = ['left', 'right'];
 
 const styles = StyleSheet.create({
     flex: {
-        flex: 1,
-    },
-    container: {
         flex: 1,
     },
     empty: {
@@ -49,14 +59,35 @@ const styles = StyleSheet.create({
     },
 });
 
-function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: Props) {
+function observeSavedPosts(database: Database) {
+    return querySavedPostsPreferences(database, undefined, 'true').observeWithColumns(['name']).pipe(
+        switchMap((rows) => {
+            const ids = rows.map((preference) => preference.name);
+            return ids.length ? observeSavedPostsByIds(database, ids) : of$(new Set<string>());
+        }),
+        switchMap((savedPostIds) => {
+            const ids = [...savedPostIds];
+            return ids.length ? queryPostsById(database, ids, Q.asc).observe() : of$([]);
+        }),
+    );
+}
+
+function SavedMessages({appsEnabled, currentUser, customEmojiNames, database}: Props) {
     const intl = useIntl();
-    const [loading, setLoading] = useState(!posts.length);
+    const [posts, setPosts] = useState<PostModel[]>([]);
+    const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const theme = useTheme();
     const serverUrl = useServerUrl();
+    const currentTimezone = useMemo(() => getTimezone(currentUser.timezone), [currentUser.timezone]);
     const route = useRoute();
     const isFocused = useIsFocused();
+    const currentScreen = useCurrentScreen();
+    const isBottomSheetOpen = currentScreen && SCREENS_AS_BOTTOM_SHEET.has(currentScreen);
+    const isPemalinkScreen = currentScreen === Screens.PERMALINK;
+    const isGalleryScreen = currentScreen === Screens.GALLERY;
+
+    useAndroidHomeTabBackHandler(Screens.SAVED_MESSAGES);
 
     const params = route.params as {direction: string};
     const toLeft = params.direction === 'left';
@@ -74,7 +105,19 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
     useEffect(() => {
         opacity.value = isFocused ? 1 : 0;
         translateX.value = isFocused ? 0 : translateSide;
-    }, [isFocused]);
+    }, [isFocused, opacity, translateSide, translateX]);
+
+    useEffect(() => {
+        if (!isFocused) {
+            return undefined;
+        }
+
+        const subscription = observeSavedPosts(database).subscribe({
+            next: setPosts,
+            error: (error) => logError('error on SavedMessages posts subscription', getFullErrorMessage(error)),
+        });
+        return () => subscription.unsubscribe();
+    }, [database, isFocused]);
 
     useEffect(() => {
         if (isFocused) {
@@ -85,16 +128,20 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
         }
     }, [serverUrl, isFocused]);
 
-    const {scrollPaddingTop, scrollRef, scrollValue, onScroll, headerHeight} = useCollapsibleHeader<FlatList<string>>(true, onSnap);
+    const {scrollPaddingTop, scrollRef, scrollValue, onScroll, headerHeight} = useCollapsibleHeader<Animated.FlatList<string>>(true, onSnap);
     const paddingTop = useMemo(() => ({paddingTop: scrollPaddingTop, flexGrow: 1}), [scrollPaddingTop]);
-    const data = useMemo(() => selectOrderedPosts(posts, 0, false, '', '', false, currentTimezone, false).reverse(), [posts]);
+    const data = useMemo(() => selectOrderedPosts(posts, 0, false, '', '', false, currentTimezone, false).reverse(), [currentTimezone, posts]);
 
     const animated = useAnimatedStyle(() => {
+        if (isBottomSheetOpen || isPemalinkScreen || isGalleryScreen) {
+            return {};
+        }
+
         return {
             opacity: withTiming(opacity.value, {duration: 150}),
             transform: [{translateX: withTiming(translateX.value, {duration: 150})}],
         };
-    }, []);
+    }, [isBottomSheetOpen, isPemalinkScreen, isGalleryScreen]);
 
     const top = useAnimatedStyle(() => {
         return {
@@ -107,14 +154,7 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
             return;
         }
 
-        const viewableItemsMap = viewableItems.reduce((acc: Record<string, boolean>, {item, isViewable}) => {
-            if (isViewable && item.type === 'post') {
-                acc[`${Screens.SAVED_MESSAGES}-${item.value.currentPost.id}`] = true;
-            }
-            return acc;
-        }, {});
-
-        DeviceEventEmitter.emit(Events.ITEM_IN_VIEWPORT, viewableItemsMap);
+        emitPostsInViewport(Screens.SAVED_MESSAGES, viewableItems);
     }, []);
 
     const handleRefresh = useCallback(async () => {
@@ -149,7 +189,8 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
             case 'post':
                 return (
                     <PostWithChannelInfo
-                        appsEnabled={appsEnabled}
+                        appsEnabled={appsEnabled ?? false}
+                        currentUser={currentUser}
                         customEmojiNames={customEmojiNames}
                         key={item.value.currentPost.id}
                         location={Screens.SAVED_MESSAGES}
@@ -161,10 +202,14 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
             default:
                 return null;
         }
-    }, [appsEnabled, currentTimezone, customEmojiNames, theme]);
+    }, [appsEnabled, currentUser, currentTimezone, customEmojiNames]);
 
     return (
-        <>
+        <SafeAreaView
+            edges={edges}
+            style={styles.flex}
+            testID='saved_messages.screen'
+        >
             <NavigationHeader
                 isLargeTitle={true}
                 showBackButton={false}
@@ -173,16 +218,12 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
                 hasSearch={false}
                 scrollValue={scrollValue}
             />
-            <SafeAreaView
-                edges={edges}
-                style={styles.flex}
-                testID='saved_messages.screen'
-            >
-                <Animated.View style={[styles.container, animated]}>
-                    <Animated.View style={top}>
-                        <RoundedHeaderContext/>
-                    </Animated.View>
-                    <AnimatedFlatList
+            <Animated.View style={[styles.flex, animated]}>
+                <Animated.View style={top}>
+                    <RoundedHeaderContext/>
+                </Animated.View>
+                <PostConfigProvider>
+                    <Animated.FlatList
                         ref={scrollRef}
                         contentContainerStyle={paddingTop}
                         ListEmptyComponent={emptyList}
@@ -200,9 +241,9 @@ function SavedMessages({appsEnabled, posts, currentTimezone, customEmojiNames}: 
                         onViewableItemsChanged={onViewableItemsChanged}
                         testID='saved_messages.post_list.flat_list'
                     />
-                </Animated.View>
-            </SafeAreaView>
-        </>
+                </PostConfigProvider>
+            </Animated.View>
+        </SafeAreaView>
     );
 }
 

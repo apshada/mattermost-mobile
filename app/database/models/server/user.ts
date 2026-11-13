@@ -7,6 +7,7 @@ import Model, {type Associations} from '@nozbe/watermelondb/Model';
 import {MM_TABLES} from '@constants/database';
 import {safeParseJSON} from '@utils/helpers';
 
+import type CustomProfileAttributeModel from './custom_profile_attribute';
 import type {Query} from '@nozbe/watermelondb';
 import type ChannelModel from '@typings/database/models/servers/channel';
 import type ChannelMembershipModel from '@typings/database/models/servers/channel_membership';
@@ -20,7 +21,9 @@ import type {UserMentionKey, HighlightWithoutNotificationKey} from '@typings/glo
 
 const {
     CHANNEL,
+    CHANNEL_BOOKMARK,
     CHANNEL_MEMBERSHIP,
+    CUSTOM_PROFILE_ATTRIBUTE,
     POST,
     PREFERENCE,
     REACTION,
@@ -43,6 +46,9 @@ export default class UserModel extends Model implements UserModelInterface {
         /** USER has a 1:N relationship with CHANNEL.  A user can create multiple channels */
         [CHANNEL]: {type: 'has_many', foreignKey: 'creator_id'},
 
+        /** USER has a 1:N relationship with CHANNEL_BOOKMARK.  A user can create multiple channels */
+        [CHANNEL_BOOKMARK]: {type: 'has_many', foreignKey: 'owner_id'},
+
         /** USER has a 1:N relationship with CHANNEL_MEMBERSHIP.  A user can be part of multiple channels */
         [CHANNEL_MEMBERSHIP]: {type: 'has_many', foreignKey: 'user_id'},
 
@@ -60,6 +66,9 @@ export default class UserModel extends Model implements UserModelInterface {
 
         /** USER has a 1:N relationship with THREAD_PARTICIPANT. A user can participate in multiple threads */
         [THREAD_PARTICIPANT]: {type: 'has_many', foreignKey: 'user_id'},
+
+        /** USER has a 1:N relationship with CUSTOM_PROFILE_ATTRIBUTE.  A user can have multiple custom profile attributes */
+        [CUSTOM_PROFILE_ATTRIBUTE]: {type: 'has_many', foreignKey: 'user_id'},
     };
 
     /** auth_service : The type of authentication service registered to that user */
@@ -148,6 +157,9 @@ export default class UserModel extends Model implements UserModelInterface {
     /** threadParticipations : All the thread participations this user is part of  */
     @children(THREAD_PARTICIPANT) threadParticipations!: Query<ThreadParticipantsModel>;
 
+    /** USER has a 1:N relationship with CUSTOM_PROFILE_ATTRIBUTE.  A user can have multiple custom profile attributes */
+    @children(CUSTOM_PROFILE_ATTRIBUTE) customProfileAttributes!: Query<CustomProfileAttributeModel> | undefined;
+
     prepareStatus = (status: string) => {
         this.prepareUpdate((u) => {
             u.status = status;
@@ -213,5 +225,32 @@ export default class UserModel extends Model implements UserModelInterface {
         }
 
         return highlightWithoutNotificationKeys;
+    }
+
+    toAPI(): UserProfile {
+        return {
+            id: this.id,
+            create_at: 0,
+            update_at: this.updateAt,
+            delete_at: this.deleteAt,
+            username: this.username,
+            auth_service: this.authService,
+            email: this.email,
+            nickname: this.nickname,
+            first_name: this.firstName,
+            last_name: this.lastName,
+            position: this.position,
+            roles: this.roles,
+            locale: this.locale,
+            notify_props: this.notifyProps ? this.notifyProps : {} as UserNotifyProps,
+            props: this.props ? this.props : {} as UserProps,
+            terms_of_service_id: this.termsOfServiceId,
+            terms_of_service_create_at: this.termsOfServiceCreateAt,
+            timezone: this.timezone ? this.timezone : undefined,
+            is_bot: this.isBot,
+            last_picture_update: this.lastPictureUpdate,
+            remote_id: this.remoteId ? this.remoteId : undefined,
+            status: this.status,
+        };
     }
 }

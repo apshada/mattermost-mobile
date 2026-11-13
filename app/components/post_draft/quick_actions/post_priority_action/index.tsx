@@ -2,16 +2,16 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback} from 'react';
-import {useIntl} from 'react-intl';
-import {Keyboard, StyleSheet} from 'react-native';
+import {StyleSheet} from 'react-native';
 
 import CompassIcon from '@components/compass_icon';
 import TouchableWithFeedback from '@components/touchable_with_feedback';
 import {Screens} from '@constants';
 import {ICON_SIZE} from '@constants/post_draft';
+import {useKeyboardState} from '@context/keyboard_state';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
-import {openAsBottomSheet} from '@screens/navigation';
+import {navigateToScreen} from '@screens/navigation';
+import CallbackStore from '@store/callback_store';
 import {changeOpacity} from '@utils/theme';
 
 type Props = {
@@ -20,7 +20,7 @@ type Props = {
     updatePostPriority: (postPriority: PostPriority) => void;
 }
 
-const style = StyleSheet.create({
+export const style = StyleSheet.create({
     icon: {
         alignItems: 'center',
         justifyContent: 'center',
@@ -28,34 +28,21 @@ const style = StyleSheet.create({
     },
 });
 
-const POST_PRIORITY_PICKER_BUTTON = 'close-post-priority-picker';
-
 export default function PostPriorityAction({
     testID,
     postPriority,
     updatePostPriority,
 }: Props) {
-    const intl = useIntl();
-    const isTablet = useIsTablet();
     const theme = useTheme();
+    const {blurAndDismissKeyboard} = useKeyboardState();
 
-    const onPress = useCallback(() => {
-        Keyboard.dismiss();
-
-        const title = isTablet ? intl.formatMessage({id: 'post_priority.picker.title', defaultMessage: 'Message priority'}) : '';
-
-        openAsBottomSheet({
-            closeButtonId: POST_PRIORITY_PICKER_BUTTON,
-            screen: Screens.POST_PRIORITY_PICKER,
-            theme,
-            title,
-            props: {
-                postPriority,
-                updatePostPriority,
-                closeButtonId: POST_PRIORITY_PICKER_BUTTON,
-            },
+    const onPress = useCallback(async () => {
+        await blurAndDismissKeyboard();
+        CallbackStore.setCallback(updatePostPriority);
+        navigateToScreen(Screens.POST_PRIORITY_PICKER, {
+            postPriority,
         });
-    }, [intl, postPriority, updatePostPriority, theme]);
+    }, [blurAndDismissKeyboard, postPriority, updatePostPriority]);
 
     const iconName = 'alert-circle-outline';
     const iconColor = changeOpacity(theme.centerChannelColor, 0.64);

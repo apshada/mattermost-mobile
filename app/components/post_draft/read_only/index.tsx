@@ -8,13 +8,18 @@ import {type Edge, SafeAreaView} from 'react-native-safe-area-context';
 import CompassIcon from '@components/compass_icon';
 import FormattedText from '@components/formatted_text';
 import {useTheme} from '@context/theme';
+import {writeDeniedMessage} from '@utils/channel_policy';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
 interface ReadOnlyProps {
     testID?: string;
+    writeDenied?: boolean;
 }
 
 const getStyle = makeStyleSheetFromTheme((theme: Theme) => ({
+    wrapper: {
+        backgroundColor: theme.centerChannelBg,
+    },
     background: {
         backgroundColor: changeOpacity(theme.centerChannelColor, 0.04),
     },
@@ -42,30 +47,39 @@ const getStyle = makeStyleSheetFromTheme((theme: Theme) => ({
 
 const edges: Edge[] = ['bottom'];
 
-const ReadOnlyChannnel = ({testID}: ReadOnlyProps) => {
+const ReadOnlyChannnel = ({testID, writeDenied}: ReadOnlyProps) => {
     const theme = useTheme();
     const style = getStyle(theme);
     return (
-        <SafeAreaView
-            edges={edges}
-            style={style.background}
-        >
-            <View
-                testID={testID}
-                style={style.container}
+        <View style={style.wrapper}>
+            <SafeAreaView
+                edges={edges}
+                style={style.background}
             >
-                <CompassIcon
-                    name='glasses'
-                    style={style.icon}
-                    color={theme.centerChannelColor}
-                />
-                <FormattedText
-                    id='mobile.create_post.read_only'
-                    defaultMessage='This channel is read-only.'
-                    style={style.text}
-                />
-            </View>
-        </SafeAreaView>
+                <View
+                    testID={testID}
+                    style={style.container}
+                >
+                    <CompassIcon
+                        name='glasses'
+                        style={style.icon}
+                        color={theme.centerChannelColor}
+                    />
+                    {writeDenied ? (
+                        <FormattedText
+                            {...writeDeniedMessage}
+                            style={style.text}
+                        />
+                    ) : (
+                        <FormattedText
+                            id='mobile.create_post.read_only'
+                            defaultMessage='This channel is read-only.'
+                            style={style.text}
+                        />
+                    )}
+                </View>
+            </SafeAreaView>
+        </View>
     );
 };
 

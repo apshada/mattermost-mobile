@@ -1,0 +1,729 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import Database from '@nozbe/watermelondb/Database';
+
+import {removePushSigningKey, storePushSigningKey} from '@actions/app/global';
+import {getPosts} from '@actions/local/post';
+import {ActionType} from '@constants';
+import {SYSTEM_IDENTIFIERS} from '@constants/database';
+import {PostTypes} from '@constants/post';
+import DatabaseManager from '@database/manager';
+import TestHelper from '@test/test_helper';
+import {logError} from '@utils/log';
+
+jest.mock('@actions/app/global', () => ({
+    removePushSigningKey: jest.fn(),
+    storePushSigningKey: jest.fn(),
+}));
+
+import {
+    storeConfig,
+    storeConfigAndLicense,
+    storeDataRetentionPolicies,
+    updateLastDataRetentionRun,
+    dataRetentionCleanup,
+    dataRetentionCleanPosts,
+    performVacuum,
+    setLastServerVersionCheck,
+    setGlobalThreadsTab,
+    dismissAnnouncement,
+    expiredBoRPostCleanup,
+    setDisconnectedSince,
+} from './systems';
+
+import type {DataRetentionPoliciesRequest} from '@actions/remote/systems';
+import type ServerDataOperator from '@database/operator/server_data_operator';
+import type SystemModel from '@typings/database/models/servers/system';
+
+const serverUrl = 'baseHandler.test.com';
+let operator: ServerDataOperator;
+
+jest.mock('@init/credentials', () => {
+    const original = jest.requireActual('@init/credentials');
+    return {
+        ...original,
+        getServerCredentials: jest.fn(async (url: string) => ({serverUrl: url})),
+    };
+});
+
+beforeEach(async () => {
+    await DatabaseManager.init([serverUrl]);
+    operator = DatabaseManager.serverDatabases[serverUrl]!.operator;
+});
+
+afterEach(async () => {
+    await DatabaseManager.destroyServerDatabase(serverUrl);
+});
+
+describe('storeConfigAndLicense', () => {
+    it('handle not found database - storeConfig', async () => {
+        const models = await storeConfig('foo', {} as ClientConfig);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(0);
+    });
+
+    it('handle undefined config - storeConfig', async () => {
+        const models = await storeConfig(serverUrl, undefined);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(0);
+    });
+
+    it('base case - storeConfig', async () => {
+        await operator.handleConfigs({
+            configs: [
+                {id: 'DataRetentionEnableMessageDeletion', value: 'true'},
+                {id: 'AboutLink', value: 'link'},
+            ],
+            configsToDelete: [],
+            prepareRecordsOnly: false,
+        });
+
+        const models = await storeConfig(serverUrl, {AboutLink: 'link'} as ClientConfig);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(1); // data retention removed
+    });
+
+    it('nothing to update - storeConfig', async () => {
+        await operator.handleConfigs({
+            configs: [
+                {id: 'AboutLink', value: 'link'},
+            ],
+            configsToDelete: [],
+            prepareRecordsOnly: false,
+        });
+
+        const models = await storeConfig(serverUrl, {AboutLink: 'link'} as ClientConfig);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(0);
+    });
+
+    it('handle not found database', async () => {
+        const models = await storeConfigAndLicense('foo', {} as ClientConfig, {} as ClientLicense);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(0);
+    });
+
+    it('base case', async () => {
+        const models = await storeConfigAndLicense(serverUrl, {AboutLink: 'link'} as ClientConfig, {Announcement: 'test'} as ClientLicense);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(1); // config
+    });
+});
+
+describe('storeConfig', () => {
+    const zeroPersistenceConfig = {
+        MobileEphemeralModeEnabled: 'true',
+        MobileEphemeralModeAutoCacheCleanupDays: '0',
+        AsymmetricSigningPublicKey: 'key-1',
+    } as ClientConfig;
+
+    describe('storing the signing key', () => {
+        it('mirrors the signing key when the config is zero-persistence', async () => {
+            await storeConfig(serverUrl, zeroPersistenceConfig);
+
+            expect(storePushSigningKey).toHaveBeenCalledWith(serverUrl, 'key-1');
+            expect(removePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('mirrors the signing key even when only preparing records', async () => {
+            await storeConfig(serverUrl, zeroPersistenceConfig, true);
+
+            expect(storePushSigningKey).toHaveBeenCalledWith(serverUrl, 'key-1');
+        });
+
+        it('does not store the signing key when the config is not zero-persistence', async () => {
+            await storeConfig(serverUrl, {AsymmetricSigningPublicKey: 'key-1'} as ClientConfig);
+
+            expect(storePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('mirrors the signing key when entering zero-persistence even if the key is unchanged from the stored config', async () => {
+            await operator.handleConfigs({
+                configs: [
+                    {id: 'MobileEphemeralModeEnabled', value: 'false'},
+                    {id: 'AsymmetricSigningPublicKey', value: 'key-1'},
+                ],
+                configsToDelete: [],
+                prepareRecordsOnly: false,
+            });
+
+            await storeConfig(serverUrl, zeroPersistenceConfig);
+
+            expect(storePushSigningKey).toHaveBeenCalledWith(serverUrl, 'key-1');
+            expect(removePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('does not store the signing key when it is unchanged from the stored config', async () => {
+            await operator.handleConfigs({
+                configs: [
+                    {id: 'MobileEphemeralModeEnabled', value: 'true'},
+                    {id: 'MobileEphemeralModeAutoCacheCleanupDays', value: '0'},
+                    {id: 'AsymmetricSigningPublicKey', value: 'key-1'},
+                    {id: 'AboutLink', value: 'old-link'},
+                ],
+                configsToDelete: [],
+                prepareRecordsOnly: false,
+            });
+
+            await storeConfig(serverUrl, {...zeroPersistenceConfig, AboutLink: 'new-link'} as ClientConfig);
+
+            expect(storePushSigningKey).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('removing the signing key', () => {
+        it('removes the mirrored signing key when the config transitions away from zero-persistence', async () => {
+            await operator.handleConfigs({
+                configs: [
+                    {id: 'MobileEphemeralModeEnabled', value: 'true'},
+                    {id: 'MobileEphemeralModeAutoCacheCleanupDays', value: '0'},
+                    {id: 'AsymmetricSigningPublicKey', value: 'key-1'},
+                ],
+                configsToDelete: [],
+                prepareRecordsOnly: false,
+            });
+
+            await storeConfig(serverUrl, {
+                MobileEphemeralModeEnabled: 'false',
+                MobileEphemeralModeAutoCacheCleanupDays: '0',
+                AsymmetricSigningPublicKey: 'key-1',
+            } as ClientConfig);
+
+            expect(removePushSigningKey).toHaveBeenCalledWith(serverUrl);
+            expect(storePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('removes the signing key defensively when prior config is empty and the config is not zero-persistence', async () => {
+            await storeConfig(serverUrl, {AsymmetricSigningPublicKey: 'key-1'} as ClientConfig);
+
+            expect(removePushSigningKey).toHaveBeenCalledWith(serverUrl);
+            expect(storePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('does not remove the signing key when a prior config already confirms the server was not zero-persistence', async () => {
+            await operator.handleConfigs({
+                configs: [
+                    {id: 'MobileEphemeralModeEnabled', value: 'false'},
+                    {id: 'AboutLink', value: 'old-link'},
+                ],
+                configsToDelete: [],
+                prepareRecordsOnly: false,
+            });
+
+            await storeConfig(serverUrl, {MobileEphemeralModeEnabled: 'false', AboutLink: 'new-link'} as ClientConfig);
+
+            expect(removePushSigningKey).not.toHaveBeenCalled();
+        });
+
+        it('removes the mirrored signing key when it is dropped from the config while the server remains zero-persistence', async () => {
+            await operator.handleConfigs({
+                configs: [
+                    {id: 'MobileEphemeralModeEnabled', value: 'true'},
+                    {id: 'MobileEphemeralModeAutoCacheCleanupDays', value: '0'},
+                    {id: 'AsymmetricSigningPublicKey', value: 'key-1'},
+                ],
+                configsToDelete: [],
+                prepareRecordsOnly: false,
+            });
+
+            await storeConfig(serverUrl, {
+                MobileEphemeralModeEnabled: 'true',
+                MobileEphemeralModeAutoCacheCleanupDays: '0',
+            } as ClientConfig);
+
+            expect(removePushSigningKey).toHaveBeenCalledWith(serverUrl);
+            expect(storePushSigningKey).not.toHaveBeenCalled();
+        });
+    });
+});
+
+describe('dataRetention', () => {
+    it('handle not found database - storeDataRetentionPolicies', async () => {
+        const models = await storeDataRetentionPolicies('foo', {} as DataRetentionPoliciesRequest);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(0);
+    });
+
+    it('base case - storeDataRetentionPolicies', async () => {
+        const models = await storeDataRetentionPolicies(serverUrl, {globalPolicy: {} as GlobalDataRetentionPolicy, teamPolicies: [], channelPolicies: []} as DataRetentionPoliciesRequest);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(2); // data retention and granular data retention policies
+    });
+
+    it('empty case - storeDataRetentionPolicies', async () => {
+        const models = await storeDataRetentionPolicies(serverUrl, {} as DataRetentionPoliciesRequest);
+        expect(models).toBeDefined();
+        expect(models.length).toBe(2); // data retention and granular data retention policies
+    });
+
+    it('handle not found database - updateLastDataRetentionRun', async () => {
+        const {error} = await updateLastDataRetentionRun('foo', 0) as {error: unknown};
+        expect(error).toBeDefined();
+    });
+
+    it('base case - updateLastDataRetentionRun', async () => {
+        const models = await updateLastDataRetentionRun(serverUrl, 10) as SystemModel[];
+        expect(models).toBeDefined();
+        expect(models.length).toBe(1); // data retention
+    });
+
+    it('no time provided - updateLastDataRetentionRun', async () => {
+        const models = await updateLastDataRetentionRun(serverUrl) as SystemModel[];
+        expect(models).toBeDefined();
+        expect(models.length).toBe(1); // data retention
+    });
+
+    it('handle not found database - dataRetentionCleanup', async () => {
+        const {error} = await dataRetentionCleanup('foo');
+        expect(error).toBeDefined();
+    });
+
+    it('rentention off - dataRetentionCleanup', async () => {
+        const post = TestHelper.fakePost({channel_id: 'channelid1', id: 'postid', create_at: 1});
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [post.id],
+            posts: [post],
+            prepareRecordsOnly: false,
+        });
+
+        const {error} = await dataRetentionCleanup(serverUrl);
+        expect(error).toBeDefined(); // unsafeExecute loki error
+    });
+
+    it('retention on - dataRetentionCleanup', async () => {
+        const channel: Channel = {
+            id: 'channelid1',
+            team_id: 'teamid1',
+            total_msg_count: 0,
+        } as Channel;
+
+        await operator.handleConfigs({
+            configs: [
+                {id: 'DataRetentionEnableMessageDeletion', value: 'true'},
+            ],
+            configsToDelete: [],
+            prepareRecordsOnly: false,
+        });
+        await operator.handleSystem({systems:
+            [
+                {id: SYSTEM_IDENTIFIERS.LICENSE, value: {IsLicensed: 'true', DataRetention: 'true'}},
+                {id: SYSTEM_IDENTIFIERS.GRANULAR_DATA_RETENTION_POLICIES, value: {team: [{team_id: 'teamid1', post_duration: 100}], channel: [{channel_id: 'channelid1', post_duration: 100}]}},
+            ],
+        prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {error} = await dataRetentionCleanup(serverUrl);
+        expect(error).toBeDefined(); // LokiJSAdapter doesn't support unsafeSqlQuery
+    });
+
+    it('already cleaned today - dataRetentionCleanup', async () => {
+        const channel: Channel = {
+            id: 'channelid1',
+            team_id: 'teamid1',
+            total_msg_count: 0,
+        } as Channel;
+
+        await operator.handleConfigs({
+            configs: [
+                {id: 'DataRetentionEnableMessageDeletion', value: 'true'},
+            ],
+            configsToDelete: [],
+            prepareRecordsOnly: false,
+        });
+        await operator.handleSystem({systems:
+            [
+                {id: SYSTEM_IDENTIFIERS.LAST_DATA_RETENTION_RUN, value: Date.now()},
+                {id: SYSTEM_IDENTIFIERS.LICENSE, value: {IsLicensed: 'true', DataRetention: 'true'}},
+                {id: SYSTEM_IDENTIFIERS.GRANULAR_DATA_RETENTION_POLICIES, value: {team: [{team_id: 'teamid1', post_duration: 100}], channel: [{channel_id: 'channelid1', post_duration: 100}]}},
+            ],
+        prepareRecordsOnly: false});
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const {error, skipped} = await dataRetentionCleanup(serverUrl);
+        expect(error).toBeUndefined();
+        expect(skipped).toBe(true);
+    });
+});
+
+describe('dataRetentionCleanPosts', () => {
+    it('should delete every post when the ids span more than one batch', async () => {
+        const database = operator.database;
+        const unsafeExecuteSpy = jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        const postIds = Array.from({length: 1500}, (unused, index) => `postid${index}`);
+
+        const {error} = await dataRetentionCleanPosts(serverUrl, postIds);
+
+        expect(error).toBeUndefined();
+
+        const batches = unsafeExecuteSpy.mock.calls.map(([operations]) => {
+            const [[, batch]] = (operations as {sqls: Array<[string, string[]]>}).sqls;
+            return batch;
+        });
+        expect(batches.map((batch) => batch.length).sort((a, b) => b - a)).toEqual([1000, 500]);
+        expect(batches.flat().sort()).toEqual([...postIds].sort());
+    });
+});
+
+describe('performVacuum', () => {
+    it('should vacuum the server database', async () => {
+        const spy = jest.spyOn(Database.prototype, 'unsafeVacuum').mockImplementation(jest.fn());
+
+        await performVacuum(serverUrl);
+
+        expect(spy).toHaveBeenCalled();
+        spy.mockRestore();
+    });
+
+    it('should log and not throw when the vacuum fails', async () => {
+        const spy = jest.spyOn(Database.prototype, 'unsafeVacuum').mockRejectedValue(new Error('vacuum error'));
+
+        await expect(performVacuum(serverUrl)).resolves.toBeUndefined();
+
+        expect(logError).toHaveBeenCalledWith('unsafeVacuum', expect.stringContaining('vacuum error'));
+        spy.mockRestore();
+    });
+});
+
+describe('setLastServerVersionCheck', () => {
+    it('handle not found database', async () => {
+        const {error} = await setLastServerVersionCheck('foo');
+        expect(error).toBeDefined();
+    });
+
+    it('base case', async () => {
+        const {error} = await setLastServerVersionCheck(serverUrl);
+        expect(error).toBeUndefined();
+    });
+
+    it('base case - reset', async () => {
+        const {error} = await setLastServerVersionCheck(serverUrl, true);
+        expect(error).toBeUndefined();
+    });
+});
+
+describe('setGlobalThreadsTab', () => {
+    it('handle not found database', async () => {
+        const {error} = await setGlobalThreadsTab('foo', 'all');
+        expect(error).toBeDefined();
+    });
+
+    it('base case', async () => {
+        const {error} = await setGlobalThreadsTab(serverUrl, 'all');
+        expect(error).toBeUndefined();
+    });
+});
+
+describe('dismissAnnouncement', () => {
+    it('handle not found database', async () => {
+        const {error} = await dismissAnnouncement('foo', 'text');
+        expect(error).toBeDefined();
+    });
+
+    it('base case', async () => {
+        const {error} = await dismissAnnouncement(serverUrl, 'text');
+        expect(error).toBeUndefined();
+    });
+});
+
+describe('setDisconnectedSince', () => {
+    it('should swallow when server database is not found', async () => {
+        await expect(setDisconnectedSince('unknown-server', 1719400000000)).resolves.toBeUndefined();
+    });
+
+    it('should write a timestamp to the system table', async () => {
+        const timestamp = 1719400000000;
+        await setDisconnectedSince(serverUrl, timestamp);
+
+        const records = await operator.database.get<SystemModel>('System').
+            query().
+            fetch();
+        const row = records.find((r) => r.id === SYSTEM_IDENTIFIERS.DISCONNECTED_SINCE);
+        expect(row?.value).toBe(timestamp);
+    });
+
+    it('should delete the row when passed null', async () => {
+        await setDisconnectedSince(serverUrl, 1719400000000);
+        await setDisconnectedSince(serverUrl, null);
+
+        const records = await operator.database.get<SystemModel>('System').
+            query().
+            fetch();
+        expect(records.find((r) => r.id === SYSTEM_IDENTIFIERS.DISCONNECTED_SINCE)).toBeUndefined();
+    });
+
+    it('should be a no-op when deleting a non-existent row', async () => {
+        await expect(setDisconnectedSince(serverUrl, null)).resolves.toBeUndefined();
+    });
+});
+
+describe('expiredBoRPostCleanup', () => {
+    it('should delete expired BoR posts', async () => {
+        const database = operator.database;
+        jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const now = Date.now();
+
+        const borPostExpiredForAll = TestHelper.fakePost({
+            id: 'postid1',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now - 10000},
+        });
+
+        const borPostExpiredForMe = TestHelper.fakePost({
+            id: 'postid2',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now + 100000},
+            metadata: {expire_at: now - 10000},
+        });
+
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [borPostExpiredForAll.id, borPostExpiredForMe.id],
+            posts: [borPostExpiredForAll, borPostExpiredForMe],
+            prepareRecordsOnly: false,
+        });
+
+        // verify channel posts
+        const fetchedPosts = await getPosts(serverUrl, [borPostExpiredForAll.id, borPostExpiredForMe.id]);
+        expect(fetchedPosts.length).toBe(2);
+
+        await expiredBoRPostCleanup(serverUrl);
+
+        const expiredIds = [borPostExpiredForMe.id, borPostExpiredForAll.id];
+        expect(database.adapter.unsafeExecute).toHaveBeenCalledWith({
+            sqls: [
+                ['DELETE FROM Post where id IN (?,?)', expiredIds],
+                ['DELETE FROM Reaction where post_id IN (?,?)', expiredIds],
+                ['DELETE FROM File where post_id IN (?,?)', expiredIds],
+                ['DELETE FROM Draft where root_id IN (?,?)', expiredIds],
+                ['DELETE FROM PostsInThread where root_id IN (?,?)', expiredIds],
+                ['DELETE FROM Thread where id IN (?,?)', expiredIds],
+                ['DELETE FROM ThreadParticipant where thread_id IN (?,?)', expiredIds],
+                ['DELETE FROM ThreadsInTeam where thread_id IN (?,?)', expiredIds],
+            ],
+        });
+    });
+
+    it('should not run cleanup when called again within 15 minutes', async () => {
+        const database = operator.database;
+        const unsafeExecuteSpy = jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        // Set up a recent last run time (within 15 minutes)
+        const recentRunTime = Date.now() - (10 * 60 * 1000); // 10 minutes ago
+        await operator.handleSystem({
+            systems: [{
+                id: SYSTEM_IDENTIFIERS.LAST_BOR_POST_CLEANUP_RUN,
+                value: recentRunTime,
+            }],
+            prepareRecordsOnly: false,
+        });
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const now = Date.now();
+        const borPostExpired = TestHelper.fakePost({
+            id: 'postid1',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now - 10000},
+        });
+
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [borPostExpired.id],
+            posts: [borPostExpired],
+            prepareRecordsOnly: false,
+        });
+
+        // Call cleanup - should not run because last run was within 15 minutes
+        await expiredBoRPostCleanup(serverUrl);
+
+        // Verify that unsafeExecute was not called (no cleanup performed)
+        expect(unsafeExecuteSpy).not.toHaveBeenCalled();
+    });
+
+    it('should handle no server database gracefully', async () => {
+        // Try to run cleanup on a non-existent server
+        await expect(expiredBoRPostCleanup('nonexistent.server.com')).resolves.not.toThrow();
+    });
+
+    it('should handle no BoR posts gracefully', async () => {
+        const database = operator.database;
+        const unsafeExecuteSpy = jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+        await expiredBoRPostCleanup(serverUrl);
+
+        // Verify that unsafeExecute was not called (no BoR posts to clean)
+        expect(unsafeExecuteSpy).not.toHaveBeenCalled();
+    });
+
+    it('should handle BoR posts that are not expired', async () => {
+        const database = operator.database;
+        const unsafeExecuteSpy = jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const now = Date.now();
+
+        // Create BoR posts that are not expired
+        const borPostNotExpired = TestHelper.fakePost({
+            id: 'postid1',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now + 100000}, // Future expiry
+        });
+
+        const borPostNotExpiredForMe = TestHelper.fakePost({
+            id: 'postid2',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now + 10000},
+            metadata: {expire_at: now + 100000},
+        });
+
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [borPostNotExpired.id, borPostNotExpiredForMe.id],
+            posts: [borPostNotExpired, borPostNotExpiredForMe],
+            prepareRecordsOnly: false,
+        });
+
+        await expiredBoRPostCleanup(serverUrl);
+
+        // Verify that unsafeExecute was not called (no expired BoR posts)
+        expect(unsafeExecuteSpy).not.toHaveBeenCalled();
+    });
+
+    it('should handle mixed expired and non-expired BoR posts', async () => {
+        const database = operator.database;
+        jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        const now = Date.now();
+
+        const borPostExpired = TestHelper.fakePost({
+            id: 'postid1',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now - 10000}, // Expired
+        });
+
+        const borPostNotExpired = TestHelper.fakePost({
+            id: 'postid2',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now + 100000}, // Not expired
+        });
+
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [borPostExpired.id, borPostNotExpired.id],
+            posts: [borPostExpired, borPostNotExpired],
+            prepareRecordsOnly: false,
+        });
+
+        await expiredBoRPostCleanup(serverUrl);
+
+        // Should only delete the expired post
+        const expiredIds = [borPostExpired.id];
+        expect(database.adapter.unsafeExecute).toHaveBeenCalledWith({
+            sqls: [
+                ['DELETE FROM Post where id IN (?)', expiredIds],
+                ['DELETE FROM Reaction where post_id IN (?)', expiredIds],
+                ['DELETE FROM File where post_id IN (?)', expiredIds],
+                ['DELETE FROM Draft where root_id IN (?)', expiredIds],
+                ['DELETE FROM PostsInThread where root_id IN (?)', expiredIds],
+                ['DELETE FROM Thread where id IN (?)', expiredIds],
+                ['DELETE FROM ThreadParticipant where thread_id IN (?)', expiredIds],
+                ['DELETE FROM ThreadsInTeam where thread_id IN (?)', expiredIds],
+            ],
+        });
+    });
+
+    it('should handle database errors gracefully', async () => {
+        const database = operator.database;
+
+        // Mock database query to throw an error
+        jest.spyOn(database, 'get').mockImplementation(() => {
+            throw new Error('Database error');
+        });
+
+        // Should not throw an error, just log it
+        await expect(expiredBoRPostCleanup(serverUrl)).resolves.not.toThrow();
+        expect(logError).toHaveBeenCalledWith('An error occurred while performing BoR post cleanup', expect.any(Error));
+    });
+
+    it('should handle updateLastBoRCleanupRun error gracefully', async () => {
+        const database = operator.database;
+        jest.spyOn(database.adapter, 'unsafeExecute').mockImplementation(() => Promise.resolve());
+
+        // Mock handleSystem to throw an error when updating last cleanup run
+        const handleSystemSpy = jest.spyOn(operator, 'handleSystem').mockImplementation(() => {
+            throw new Error('System update error');
+        });
+
+        const channel: Channel = TestHelper.fakeChannel({
+            id: 'channelid1',
+            team_id: 'teamid1',
+        });
+        await operator.handleChannel({channels: [channel], prepareRecordsOnly: false});
+
+        // Restore handleSystem for channel creation, then mock it again for the cleanup run update
+        handleSystemSpy.mockRestore();
+        jest.spyOn(operator, 'handleSystem').mockImplementation((args) => {
+            if (args.systems?.[0]?.id === SYSTEM_IDENTIFIERS.LAST_BOR_POST_CLEANUP_RUN) {
+                throw new Error('System update error');
+            }
+            return Promise.resolve([]);
+        });
+
+        const now = Date.now();
+        const borPostExpired = TestHelper.fakePost({
+            id: 'postid1',
+            channel_id: channel.id,
+            type: PostTypes.BURN_ON_READ,
+            props: {expire_at: now - 10000},
+        });
+
+        await operator.handlePosts({
+            actionType: ActionType.POSTS.RECEIVED_IN_CHANNEL,
+            order: [borPostExpired.id],
+            posts: [borPostExpired],
+            prepareRecordsOnly: false,
+        });
+
+        // Should not throw an error, just log it
+        await expect(expiredBoRPostCleanup(serverUrl)).resolves.not.toThrow();
+        expect(logError).toHaveBeenCalledWith('Failed updateLastBoRCleanupRun', expect.any(Error));
+    });
+
+});

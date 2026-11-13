@@ -2,15 +2,16 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback, useMemo, useState} from 'react';
-import FastImage from 'react-native-fast-image';
 
-import CompassIcon from '@components/compass_icon';
+import CompassIcon, {type CompassIconName} from '@components/compass_icon';
+import ExpoImage from '@components/expo_image';
 import {useTheme} from '@context/theme';
+import {urlSafeBase64Encode} from '@utils/security';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 import {isValidUrl} from '@utils/url';
 
 type OptionIconProps = {
-    icon: string;
+    icon: CompassIconName;
     iconColor?: string;
     destructive?: boolean;
 };
@@ -40,7 +41,8 @@ const OptionIcon = ({icon, iconColor, destructive}: OptionIconProps) => {
 
     if (isValidUrl(icon) && !failedToLoadImage) {
         return (
-            <FastImage
+            <ExpoImage
+                id={`option-icon-${urlSafeBase64Encode(icon)}`}
                 source={iconAsSource}
                 style={styles.icon}
                 onError={onErrorLoadingIcon}
@@ -48,7 +50,7 @@ const OptionIcon = ({icon, iconColor, destructive}: OptionIconProps) => {
         );
     }
 
-    const iconName = failedToLoadImage ? 'power-plugin-outline' : icon;
+    const iconName = failedToLoadImage ? 'power-plug-outline' : icon;
     return (
         <CompassIcon
             name={iconName}

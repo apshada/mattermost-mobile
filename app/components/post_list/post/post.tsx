@@ -1,26 +1,36 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {type ReactNode, useEffect, useMemo, useRef, useState} from 'react';
+import React, {type ReactNode, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {useIntl} from 'react-intl';
-import {Keyboard, Platform, type StyleProp, View, type ViewStyle, TouchableHighlight} from 'react-native';
+import {type StyleProp, View, type ViewStyle, TouchableHighlight, type LayoutChangeEvent} from 'react-native';
 
 import {removePost} from '@actions/local/post';
 import {showPermalink} from '@actions/remote/permalink';
 import {fetchAndSwitchToThread} from '@actions/remote/thread';
+import AgentMentionReminderPost from '@agents/components/agent_mention_reminder_post';
+import AgentPost from '@agents/components/agent_post';
+import {isAgentMentionReminderPost, isAgentPost} from '@agents/utils';
 import CallsCustomMessage from '@calls/components/calls_custom_message';
 import {isCallsCustomMessage} from '@calls/utils';
+import UnrevealedBurnOnReadPost from '@components/post_list/post/burn_on_read/unrevealed';
 import SystemAvatar from '@components/system_avatar';
 import SystemHeader from '@components/system_header';
+import {Screens} from '@constants';
 import {POST_TIME_TO_FAIL} from '@constants/post';
-import * as Screens from '@constants/screens';
+import {PROFILE_PICTURE_SIZE} from '@constants/view';
+import {useKeyboardState} from '@context/keyboard_state';
+import {usePostConfig} from '@context/post_config';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
-import {useIsTablet} from '@hooks/device';
-import {openAsBottomSheet} from '@screens/navigation';
+import useDidMount from '@hooks/did_mount';
+import {usePreventDoubleTap} from '@hooks/utils';
+import PerformanceMetricsManager from '@managers/performance_metrics_manager';
+import {navigateBack, navigateToScreen} from '@screens/navigation';
+import {isBoRPost, isUnrevealedBoRPost} from '@utils/bor';
 import {hasJumboEmojiOnly} from '@utils/emoji/helpers';
+import {dismissKeyboard} from '@utils/keyboard';
 import {fromAutoResponder, isFromWebhook, isPostFailed, isPostPendingOrFailed, isSystemMessage} from '@utils/post';
-import {preventDoubleTap} from '@utils/tap';
 import {changeOpacity, makeStyleSheetFromTheme} from '@utils/theme';
 
 import Avatar from './avatar';
@@ -28,25 +38,33 @@ import Body from './body';
 import Footer from './footer';
 import Header from './header';
 import PreHeader from './pre_header';
+import ShimmerAnimation from './shimmer_animation';
 import SystemMessage from './system_message';
 import UnreadDot from './unread_dot';
+import useShimmerAnimation from './use_shimmer_animation';
 
 import type PostModel from '@typings/database/models/servers/post';
 import type ThreadModel from '@typings/database/models/servers/thread';
 import type UserModel from '@typings/database/models/servers/user';
 import type {SearchPattern} from '@typings/global/markdown';
+import type {AvailableScreens} from '@typings/screens/navigation';
 
 type PostProps = {
     appsEnabled: boolean;
+    mmBlocksEnabled: boolean;
+    author?: UserModel;
     canDelete: boolean;
+    commentCount: number;
     currentUser?: UserModel;
     customEmojiNames: string[];
-    differentThreadSequence: boolean;
-    hasFiles: boolean;
+    filesInfo: FileInfo[];
+    isRedactionVerified: boolean;
+    redactionRequiredEpoch: number;
     hasReplies: boolean;
     highlight?: boolean;
     highlightPinnedOrSaved?: boolean;
     highlightReplyBar: boolean;
+    isAiGenerated?: boolean;
     isConsecutivePost?: boolean;
     isCRTEnabled?: boolean;
     isEphemeral: boolean;
@@ -55,11 +73,13 @@ type PostProps = {
     isSaved?: boolean;
     isLastReply?: boolean;
     isPostAddChannelMember: boolean;
-    isPostPriorityEnabled: boolean;
-    location: string;
+    isChannelWriteDenied: boolean;
+    location: AvailableScreens;
     post: PostModel;
     rootId?: string;
+    rootPostAuthor?: UserModel | null;
     previousPost?: PostModel;
+    isLastPost: boolean;
     hasReactions: boolean;
     searchPatterns?: SearchPattern[];
     shouldRenderReplyButton?: boolean;
@@ -69,6 +89,7 @@ type PostProps = {
     style?: StyleProp<ViewStyle>;
     testID?: string;
     thread?: ThreadModel;
+    isChannelAutotranslated: boolean;
 };
 
 const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
@@ -77,7 +98,7 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
         consecutivePostContainer: {
             marginBottom: 10,
             marginRight: 10,
-            marginLeft: Platform.select({ios: 34, android: 33}),
+            marginLeft: PROFILE_PICTURE_SIZE,
             marginTop: 10,
         },
         container: {flexDirection: 'row'},
@@ -109,24 +130,69 @@ const getStyleSheet = makeStyleSheetFromTheme((theme: Theme) => {
 });
 
 const Post = ({
-    appsEnabled, canDelete, currentUser, customEmojiNames, differentThreadSequence, hasFiles, hasReplies, highlight, highlightPinnedOrSaved = true, highlightReplyBar,
-    isCRTEnabled, isConsecutivePost, isEphemeral, isFirstReply, isSaved, isLastReply, isPostAcknowledgementEnabled, isPostAddChannelMember, isPostPriorityEnabled,
-    location, post, rootId, hasReactions, searchPatterns, shouldRenderReplyButton, skipSavedHeader, skipPinnedHeader, showAddReaction = true, style,
-    testID, thread, previousPost,
+    appsEnabled,
+    mmBlocksEnabled,
+    author,
+    canDelete,
+    commentCount,
+    currentUser,
+    customEmojiNames,
+    filesInfo,
+    isRedactionVerified,
+    redactionRequiredEpoch,
+    hasReplies,
+    highlight,
+    highlightPinnedOrSaved = true,
+    highlightReplyBar,
+    isAiGenerated = false,
+    isCRTEnabled,
+    isConsecutivePost,
+    isEphemeral,
+    isFirstReply,
+    isSaved,
+    isLastReply,
+    isPostAcknowledgementEnabled,
+    isPostAddChannelMember,
+    isChannelWriteDenied,
+    location,
+    post,
+    rootId,
+    rootPostAuthor,
+    hasReactions,
+    searchPatterns,
+    shouldRenderReplyButton,
+    skipSavedHeader,
+    skipPinnedHeader,
+    showAddReaction = true,
+    style,
+    testID,
+    thread,
+    previousPost,
+    isLastPost,
+    isChannelAutotranslated,
 }: PostProps) => {
     const pressDetected = useRef(false);
-    const intl = useIntl();
     const serverUrl = useServerUrl();
     const theme = useTheme();
-    const isTablet = useIsTablet();
+    const intl = useIntl();
+    const {blurAndDismissKeyboard} = useKeyboardState();
     const styles = getStyleSheet(theme);
+    const postConfig = usePostConfig();
     const isAutoResponder = fromAutoResponder(post);
     const isPendingOrFailed = isPostPendingOrFailed(post);
     const isFailed = isPostFailed(post);
     const isSystemPost = isSystemMessage(post);
     const isCallsPost = isCallsCustomMessage(post);
+    const borPost = isBoRPost(post);
+    const isUnrevealedPost = isUnrevealedBoRPost(post);
+    const isOwnPost = Boolean(currentUser && post.userId === currentUser.id);
+    const isAgentPostType = isAgentPost(post);
+    const isAgentMentionReminderPostType = isAgentMentionReminderPost(post);
     const hasBeenDeleted = (post.deleteAt !== 0);
     const isWebHook = isFromWebhook(post);
+    const showEphemeralAuthor = isEphemeral && Boolean(post.userId);
+    const [layoutWidth, setLayoutWidth] = useState(0);
+    const shimmerAnimationProps = useShimmerAnimation(post, isChannelAutotranslated, intl.locale, layoutWidth, theme);
     const hasSameRoot = useMemo(() => {
         if (isFirstReply) {
             return false;
@@ -145,8 +211,8 @@ const Post = ({
         return false;
     }, [customEmojiNames, post.message]);
 
-    const handlePostPress = () => {
-        if ([Screens.SAVED_MESSAGES, Screens.MENTIONS, Screens.SEARCH, Screens.PINNED_MESSAGES].includes(location)) {
+    const handlePostPress = useCallback(async () => {
+        if (([Screens.SAVED_MESSAGES, Screens.MENTIONS, Screens.SEARCH, Screens.PINNED_MESSAGES] as AvailableScreens[]).includes(location)) {
             showPermalink(serverUrl, '', post.id);
             return;
         }
@@ -155,7 +221,12 @@ const Post = ({
         if (isEphemeral || hasBeenDeleted) {
             removePost(serverUrl, post);
         } else if (isValidSystemMessage && !hasBeenDeleted && !isPendingOrFailed) {
-            if ([Screens.CHANNEL, Screens.PERMALINK].includes(location)) {
+            // BoR posts cannot have replies, so don't open threads screen for them
+            if (!borPost && ([Screens.CHANNEL, Screens.PERMALINK] as AvailableScreens[]).includes(location)) {
+                await blurAndDismissKeyboard();
+                if (location === Screens.PERMALINK) {
+                    await navigateBack();
+                }
                 const postRootId = post.rootId || post.id;
                 fetchAndSwitchToThread(serverUrl, postRootId);
             }
@@ -164,19 +235,23 @@ const Post = ({
         setTimeout(() => {
             pressDetected.current = false;
         }, 300);
-    };
+    }, [location, isAutoResponder, isSystemPost, isEphemeral, hasBeenDeleted, isPendingOrFailed, serverUrl, post, borPost, blurAndDismissKeyboard]);
 
-    const handlePress = preventDoubleTap(() => {
+    const handlePress = usePreventDoubleTap(useCallback(() => {
+        if (isBoRPost(post)) {
+            return;
+        }
+
         pressDetected.current = true;
 
-        if (post) {
-            Keyboard.dismiss();
+        dismissKeyboard();
 
+        if (post) {
             setTimeout(handlePostPress, 300);
         }
-    });
+    }, [handlePostPress, post]));
 
-    const showPostOptions = () => {
+    const showPostOptions = useCallback(async () => {
         if (!post) {
             return;
         }
@@ -189,18 +264,10 @@ const Post = ({
             return;
         }
 
-        Keyboard.dismiss();
-        const passProps = {sourceScreen: location, post, showAddReaction, serverUrl};
-        const title = isTablet ? intl.formatMessage({id: 'post.options.title', defaultMessage: 'Options'}) : '';
-
-        openAsBottomSheet({
-            closeButtonId: 'close-post-options',
-            screen: Screens.POST_OPTIONS,
-            theme,
-            title,
-            props: passProps,
-        });
-    };
+        await blurAndDismissKeyboard();
+        const passProps = {sourceScreen: location, postId: post.id, showAddReaction};
+        navigateToScreen(Screens.POST_OPTIONS, passProps);
+    }, [post, isSystemPost, canDelete, hasBeenDeleted, isPendingOrFailed, isEphemeral, blurAndDismissKeyboard, location, showAddReaction]);
 
     const [, rerender] = useState(false);
     useEffect(() => {
@@ -214,7 +281,27 @@ const Post = ({
                 clearTimeout(t);
             }
         };
+
+    // Timer only needs to reset when post.id changes, not on other prop updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [post.id]);
+
+    useDidMount(() => {
+        if (!isLastPost) {
+            return;
+        }
+
+        if (location !== Screens.CHANNEL && location !== Screens.THREAD) {
+            return;
+        }
+
+        PerformanceMetricsManager.finishLoad(location === Screens.THREAD ? 'THREAD' : 'CHANNEL', serverUrl);
+        PerformanceMetricsManager.endMetric('mobile_channel_switch', serverUrl);
+    });
+
+    const onLayout = useCallback((e: LayoutChangeEvent) => {
+        setLayoutWidth(e.nativeEvent.layout.width);
+    }, []);
 
     const highlightSaved = isSaved && !skipSavedHeader;
     const hightlightPinned = post.isPinned && !skipPinnedHeader;
@@ -236,7 +323,7 @@ const Post = ({
     // If the post is a priority post:
     // 1. Show the priority label in channel screen
     // 2. Show the priority label in thread screen for the root post
-    const showPostPriority = Boolean(isPostPriorityEnabled && post.metadata?.priority?.priority) && (location !== Screens.THREAD || !post.rootId);
+    const showPostPriority = Boolean(postConfig.isPostPriorityEnabled && post.metadata?.priority?.priority) && (location !== Screens.THREAD || !post.rootId);
 
     const sameSequence = hasReplies ? (hasReplies && post.rootId) : !post.rootId;
     if (!showPostPriority && hasSameRoot && isConsecutivePost && sameSequence) {
@@ -245,7 +332,7 @@ const Post = ({
     } else {
         postAvatar = (
             <View style={[styles.profilePictureContainer, pendingPostStyle]}>
-                {(isAutoResponder || isSystemPost) ? (
+                {(isAutoResponder || (isSystemPost && !showEphemeralAuthor)) ? (
                     <SystemAvatar theme={theme}/>
                 ) : (
                     <Avatar
@@ -257,18 +344,21 @@ const Post = ({
             </View>
         );
 
-        if (isSystemPost && !isAutoResponder) {
+        if (isSystemPost && !isAutoResponder && !showEphemeralAuthor) {
             header = (
                 <SystemHeader
                     createAt={post.createAt}
                     theme={theme}
+                    isEphemeral={isEphemeral}
                 />
             );
         } else {
             header = (
                 <Header
+                    author={author}
+                    commentCount={commentCount}
                     currentUser={currentUser}
-                    differentThreadSequence={differentThreadSequence}
+                    isAiGenerated={isAiGenerated}
                     isAutoResponse={isAutoResponder}
                     isCRTEnabled={isCRTEnabled}
                     isEphemeral={isEphemeral}
@@ -277,8 +367,10 @@ const Post = ({
                     isWebHook={isWebHook}
                     location={location}
                     post={post}
+                    rootPostAuthor={rootPostAuthor}
                     showPostPriority={showPostPriority}
                     shouldRenderReplyButton={shouldRenderReplyButton}
+                    isChannelAutotranslated={isChannelAutotranslated}
                 />
             );
         }
@@ -297,14 +389,39 @@ const Post = ({
             <CallsCustomMessage
                 serverUrl={serverUrl}
                 post={post}
+
+                // Note: the below are provided by the index, but typescript seems to be having problems.
+                otherParticipants={false}
+                isAdmin={false}
+                isHost={false}
+                joiningChannelId={null}
+            />
+        );
+    } else if (isUnrevealedPost && !isOwnPost) {
+        body = (
+            <UnrevealedBurnOnReadPost post={post}/>
+        );
+    } else if (isAgentMentionReminderPostType && !hasBeenDeleted) {
+        body = (
+            <AgentMentionReminderPost post={post}/>
+        );
+    } else if (isAgentPostType && !hasBeenDeleted) {
+        body = (
+            <AgentPost
+                post={post}
+                currentUserId={currentUser?.id}
+                location={location}
             />
         );
     } else {
         body = (
             <Body
                 appsEnabled={appsEnabled}
-                hasFiles={hasFiles}
+                mmBlocksEnabled={mmBlocksEnabled}
+                filesInfo={filesInfo}
                 hasReactions={hasReactions}
+                isRedactionVerified={isRedactionVerified}
+                redactionRequiredEpoch={redactionRequiredEpoch}
                 highlight={Boolean(highlightedStyle)}
                 highlightReplyBar={highlightReplyBar}
                 isCRTEnabled={isCRTEnabled}
@@ -315,11 +432,13 @@ const Post = ({
                 isPendingOrFailed={isPendingOrFailed}
                 isPostAcknowledgementEnabled={isPostAcknowledgementEnabled}
                 isPostAddChannelMember={isPostAddChannelMember}
+                isChannelWriteDenied={isChannelWriteDenied}
                 location={location}
                 post={post}
                 searchPatterns={searchPatterns}
                 showAddReaction={showAddReaction}
                 theme={theme}
+                isChannelAutotranslated={isChannelAutotranslated}
             />
         );
     }
@@ -347,6 +466,7 @@ const Post = ({
         <View
             testID={testID}
             style={[styles.postStyle, style, highlightedStyle]}
+            onLayout={onLayout}
         >
             <TouchableHighlight
                 testID={itemTestID}
@@ -356,7 +476,7 @@ const Post = ({
                 underlayColor={changeOpacity(theme.centerChannelColor, 0.1)}
                 style={styles.postContent}
             >
-                <>
+                <View>
                     <PreHeader
                         isConsecutivePost={isConsecutivePost}
                         isSaved={isSaved}
@@ -373,8 +493,9 @@ const Post = ({
                         </View>
                         {unreadDot}
                     </View>
-                </>
+                </View>
             </TouchableHighlight>
+            <ShimmerAnimation {...shimmerAnimationProps}/>
         </View>
     );
 };

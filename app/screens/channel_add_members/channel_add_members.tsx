@@ -1,34 +1,32 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {useIntl} from 'react-intl';
-import {Keyboard, type LayoutChangeEvent, Platform, View} from 'react-native';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import React, {useCallback, useState} from 'react';
+import {defineMessage, useIntl} from 'react-intl';
+import {Keyboard, Platform, View} from 'react-native';
+import {SafeAreaView, type Edge} from 'react-native-safe-area-context';
 
 import {addMembersToChannel} from '@actions/remote/channel';
 import {fetchProfilesNotInChannel, searchProfiles} from '@actions/remote/user';
 import CompassIcon from '@components/compass_icon';
 import Loading from '@components/loading';
 import Search from '@components/search';
+import SectionNotice from '@components/section_notice';
 import SelectedUsers from '@components/selected_users';
 import ServerUserList from '@components/server_user_list';
-import {General} from '@constants';
+import {General, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {useTheme} from '@context/theme';
+import {TutorialProvider} from '@context/tutorial';
+import {useAccessControlAttributes} from '@hooks/access_control_attributes';
 import useAndroidHardwareBackHandler from '@hooks/android_back_handler';
-import {useKeyboardOverlap} from '@hooks/device';
-import useNavButtonPressed from '@hooks/navigation_button_pressed';
-import {t} from '@i18n';
-import {dismissModal} from '@screens/navigation';
+import {navigateBack} from '@screens/navigation';
 import {alertErrorWithFallback} from '@utils/draft';
-import {mergeNavigationOptions} from '@utils/navigation';
 import {showAddChannelMembersSnackbar} from '@utils/snack_bar';
 import {changeOpacity, getKeyboardAppearanceFromTheme, makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
 
 import type ChannelModel from '@typings/database/models/servers/channel';
-import type {AvailableScreens} from '@typings/screens/navigation';
 
 const CLOSE_BUTTON_ID = 'close-add-member';
 const TEST_ID = 'add_members';
@@ -59,17 +57,16 @@ export const getHeaderOptions = async (theme: Theme, displayName: string, inModa
 };
 
 type Props = {
-    componentId: AvailableScreens;
     channel?: ChannelModel;
-    currentUserId: string;
     teammateNameDisplay: string;
     tutorialWatched: boolean;
-    inModal?: boolean;
 }
+
+const safeAreaEdges: Edge[] = ['bottom', 'left', 'right'];
 
 const close = () => {
     Keyboard.dismiss();
-    dismissModal();
+    navigateBack();
 };
 
 const getStyleFromTheme = makeStyleSheetFromTheme((theme: Theme) => {
@@ -81,6 +78,11 @@ const getStyleFromTheme = makeStyleSheetFromTheme((theme: Theme) => {
             marginLeft: 12,
             marginRight: Platform.select({ios: 4, default: 12}),
             marginVertical: 12,
+        },
+        listContainer: {
+            flex: 1,
+            marginLeft: 12,
+            marginRight: Platform.select({ios: 4, default: 12}),
         },
         loadingContainer: {
             alignItems: 'center',
@@ -101,23 +103,23 @@ const getStyleFromTheme = makeStyleSheetFromTheme((theme: Theme) => {
             color: changeOpacity(theme.centerChannelColor, 0.5),
             ...typography('Body', 600, 'Regular'),
         },
+        flatBottomBanner: {
+            borderBottomLeftRadius: 0,
+            borderBottomRightRadius: 0,
+        },
     };
 });
 
-function removeProfileFromList(list: {[id: string]: UserProfile}, id: string) {
-    const newSelectedIds = Object.assign({}, list);
-
-    Reflect.deleteProperty(newSelectedIds, id);
+function removeProfileFromList(list: Set<string>, id: string) {
+    const newSelectedIds = new Set(list);
+    newSelectedIds.delete(id);
     return newSelectedIds;
 }
 
 export default function ChannelAddMembers({
-    componentId,
     channel,
-    currentUserId,
     teammateNameDisplay,
     tutorialWatched,
-    inModal,
 }: Props) {
     const serverUrl = useServerUrl();
     const theme = useTheme();
@@ -125,13 +127,17 @@ export default function ChannelAddMembers({
     const intl = useIntl();
     const {formatMessage} = intl;
 
-    const mainView = useRef<View>(null);
-    const [containerHeight, setContainerHeight] = useState(0);
-    const keyboardOverlap = useKeyboardOverlap(mainView, containerHeight);
-
     const [term, setTerm] = useState('');
     const [addingMembers, setAddingMembers] = useState(false);
-    const [selectedIds, setSelectedIds] = useState<{[id: string]: UserProfile}>({});
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set<string>());
+    const [showBanner, setShowBanner] = useState(Boolean(channel?.abacPolicyEnforced));
+
+    // Use the hook to fetch access control attributes
+    const {attributeTags} = useAccessControlAttributes('channel', channel?.id, channel?.abacPolicyEnforced);
+
+    const handleDismissBanner = useCallback(() => {
+        setShowBanner(false);
+    }, []);
 
     const clearSearch = useCallback(() => {
         setTerm('');
@@ -150,7 +156,7 @@ export default function ChannelAddMembers({
             return;
         }
 
-        const idsToUse = Object.keys(selectedIds);
+        const idsToUse = Array.from(selectedIds);
         if (!idsToUse.length) {
             return;
         }
@@ -159,7 +165,7 @@ export default function ChannelAddMembers({
         const result = await addMembersToChannel(serverUrl, channel.id, idsToUse);
 
         if (result.error) {
-            alertErrorWithFallback(intl, result.error, {id: t('mobile.channel_add_members.error'), defaultMessage: 'There has been an error and we could not add those users to the channel.'});
+            alertErrorWithFallback(intl, result.error, defineMessage({id: 'mobile.channel_add_members.error', defaultMessage: 'There has been an error and we could not add those users to the channel.'}));
             setAddingMembers(false);
         } else {
             close();
@@ -170,29 +176,20 @@ export default function ChannelAddMembers({
     const handleSelectProfile = useCallback((user: UserProfile) => {
         clearSearch();
         setSelectedIds((current) => {
-            if (current[user.id]) {
+            if (current.has(user.id)) {
                 return removeProfileFromList(current, user.id);
             }
 
-            const newSelectedIds = Object.assign({}, current);
-            newSelectedIds[user.id] = user;
+            const newSelectedIds = new Set(current);
+            newSelectedIds.add(user.id);
 
             return newSelectedIds;
         });
-    }, [currentUserId, clearSearch]);
+    }, [clearSearch]);
 
     const onTextChange = useCallback((searchTerm: string) => {
         setTerm(searchTerm);
     }, []);
-
-    const onLayout = useCallback((e: LayoutChangeEvent) => {
-        setContainerHeight(e.nativeEvent.layout.height);
-    }, []);
-
-    const updateNavigationButtons = useCallback(async () => {
-        const options = await getHeaderOptions(theme, channel?.displayName || '', inModal);
-        mergeNavigationOptions(componentId, options);
-    }, [theme, channel?.displayName, inModal, componentId]);
 
     const userFetchFunction = useCallback(async (page: number) => {
         if (!channel) {
@@ -233,12 +230,7 @@ export default function ChannelAddMembers({
         };
     }, []);
 
-    useNavButtonPressed(CLOSE_BUTTON_ID, componentId, close, [close]);
-    useAndroidHardwareBackHandler(componentId, close);
-
-    useEffect(() => {
-        updateNavigationButtons();
-    }, [updateNavigationButtons]);
+    useAndroidHardwareBackHandler(Screens.CHANNEL_ADD_MEMBERS, close);
 
     if (addingMembers) {
         return (
@@ -252,45 +244,64 @@ export default function ChannelAddMembers({
         <SafeAreaView
             style={style.container}
             testID={`${TEST_ID}.screen`}
-            onLayout={onLayout}
-            ref={mainView}
-            edges={['top', 'left', 'right']}
+            edges={safeAreaEdges}
         >
-            <View style={style.searchBar}>
-                <Search
-                    testID={`${TEST_ID}.search_bar`}
-                    placeholder={formatMessage({id: 'search_bar.search', defaultMessage: 'Search'})}
-                    cancelButtonTitle={formatMessage({id: 'mobile.post.cancel', defaultMessage: 'Cancel'})}
-                    placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
-                    onChangeText={onTextChange}
-                    onCancel={clearSearch}
-                    autoCapitalize='none'
-                    keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
-                    value={term}
+            <TutorialProvider>
+                {showBanner && (
+                    <SectionNotice
+                        type='info'
+                        title={formatMessage({
+                            id: 'channel.abac_policy_enforced.title',
+                            defaultMessage: 'Channel access is restricted by user attributes',
+                        })}
+                        text={formatMessage({
+                            id: 'channel.abac_policy_enforced.description',
+                            defaultMessage: 'Only people who match the specified access rules can be selected and added to this channel.',
+                        })}
+                        tags={attributeTags.length > 0 ? attributeTags : undefined}
+                        isDismissable={true}
+                        onDismissClick={handleDismissBanner}
+                        location={Screens.CHANNEL_ADD_MEMBERS}
+                        testID={`${TEST_ID}.notice`}
+                        squareCorners={true}
+                    />
+                )}
+                <View style={style.searchBar}>
+                    <Search
+                        testID={`${TEST_ID}.search_bar`}
+                        placeholder={formatMessage({id: 'search_bar.search', defaultMessage: 'Search'})}
+                        cancelButtonTitle={formatMessage({id: 'mobile.post.cancel', defaultMessage: 'Cancel'})}
+                        placeholderTextColor={changeOpacity(theme.centerChannelColor, 0.5)}
+                        onChangeText={onTextChange}
+                        onCancel={clearSearch}
+                        autoCapitalize='none'
+                        keyboardAppearance={getKeyboardAppearanceFromTheme(theme)}
+                        value={term}
+                    />
+                </View>
+                <View style={style.listContainer}>
+                    <ServerUserList
+                        handleSelectProfile={handleSelectProfile}
+                        selectedIds={selectedIds}
+                        term={term}
+                        testID={`${TEST_ID}.user_list`}
+                        tutorialWatched={tutorialWatched}
+                        fetchFunction={userFetchFunction}
+                        searchFunction={userSearchFunction}
+                        createFilter={createUserFilter}
+                        location={Screens.CHANNEL_ADD_MEMBERS}
+                    />
+                </View>
+                <SelectedUsers
+                    selectedIds={selectedIds}
+                    onRemove={handleRemoveProfile}
+                    teammateNameDisplay={teammateNameDisplay}
+                    onPress={addMembers}
+                    buttonIcon={'account-plus-outline'}
+                    buttonText={formatMessage({id: 'channel_add_members.add_members.button', defaultMessage: 'Add Members'})}
+                    testID={`${TEST_ID}.selected`}
                 />
-            </View>
-            <ServerUserList
-                currentUserId={currentUserId}
-                handleSelectProfile={handleSelectProfile}
-                selectedIds={selectedIds}
-                term={term}
-                testID={`${TEST_ID}.user_list`}
-                tutorialWatched={tutorialWatched}
-                fetchFunction={userFetchFunction}
-                searchFunction={userSearchFunction}
-                createFilter={createUserFilter}
-            />
-            <SelectedUsers
-                keyboardOverlap={keyboardOverlap}
-                selectedIds={selectedIds}
-                onRemove={handleRemoveProfile}
-                teammateNameDisplay={teammateNameDisplay}
-                onPress={addMembers}
-                buttonIcon={'account-plus-outline'}
-                buttonText={formatMessage({id: 'channel_add_members.add_members.button', defaultMessage: 'Add Members'})}
-                testID={`${TEST_ID}.selected`}
-            />
+            </TutorialProvider>
         </SafeAreaView>
     );
 }
-

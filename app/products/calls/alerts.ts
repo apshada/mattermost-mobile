@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import {Alert} from 'react-native';
+import {Alert, type AlertButton, Platform} from 'react-native';
 
 import {hasMicrophonePermission, joinCall, leaveCall, unmuteMyself} from '@calls/actions';
 import {dismissIncomingCall, hostRemove} from '@calls/actions/calls';
@@ -15,12 +15,13 @@ import {
     removeIncomingCall,
     setMicPermissionsGranted,
 } from '@calls/state';
+import {EndCallReturn} from '@calls/types/calls';
 import {errorAlert} from '@calls/utils';
 import DatabaseManager from '@database/manager';
 import {getChannelById} from '@queries/servers/channel';
 import {getCurrentUser} from '@queries/servers/user';
 import {dismissBottomSheet} from '@screens/navigation';
-import {isDMorGM} from '@utils/channel';
+import {isDMChannel, isTypeDMorGM} from '@utils/channel';
 import {getFullErrorMessage} from '@utils/errors';
 import {logError} from '@utils/log';
 import {isSystemAdmin} from '@utils/user';
@@ -81,7 +82,7 @@ export const leaveAndJoinWithAlert = async (
 ) => {
     let leaveChannelName = '';
     let joinChannelName = '';
-    let joinChannelIsDMorGM = false;
+    let joinChannelType: ChannelType | undefined;
     let leaveServerUrl = '';
     let leaveChannelId = '';
     const newCall = !getChannelsWithCalls(joinServerUrl)[joinChannelId];
@@ -90,10 +91,12 @@ export const leaveAndJoinWithAlert = async (
         const {database: joinDatabase} = DatabaseManager.getServerDatabaseAndOperator(joinServerUrl);
         const joinChannel = await getChannelById(joinDatabase, joinChannelId);
         joinChannelName = joinChannel?.displayName || '';
-        joinChannelIsDMorGM = joinChannel ? isDMorGM(joinChannel) : false;
+        joinChannelType = joinChannel?.type;
 
+        // Don't prompt to leave a call if it's the same call we're joining.
+        // Skip if the current call matches the join channel and server.
         const currentCall = getCurrentCall();
-        if (currentCall) {
+        if (currentCall && !(currentCall.serverUrl === joinServerUrl && currentCall.channelId === joinChannelId)) {
             const {database: leaveDatabase} = DatabaseManager.getServerDatabaseAndOperator(currentCall.serverUrl);
             const leaveChannel = await getChannelById(leaveDatabase, currentCall.channelId);
             leaveChannelName = leaveChannel?.displayName || '';
@@ -102,7 +105,7 @@ export const leaveAndJoinWithAlert = async (
         }
     } catch (error) {
         logError('failed to getServerDatabase in leaveAndJoinWithAlert', error);
-        return;
+        return false;
     }
 
     if (leaveServerUrl && leaveChannelId) {
@@ -114,44 +117,49 @@ export const leaveAndJoinWithAlert = async (
         }, {leaveChannelName, joinChannelName});
         if (newCall) {
             joinMessage = formatMessage({
-                id: 'mobile.leave_and_join_message',
+                id: 'mobile.leave_and_create_message',
                 defaultMessage: 'You are already on a channel call in ~{leaveChannelName}. Do you want to leave your current call and start a new call in ~{joinChannelName}?',
             }, {leaveChannelName, joinChannelName});
         }
 
-        Alert.alert(
-            formatMessage({
-                id: 'mobile.leave_and_join_title',
-                defaultMessage: 'Are you sure you want to switch to a different call?',
-            }),
-            joinMessage,
-            [
-                {
-                    text: formatMessage({
-                        id: 'mobile.post.cancel',
-                        defaultMessage: 'Cancel',
-                    }),
-                    style: 'destructive',
-                },
-                {
-                    text: formatMessage({
-                        id: 'mobile.leave_and_join_confirmation',
-                        defaultMessage: 'Leave & Join',
-                    }),
-                    onPress: () => doJoinCall(joinServerUrl, joinChannelId, joinChannelIsDMorGM, newCall, intl, title, rootId),
-                    style: 'cancel',
-                },
-            ],
-        );
-    } else {
-        doJoinCall(joinServerUrl, joinChannelId, joinChannelIsDMorGM, newCall, intl, title, rootId);
+        const asyncAlert = async () => new Promise((resolve) => {
+            Alert.alert(
+                formatMessage({
+                    id: 'mobile.leave_and_join_title',
+                    defaultMessage: 'Are you sure you want to switch to a different call?',
+                }),
+                joinMessage,
+                [
+                    {
+                        text: formatMessage({
+                            id: 'mobile.post.cancel',
+                            defaultMessage: 'Cancel',
+                        }),
+                        onPress: () => resolve(false),
+                        style: 'destructive',
+                    },
+                    {
+                        text: formatMessage({
+                            id: 'mobile.leave_and_join_confirmation',
+                            defaultMessage: 'Leave & Join',
+                        }),
+                        onPress: async () => resolve(await doJoinCall(joinServerUrl, joinChannelId, joinChannelType, newCall, intl, title, rootId)),
+                        isPreferred: true,
+                    },
+                ],
+            );
+        });
+
+        return asyncAlert();
     }
+
+    return doJoinCall(joinServerUrl, joinChannelId, joinChannelType, newCall, intl, title, rootId);
 };
 
 const doJoinCall = async (
     serverUrl: string,
     channelId: string,
-    joinChannelIsDMorGM: boolean,
+    channelType: ChannelType | undefined,
     newCall: boolean,
     intl: IntlShape,
     title?: string,
@@ -166,7 +174,7 @@ const doJoinCall = async (
         user = await getCurrentUser(database);
         if (!user) {
             // This shouldn't happen, so don't bother localizing and displaying an alert.
-            return;
+            return false;
         }
 
         if (newCall) {
@@ -189,12 +197,12 @@ const doJoinCall = async (
                 // continue through and start the call
             } else {
                 contactAdminAlert(intl);
-                return;
+                return false;
             }
         }
     } catch (error) {
         logError('failed to getServerDatabaseAndOperator in doJoinCall', error);
-        return;
+        return false;
     }
 
     recordingAlertLock = false;
@@ -204,23 +212,33 @@ const doJoinCall = async (
     const hasPermission = await hasMicrophonePermission();
     setMicPermissionsGranted(hasPermission);
 
-    if (!newCall && joinChannelIsDMorGM) {
+    const isDMorGM = isTypeDMorGM(channelType);
+
+    if (!newCall && isDMorGM) {
         // we're joining an existing call, so dismiss any notifications (for all clients, too)
         const callId = getCallsState(serverUrl).calls[channelId].id;
         dismissIncomingCall(serverUrl, channelId);
         removeIncomingCall(serverUrl, callId, channelId);
     }
 
-    const res = await joinCall(serverUrl, channelId, user.id, hasPermission, intl, title, rootId);
+    // newCall means there was no call in the channel to join, so this one is ours: the call view
+    // needs to know that before the server's call_start event arrives with the owner. A 1:1 DM call
+    // we place is also live from the moment we're in it, per the unmute below.
+    const res = await joinCall(serverUrl, channelId, user.id, hasPermission, intl, title, rootId, {
+        startedByMe: newCall,
+        startUnmuted: newCall && isDMChannel(channelType) && hasPermission,
+    });
     if (res.error) {
         const seeLogs = formatMessage({id: 'mobile.calls_see_logs', defaultMessage: 'See server logs'});
         errorAlert(res.error?.toString() || seeLogs, intl);
-        return;
+        return false;
     }
 
-    if (joinChannelIsDMorGM) {
+    if (isDMorGM) {
         unmuteMyself();
     }
+
+    return true;
 };
 
 const contactAdminAlert = ({formatMessage}: IntlShape) => {
@@ -260,7 +278,7 @@ export const recordingAlert = (isHost: boolean, transcriptionsEnabled: boolean, 
     });
     const hostMessage = formatMessage({
         id: 'mobile.calls_host_rec',
-        defaultMessage: 'Consider letting everyone know that this meeting is being recorded.',
+        defaultMessage: 'You are recording this meeting. Consider letting everyone know that this meeting is being recorded.',
     });
 
     const participantTitle = formatMessage({
@@ -302,7 +320,7 @@ export const recordingAlert = (isHost: boolean, transcriptionsEnabled: boolean, 
                 defaultMessage: 'Leave',
             }),
             onPress: async () => {
-                await leaveCall();
+                leaveCall();
             },
             style: 'destructive',
         },
@@ -326,6 +344,54 @@ export const recordingAlert = (isHost: boolean, transcriptionsEnabled: boolean, 
         isHost ? hMessage : pMessage,
         isHost ? hostButton : participantButtons,
     );
+};
+
+export const stopRecordingConfirmationAlert = (intl: IntlShape, enableTranscriptions: boolean) => {
+    const {formatMessage} = intl;
+
+    const asyncAlert = async () => new Promise((resolve) => {
+        let title = formatMessage({
+            id: 'mobile.calls_host_rec_stop_title',
+            defaultMessage: 'Stop recording',
+        });
+        let body = formatMessage({
+            id: 'mobile.calls_host_rec_stop_body',
+            defaultMessage: 'The call recording will be processed and posted in the call thread. Are you sure you want to stop the recording?',
+        });
+
+        if (enableTranscriptions) {
+            title = formatMessage({
+                id: 'mobile.calls_host_rec_trans_stop_title',
+                defaultMessage: 'Stop recording and transcription',
+            });
+            body = formatMessage({
+                id: 'mobile.calls_host_rec_trans_stop_body',
+                defaultMessage: 'The call recording and transcription files will be processed and posted in the call thread. Are you sure you want to stop the recording and transcription?',
+            });
+        }
+
+        Alert.alert(
+            title,
+            body,
+            [{
+                text: formatMessage({
+                    id: 'mobile.calls_cancel',
+                    defaultMessage: 'Cancel',
+                }),
+                onPress: () => resolve(false),
+                style: 'cancel',
+            }, {
+                text: formatMessage({
+                    id: 'mobile.calls_host_rec_stop_confirm',
+                    defaultMessage: 'Stop recording',
+                }),
+                onPress: () => resolve(true),
+                style: 'destructive',
+            }],
+        );
+    });
+
+    return asyncAlert();
 };
 
 export const needsRecordingWillBePostedAlert = () => {
@@ -465,4 +531,48 @@ export const removeFromCall = (serverUrl: string, displayName: string, callId: s
         },
         style: 'destructive',
     }]);
+};
+
+export const endCallConfirmationAlert = (intl: IntlShape) => {
+    const {formatMessage} = intl;
+
+    const asyncAlert = async () => new Promise((resolve) => {
+        const cancelButton: AlertButton = {
+            text: formatMessage({
+                id: 'mobile.calls_cancel',
+                defaultMessage: 'Cancel',
+            }),
+            onPress: () => resolve(EndCallReturn.Cancel),
+            style: 'cancel',
+        };
+        const endCallButton: AlertButton = {
+            text: formatMessage({
+                id: 'mobile.calls_host_end_confirm',
+                defaultMessage: 'End call for everyone',
+            }),
+            onPress: () => resolve(EndCallReturn.EndCall),
+            style: 'destructive',
+        };
+        const leaveCallButton: AlertButton = {
+            text: formatMessage({
+                id: 'mobile.calls_host_leave_confirm',
+                defaultMessage: 'Leave call',
+            }),
+            onPress: () => resolve(EndCallReturn.LeaveCall),
+        };
+        const buttons = Platform.OS === 'ios' ? [cancelButton, endCallButton, leaveCallButton] : [cancelButton, leaveCallButton, endCallButton];
+
+        const questionMsg = formatMessage({
+            id: 'mobile.calls_host_leave_title',
+            defaultMessage: 'Are you sure you want to leave this call?',
+        });
+
+        if (Platform.OS === 'ios') {
+            Alert.alert(questionMsg, '', buttons);
+        } else {
+            Alert.alert('', questionMsg, buttons);
+        }
+    });
+
+    return asyncAlert();
 };
